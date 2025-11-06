@@ -1,0 +1,20 @@
+# Core dependencies
+torch>=1.13.0
+transformers>=4.20.0
+datasets>=2.0.0
+scikit-learn>=1.0.0
+accelerate>=0.20.0
+
+# Optional: for development
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
+
+# Note: For CUDA, install PyTorch with:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# For MPS (Apple Silicon), install PyTorch with:
+# pip install torch torchvision torchaudio
+#
+# The rest of the dependencies are the same for both platforms.
+
