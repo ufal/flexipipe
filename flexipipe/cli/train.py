@@ -13,7 +13,10 @@ from flexipipe.core import (
 )
 
 def main():
-    parser = argparse.ArgumentParser(description='FlexiPipe train: Train a model')
+    parser = argparse.ArgumentParser(
+        description='FlexiPipe train: Train a model',
+        prog='flexipipe train'
+    )
     parser.add_argument('--data-dir', type=Path,
                        help='UD treebank directory')
     parser.add_argument('--train-dir', type=Path,

@@ -27,11 +27,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 
+# Import FlexiPipeConfig from config module to avoid duplication
+from flexipipe.config import FlexiPipeConfig
+
 # Disable tokenizers parallelism warning (set before any tokenizers imports)
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # CoNLL-U MISC expansion keys (configurable via --expan)
-CONLLU_EXPANSION_KEYS = ['Exp', 'Expan', 'Expand', 'Expansion', 'fform', 'FFORM']
+# Expansion is the new standard format, others are for backward compatibility
+CONLLU_EXPANSION_KEYS = ['Expansion', 'Exp', 'Expan', 'Expand', 'fform', 'FFORM']
 
 def set_conllu_expansion_key(key: Optional[str]):
     """Configure which MISC key to consider as expansion (e.g., 'Exp', 'fform')."""
@@ -84,46 +88,6 @@ except ImportError as e:
         return None
 
 
-@dataclass
-class FlexiPipeConfig:
-    """Configuration for the tagger."""
-    bert_model: str = "bert-base-multilingual-cased"  # Multilingual by default (supports 104 languages)
-    train_tokenizer: bool = True  # Default: train tokenizer
-    train_tagger: bool = True  # Default: train tagger
-    train_parser: bool = True  # Default: train parser (full pipeline)
-    train_lemmatizer: bool = True  # Default: train lemmatizer
-    max_length: int = 512
-    batch_size: int = 16  # Reduced for MPS memory constraints (can use gradient_accumulation_steps to simulate larger batch)
-    gradient_accumulation_steps: int = 2  # Effective batch size = 16 * 2 = 32
-    learning_rate: float = 2e-5
-    num_epochs: int = 5  # Increased from 3 - BERT fine-tuning often needs more epochs
-    output_dir: str = "models/flexipipe"
-    similarity_threshold: float = 0.7
-    use_vocabulary: bool = True
-    vocab_priority: bool = False  # If True, vocabulary takes priority over model predictions for all tasks
-    respect_existing: bool = True
-    lemma_method: str = 'auto'  # 'bert', 'similarity', or 'auto' (default: try BERT first, fallback to similarity)
-    # Historic document processing (neotag replacement)
-    normalize: bool = False  # Normalize orthographic variants (e.g., "mediaeval" -> "medieval")
-    conservative_normalization: bool = True  # Only normalize if high confidence (avoid over-normalization)
-    train_normalizer: bool = True  # Train normalizer if normalization data is present (auto-detected)
-    normalization_attr: str = 'reg'  # TEITOK attribute for normalization (default: 'reg', can be 'nform')
-    expansion_attr: str = 'expan'  # TEITOK attribute for expansion (default: 'expan', can be 'fform')
-    tag_on_normalized: bool = False  # Tag on normalized form instead of original orthography
-    split_contractions: bool = False  # Split contractions (e.g., "destas" -> "de estas")
-    aggressive_contraction_splitting: bool = False  # More aggressive splitting for historic texts
-    language: Optional[str] = None  # Language code for language-specific contraction rules (e.g., 'es', 'pt', 'ltz')
-    # Normalization inflection suffixes
-    normalization_suffixes_file: Optional[Path] = None  # Optional JSON file with suffix list for normalization inflections
-    lemma_anchor: str = 'both'  # How to derive suffixes: 'reg' | 'form' | 'both'
-    xpos_attr: str = 'xpos'  # TEITOK attribute(s) for XPOS (comma-separated fallbacks allowed)
-    # Parsing configuration
-    parse: bool = False  # Whether to run parsing (predict head/deprel)
-    tag_only: bool = False  # Only tag (UPOS/XPOS/FEATS), skip parsing
-    parse_only: bool = False  # Only parse (assumes tags already exist), skip tagging
-    debug: bool = False  # Enable debug output
-
-
 def parse_conllu_simple(line: str) -> Optional[Dict]:
     """Parse CoNLL-U line, handling VRT format (1-3 columns only)."""
     line = line.strip()
@@ -169,22 +133,27 @@ def parse_conllu_simple(line: str) -> Optional[Dict]:
                 'misc': parts[9] if len(parts) > 9 else '_',
             })
             
-            # Extract normalization from MISC column (Reg=...)
+            # Extract normalization from MISC column (Normalized= or Reg= for backward compatibility)
             misc = parts[9] if len(parts) > 9 else '_'
             if misc and misc != '_':
-                # Parse MISC column for Reg= (normalization)
+                # Parse MISC column for Normalized= or Reg= (normalization)
                 misc_parts = misc.split('|')
                 norm_form = '_'
                 expan_form = '_'
                 for misc_part in misc_parts:
-                    if misc_part.startswith('Reg='):
-                        norm_form = misc_part[4:]  # Extract value after "Reg="
+                    if misc_part.startswith('Normalized='):
+                        norm_form = misc_part[11:]  # Extract value after "Normalized="
+                    elif misc_part.startswith('Reg='):
+                        norm_form = misc_part[4:]  # Extract value after "Reg=" (backward compatibility)
                     else:
                         for k in CONLLU_EXPANSION_KEYS:
                             prefix = f"{k}="
                             if misc_part.startswith(prefix):
                                 expan_form = misc_part[len(prefix):]
                                 break
+                        # Also check for Expansion= (new format)
+                        if misc_part.startswith('Expansion='):
+                            expan_form = misc_part[10:]  # Extract value after "Expansion="
                 token['norm_form'] = norm_form
                 token['expan'] = expan_form if expan_form else '_'
             else:
@@ -495,6 +464,9 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
             sentence_tokens = []
             token_num = 1
             
+            # Get sentence ID: try @id first, then @xml:id
+            sentence_id = s.get('id', '') or s.get('{http://www.w3.org/XML/1998/namespace}id', '')
+            
             # Try to get original text from sentence element (if available)
             # Some TEITOK files store original text as an attribute or in a text node
             original_sentence_text = s.text or s.get('text', None)
@@ -503,13 +475,15 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                 original_sentence_text = None
             
             for tok in s.findall('.//tok'):
-                tok_id = tok.get('id', '')
+                # Get token ID: try @id first, then @xml:id
+                tok_id = tok.get('id', '') or tok.get('{http://www.w3.org/XML/1998/namespace}id', '')
                 dtoks = tok.findall('.//dtok')
                 
                 if dtoks:
                     # Contraction: process each dtok
                     for dt in dtoks:
-                        dt_id = dt.get('id', '')
+                        # Get dtok ID: try @id first, then @xml:id
+                        dt_id = dt.get('id', '') or dt.get('{http://www.w3.org/XML/1998/namespace}id', '')
                         form = dt.get('form', '') or (dt.text or '').strip()
                         if form:
                             # Get normalization (try specified attr first, then common fallbacks)
@@ -557,7 +531,9 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                         token_num += 1
             
             if sentence_tokens:
-                # Store original text in first token if available
+                # Store sentence ID and original text in first token if available
+                if sentence_id:
+                    sentence_tokens[0]['_sentence_id'] = sentence_id
                 if original_sentence_text:
                     sentence_tokens[0]['_original_text'] = original_sentence_text
                 sentences.append(sentence_tokens)
@@ -687,7 +663,8 @@ class MultiTaskFlexiPipeTagger(nn.Module):
     
     def __init__(self, base_model_name: str, num_upos: int, num_xpos: int, num_feats: int, 
                  num_lemmas: int = 0, num_deprels: int = 0, num_norms: int = 0,
-                 train_parser: bool = False, train_lemmatizer: bool = False, train_normalizer: bool = False):
+                 train_parser: bool = False, train_lemmatizer: bool = False, train_normalizer: bool = False,
+                 num_orig_forms: int = 0, use_orig_form_for_parser: bool = False):
         super().__init__()
         self.base_model = AutoModel.from_pretrained(base_model_name)
         hidden_size = self.base_model.config.hidden_size
@@ -754,11 +731,23 @@ class MultiTaskFlexiPipeTagger(nn.Module):
             self.lemma_xpos_embed = None
             self.lemma_feats_embed = None
         
+        # Original form embedding for transpositional parsing (if enabled)
+        self.use_orig_form_for_parser = use_orig_form_for_parser
+        self.orig_form_embed = None
+        orig_form_embed_dim = 64  # Embedding dimension for original forms
+        if use_orig_form_for_parser and num_orig_forms > 0:
+            self.orig_form_embed = nn.Embedding(num_orig_forms, orig_form_embed_dim)
+            # Adjust hidden size for parser to account for orig_form embeddings
+            parser_hidden_size = hidden_size + orig_form_embed_dim
+        else:
+            parser_hidden_size = hidden_size
+        
         # Parsing heads (only if training parser)
         if train_parser and num_deprels > 0:
-            self.biaffine = BiaffineAttention(hidden_size, arc_dim=500)
+            # Use adjusted hidden size that includes orig_form embeddings if enabled
+            self.biaffine = BiaffineAttention(parser_hidden_size, arc_dim=500)
             self.deprel_head = nn.Sequential(
-                nn.Linear(hidden_size, mlp_hidden),
+                nn.Linear(parser_hidden_size, mlp_hidden),
                 nn.GELU(),
                 nn.Dropout(0.1),
                 nn.Linear(mlp_hidden, num_deprels)
@@ -781,7 +770,8 @@ class MultiTaskFlexiPipeTagger(nn.Module):
         self.dropout = nn.Dropout(0.1)
     
     def forward(self, input_ids, attention_mask=None, labels_upos=None, labels_xpos=None, 
-                labels_feats=None, labels_lemma=None, labels_norm=None, labels_head=None, labels_deprel=None):
+                labels_feats=None, labels_lemma=None, labels_norm=None, labels_head=None, labels_deprel=None,
+                orig_form_ids=None):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         sequence_output = outputs.last_hidden_state
         sequence_output = self.dropout(sequence_output)
@@ -832,10 +822,18 @@ class MultiTaskFlexiPipeTagger(nn.Module):
         arc_scores = None
         logits_deprel = None
         if self.train_parser and self.biaffine is not None:
-            arc_scores = self.biaffine(sequence_output)  # [batch, seq, seq]
+            # For transpositional parsing: concatenate original form embeddings with BERT embeddings
+            parser_input = sequence_output
+            if self.use_orig_form_for_parser and self.orig_form_embed is not None and orig_form_ids is not None:
+                # Embed original forms: [batch, seq] -> [batch, seq, orig_form_embed_dim]
+                orig_form_embeds = self.orig_form_embed(orig_form_ids)
+                # Concatenate: [batch, seq, hidden_size] + [batch, seq, orig_form_embed_dim]
+                parser_input = torch.cat([sequence_output, orig_form_embeds], dim=-1)
+            
+            arc_scores = self.biaffine(parser_input)  # [batch, seq, seq]
             # Deprel scores: for each possible head-child pair
             # We'll use a simpler approach: predict deprel for each token given its predicted head
-            logits_deprel = self.deprel_head(sequence_output)  # [batch, seq, num_deprels]
+            logits_deprel = self.deprel_head(parser_input)  # [batch, seq, num_deprels]
         
         loss = None
         if labels_upos is not None:
@@ -905,11 +903,13 @@ class MultiTaskTrainer(Trainer):
         labels_norm = inputs.pop("labels_norm", None)
         labels_head = inputs.pop("labels_head", None)
         labels_deprel = inputs.pop("labels_deprel", None)
+        orig_form_ids = inputs.pop("orig_form_ids", None)
         
         outputs = model(**inputs, labels_upos=labels_upos, labels_xpos=labels_xpos, 
                        labels_feats=labels_feats, labels_lemma=labels_lemma,
                        labels_norm=labels_norm,
-                       labels_head=labels_head, labels_deprel=labels_deprel)
+                       labels_head=labels_head, labels_deprel=labels_deprel,
+                       orig_form_ids=orig_form_ids)
         loss = outputs.get('loss')
         
         return (loss, outputs) if return_outputs else loss
@@ -1465,316 +1465,8 @@ def split_contraction(form: str, vocab: Dict, aggressive: bool = False, language
     return None
 
 
-def viterbi_tag_sentence(sentence: List[str], vocab: Dict, transition_probs: Dict, 
-                         tag_type: str = 'upos') -> List[str]:
-    """
-    Tag a sentence using Viterbi algorithm.
-    
-    Args:
-        sentence: List of word forms
-        vocab: Vocabulary dictionary (form -> analysis or list of analyses)
-        transition_probs: Transition probabilities dict with 'upos' or 'xpos' keys
-        tag_type: 'upos' or 'xpos'
-    
-    Returns:
-        List of predicted tags
-    """
-    if not sentence:
-        return []
-    
-    # Get transition probabilities for this tag type
-    trans_probs = transition_probs.get(tag_type, {})
-    start_probs = transition_probs.get('start', {})
-    
-    # Collect all possible tags from vocab
-    all_tags = set()
-    for entry in vocab.values():
-        if isinstance(entry, list):
-            for analysis in entry:
-                tag = analysis.get(tag_type, '_')
-                if tag != '_':
-                    all_tags.add(tag)
-        else:
-            tag = entry.get(tag_type, '_')
-            if tag != '_':
-                all_tags.add(tag)
-    
-    # Add tags from transitions
-    for prev_tag in trans_probs.keys():
-        all_tags.add(prev_tag)
-        for curr_tag in trans_probs[prev_tag].keys():
-            all_tags.add(curr_tag)
-    
-    all_tags = sorted(all_tags)  # For consistent ordering
-    
-    if not all_tags:
-        # No tags available, return all '_'
-        return ['_'] * len(sentence)
-    
-    # Calculate raw tag frequencies from vocabulary (for OOV fallback)
-    # This is better than uniform distribution - use actual tag distribution in vocab
-    tag_frequencies = {}
-    total_tag_count = 0
-    for entry in vocab.values():
-        if isinstance(entry, list):
-            for analysis in entry:
-                tag = analysis.get(tag_type, '_')
-                if tag != '_':
-                    count = analysis.get('count', 1)
-                    tag_frequencies[tag] = tag_frequencies.get(tag, 0) + count
-                    total_tag_count += count
-        else:
-            tag = entry.get(tag_type, '_')
-            if tag != '_':
-                count = entry.get('count', 1)
-                tag_frequencies[tag] = tag_frequencies.get(tag, 0) + count
-                total_tag_count += count
-    
-    # Create default emission probabilities based on tag frequencies
-    # If a tag doesn't appear in vocab, give it a very small probability (smoothing)
-    default_emission = {}
-    smoothing = 0.1  # Small smoothing value for unseen tags
-    if total_tag_count > 0:
-        for tag in all_tags:
-            freq = tag_frequencies.get(tag, 0)
-            default_emission[tag] = (freq + smoothing) / (total_tag_count + smoothing * len(all_tags))
-    else:
-        # No frequency data - use uniform as absolute last resort
-        uniform = 1.0 / len(all_tags)
-        default_emission = {tag: uniform for tag in all_tags}
-    
-    # Build emission probabilities for each word
-    # emission[word_idx][tag] = log probability
-    emission = []
-    for word in sentence:
-        word_emission = {}
-        word_lower = word.lower()
-        
-        # Get entry from vocab (try exact case, then lowercase)
-        entry = vocab.get(word) or vocab.get(word_lower)
-        
-        if entry:
-            # Word in vocab - use frequency-based emission
-            # BUT: Filter out analyses that don't have the requested tag_type
-            # This prevents using entries without XPOS for XPOS tagging
-            if isinstance(entry, list):
-                # Multiple analyses - filter to only those with the tag_type
-                analyses_with_tag = [a for a in entry if a.get(tag_type) and a.get(tag_type) != '_']
-                if analyses_with_tag:
-                    # Use only analyses that have the tag
-                    total_count = sum(a.get('count', 1) for a in analyses_with_tag)
-                    for analysis in analyses_with_tag:
-                        tag = analysis.get(tag_type, '_')
-                        if tag != '_':
-                            count = analysis.get('count', 1)
-                            # Use log probability (add small smoothing)
-                            prob = (count + 0.1) / (total_count + 0.1 * len(all_tags))
-                            word_emission[tag] = word_emission.get(tag, 0) + prob
-                # If no analyses have the tag, treat as OOV (fall through to OOV handling)
-            else:
-                # Single analysis - check if it has the tag
-                tag = entry.get(tag_type, '_')
-                if tag != '_':
-                    count = entry.get('count', 1)
-                    # Normalize to probability
-                    prob = (count + 0.1) / (count + 0.1 * len(all_tags))
-                    word_emission[tag] = prob
-                # If entry doesn't have the tag, treat as OOV (fall through to OOV handling)
-            
-            # Normalize to probabilities and convert to log space
-            total_prob = sum(word_emission.values())
-            if total_prob > 0:
-                for tag in word_emission:
-                    word_emission[tag] = word_emission[tag] / total_prob
-            else:
-                # Uniform distribution if no counts
-                uniform = 1.0 / len(all_tags)
-                for tag in all_tags:
-                    word_emission[tag] = uniform
-        else:
-            # OOV word - check if it's punctuation-only first
-            # Historic texts often have punctuation marks not in vocabulary
-            # (e.g., "!" in ODE corpus, various historic punctuation marks)
-            # Check if word contains only punctuation/symbol characters (no letters, digits)
-            is_punctuation_only = bool(word and not re.search(r'[a-zA-Z0-9]', word) and re.search(r'[^\s]', word))
-            
-            if is_punctuation_only:
-                # Punctuation-only OOV word
-                word_emission = {}
-                
-                if tag_type == 'upos':
-                    # For UPOS, always use PUNCT for punctuation
-                    if 'PUNCT' in all_tags:
-                        word_emission['PUNCT'] = 1.0
-                    else:
-                        # If PUNCT not in tags, use most common tag as fallback
-                        word_emission = default_emission.copy()
-                else:
-                    # For XPOS, find punctuation tags (typically start with 'F' or are short)
-                    # Look for punctuation tags in all_tags
-                    punct_tags = [tag for tag in all_tags if (
-                        tag.startswith('F') and len(tag) <= 4  # Short tags starting with F
-                        or tag in ('PUNCT', 'Punct', 'punct')  # Common punctuation tag names
-                    )]
-                    
-                    if punct_tags:
-                        # Use uniform distribution over available punctuation tags
-                        prob = 1.0 / len(punct_tags)
-                        for tag in punct_tags:
-                            word_emission[tag] = prob
-                    else:
-                        # No punctuation tags found - try to infer from common patterns
-                        # Default to a generic punctuation tag if available
-                        # Otherwise fall back to tag frequency distribution
-                        word_emission = default_emission.copy()
-            else:
-                # Not punctuation - try suffix-based matching
-                # OOV word - try to use suffix-based tag frequencies (for suffixing languages)
-                # This is much better than uniform distribution or general similarity matching
-                # In suffixing languages, the ending is morphologically significant
-                # Example: words ending in -tido are likely past participles (verbs)
-                word_emission = {}
-                word_lower = word.lower()
-                
-                # Try suffix-based tag frequency lookup (like lemmatization pattern matching)
-                # Try progressively shorter suffixes (longest first) to find tag distribution
-                # This is more reliable than general similarity matching for suffixing languages
-                suffix_tag_counts = {}
-                total_suffix_count = 0
-                
-                # Try suffixes from 6 chars down to 2 chars (morphologically significant endings)
-                for suffix_len in range(6, 1, -1):
-                    if len(word_lower) >= suffix_len:
-                        suffix = word_lower[-suffix_len:]
-                        # Find all words in vocab ending with this suffix
-                        suffix_words = []
-                        for vocab_word, vocab_entry in vocab.items():
-                            if vocab_word.lower().endswith(suffix) and vocab_word.lower() != word_lower:
-                                suffix_words.append((vocab_word, vocab_entry))
-                        
-                        # If we found words with this suffix, use their tag distribution
-                        if suffix_words:
-                            for vocab_word, vocab_entry in suffix_words:
-                                if isinstance(vocab_entry, list):
-                                    for analysis in vocab_entry:
-                                        tag = analysis.get(tag_type, '_')
-                                        if tag != '_':
-                                            count = analysis.get('count', 1)
-                                            suffix_tag_counts[tag] = suffix_tag_counts.get(tag, 0) + count
-                                            total_suffix_count += count
-                                else:
-                                    tag = vocab_entry.get(tag_type, '_')
-                                    if tag != '_':
-                                        count = vocab_entry.get('count', 1)
-                                        suffix_tag_counts[tag] = suffix_tag_counts.get(tag, 0) + count
-                                        total_suffix_count += count
-                            
-                            # Found suffix matches - use their tag distribution (stop at longest suffix)
-                            break
-                
-                # Convert suffix-based tag counts to probabilities
-                if suffix_tag_counts and total_suffix_count > 0:
-                    for tag, count in suffix_tag_counts.items():
-                        word_emission[tag] = count / total_suffix_count
-                
-                # If no similar words found, or if we have very low similarity, use pattern-based heuristics
-                if not word_emission or max(word_emission.values()) < 0.3:
-                    # Pattern-based heuristics for common endings
-                    # This helps assign more reasonable tags for OOV words
-                    word_lower = word.lower()
-                    
-                    # Spanish/Portuguese verb endings (common in historic texts)
-                    if word_lower.endswith(('ado', 'ada', 'ados', 'adas', 'ido', 'ida', 'idos', 'idas')):
-                        # Past participles - likely to be ADJ or VERB
-                        for tag in all_tags:
-                            if tag.startswith('A') or tag.startswith('V'):  # Adjective or Verb
-                                word_emission[tag] = word_emission.get(tag, 0) + 0.5
-                    
-                    # Preposition-like patterns (very short words, single letters)
-                    if len(word_lower) <= 2 or word_lower in ('de', 'a', 'en', 'por', 'para', 'con', 'sin', 'sobre'):
-                        for tag in all_tags:
-                            if tag.startswith('SP'):  # Preposition
-                                word_emission[tag] = word_emission.get(tag, 0) + 0.3
-                
-                # Fallback: if still no emission probabilities, use tag frequency distribution
-                if not word_emission:
-                    # Use default emission based on tag frequencies in vocabulary
-                    # This is much better than uniform - reflects actual tag distribution
-                    word_emission = default_emission.copy()
-                else:
-                    # Normalize the emission probabilities we found
-                    total_prob = sum(word_emission.values())
-                    if total_prob > 0:
-                        for tag in word_emission:
-                            word_emission[tag] = word_emission[tag] / total_prob
-                    else:
-                        # Fallback to tag frequencies if normalization fails
-                        word_emission = default_emission.copy()
-        
-        # Convert to log space
-        log_emission = {}
-        import math
-        for tag, prob in word_emission.items():
-            log_emission[tag] = math.log(max(prob, 1e-10))  # Avoid log(0)
-        
-        emission.append(log_emission)
-    
-    # Viterbi algorithm
-    n = len(sentence)
-    if n == 0:
-        return []
-    
-    # Initialize DP table: viterbi[position][tag] = best log probability
-    viterbi = [{} for _ in range(n)]
-    backpointer = [{} for _ in range(n)]
-    
-    # Initialization: first word
-    import math
-    for tag in all_tags:
-        # Start probability (log)
-        start_prob = start_probs.get(tag, 1.0 / len(all_tags))
-        start_log = math.log(max(start_prob, 1e-10))
-        
-        # Emission probability (log)
-        emit_log = emission[0].get(tag, math.log(1e-10))
-        
-        viterbi[0][tag] = start_log + emit_log
-        backpointer[0][tag] = None
-    
-    # Recursion: fill DP table
-    for t in range(1, n):
-        for curr_tag in all_tags:
-            best_prob = float('-inf')
-            best_prev_tag = None
-            
-            for prev_tag in all_tags:
-                # Transition probability (log)
-                trans_prob = trans_probs.get(prev_tag, {}).get(curr_tag, 1e-10)
-                trans_log = math.log(max(trans_prob, 1e-10))
-                
-                # Emission probability (log)
-                emit_log = emission[t].get(curr_tag, math.log(1e-10))
-                
-                # Total probability
-                prob = viterbi[t-1][prev_tag] + trans_log + emit_log
-                
-                if prob > best_prob:
-                    best_prob = prob
-                    best_prev_tag = prev_tag
-            
-            viterbi[t][curr_tag] = best_prob
-            backpointer[t][curr_tag] = best_prev_tag
-    
-    # Termination: find best final tag
-    best_final_tag = max(all_tags, key=lambda tag: viterbi[n-1][tag])
-    
-    # Backtrack: reconstruct best path
-    path = [best_final_tag]
-    for t in range(n-1, 0, -1):
-        prev_tag = backpointer[t][path[0]]
-        path.insert(0, prev_tag)
-    
-    return path
+# Import viterbi_tag_sentence from dedicated module to avoid duplication
+from flexipipe.viterbi import viterbi_tag_sentence
 
 
 def find_similar_words(word: str, vocab: Dict[str, Dict], threshold: float = 0.7) -> List[Tuple[str, float]]:
@@ -1834,12 +1526,13 @@ def find_similar_words(word: str, vocab: Dict[str, Dict], threshold: float = 0.7
 class FlexiPipeTagger:
     """Transformer-based FlexiPipe tagger."""
     
-    def __init__(self, config: FlexiPipeConfig, vocab: Optional[Dict[str, Dict]] = None, model_path: Optional[Path] = None, transition_probs: Optional[Dict] = None):
+    def __init__(self, config: FlexiPipeConfig, vocab: Optional[Dict[str, Dict]] = None, model_path: Optional[Path] = None, transition_probs: Optional[Dict] = None, vocab_metadata: Optional[Dict] = None):
         self.config = config
         self.model_path = model_path  # Store model path for vocabulary loading
         # vocab will be merged with model vocabulary in load_model
         self.external_vocab = vocab or {}
         self.transition_probs = transition_probs  # Transition probabilities for Viterbi tagging
+        self.vocab_metadata = vocab_metadata  # Vocabulary metadata (may contain language info)
         self.model_vocab = {}  # Vocabulary from training data
         self.vocab = {}  # Merged vocabulary (model_vocab + external_vocab, external overrides)
         self.lemmatization_patterns = {}  # XPOS -> list of (suffix_from, suffix_to, min_length) patterns
@@ -1855,6 +1548,14 @@ class FlexiPipeTagger:
         self.deprel_to_id = {}
         self.id_to_deprel = {}
         self.inflection_suffixes: Optional[List[str]] = None
+        # Store original XML tree for TEITOK input (to preserve structure)
+        self.original_teitok_tree = None
+        self.original_teitok_file = None
+        # Store vocabulary file path(s) for revision statement
+        self.vocab_file_path = None  # Most specific vocab file (for display)
+        self.vocab_file_paths = []  # All vocab files (for reference)
+        # Track operations performed for revision statement
+        self.operations_performed = []
         # Detect and store device (MPS for Mac Studio, CUDA for NVIDIA, CPU otherwise)
         if TRANSFORMERS_AVAILABLE:
             self.device = get_device()
@@ -2059,6 +1760,18 @@ class FlexiPipeTagger:
                     suffix_to = best_suffix_to
                     min_base = best_prefix_len
                     
+                    # Filter out unrealistic patterns:
+                    # 1. Very short suffix patterns that add characters (likely errors)
+                    #    Example: "o" -> "oto" is unrealistic (should be longer suffix or deletion)
+                    # 2. Patterns where suffix_to is much longer than suffix_from (unlikely morphological change)
+                    #    Example: "o" -> "oto" (1 char -> 3 chars) is suspicious
+                    if len(suffix_from) <= 1 and len(suffix_to) > len(suffix_from) + 1:
+                        # Skip: very short suffix adding more than 1 character is unrealistic
+                        continue
+                    if len(suffix_from) == 2 and len(suffix_to) > len(suffix_from) + 2:
+                        # Skip: 2-char suffix adding more than 2 characters is suspicious
+                        continue
+                    
                     # IMPORTANT: Include "no change" patterns (form == lemma) as well
                     # This prevents rare transformation patterns (like -a → -o for animate nouns)
                     # from being over-applied to words that should have no change
@@ -2084,7 +1797,20 @@ class FlexiPipeTagger:
             xpos_patterns = []
             for suffix_from, suffix_to, min_base in patterns_by_xpos[xpos]:
                 count = pattern_counts[(xpos, suffix_from, suffix_to)]
-                if count >= 2:  # Only keep patterns seen at least 2 times
+                # Require higher count for suspicious patterns:
+                # - Patterns that change accented characters to unaccented (e.g., "ón" -> "o")
+                #   These are often rare exceptions, not general rules
+                # - Patterns with very short suffixes that change significantly
+                min_required_count = 2
+                if len(suffix_from) >= 2 and len(suffix_to) >= 1:
+                    # Check if pattern removes accent: contains accented char in suffix_from but not in suffix_to
+                    has_accent_in_from = any(c in suffix_from for c in 'áéíóúÁÉÍÓÚñÑçÇ')
+                    has_accent_in_to = any(c in suffix_to for c in 'áéíóúÁÉÍÓÚñÑçÇ')
+                    if has_accent_in_from and not has_accent_in_to:
+                        # Accent removal pattern - require higher count (at least 5) to be reliable
+                        min_required_count = 5
+                
+                if count >= min_required_count:
                     suffix_len = len(suffix_from)
                     xpos_patterns.append((suffix_from, suffix_to, min_base, suffix_len, count))
                     # Store pattern info for conflict resolution
@@ -2163,6 +1889,18 @@ class FlexiPipeTagger:
                     self.norm_to_id = label_mappings.get('norm_to_id', {})
                     self.id_to_norm = {v: k for k, v in self.norm_to_id.items()} if self.norm_to_id else {}
                 
+                # Load original form mappings for transpositional parsing if available
+                use_orig_form_for_parser = label_mappings.get('use_orig_form_for_parser', False)
+                if use_orig_form_for_parser:
+                    self.orig_forms = label_mappings.get('orig_forms', [])
+                    self.orig_form_to_id = label_mappings.get('orig_form_to_id', {})
+                    self.id_to_orig_form = {v: k for k, v in self.orig_form_to_id.items()} if self.orig_form_to_id else {}
+                    print(f"Loaded original form mappings: {len(self.orig_forms)} unique forms (transpositional parsing enabled)", file=sys.stderr)
+                else:
+                    self.orig_forms = []
+                    self.orig_form_to_id = {}
+                    self.id_to_orig_form = {}
+                
                 # Fallback: detect if model was trained with lemmatizer/parser/normalizer from label_mappings
                 # (only if training_config.json wasn't found)
                 if not training_config_file.exists():
@@ -2212,6 +1950,7 @@ class FlexiPipeTagger:
             # No need to add them to tokenizer anymore
             
             # Load model
+            use_orig_form = hasattr(self, 'orig_forms') and self.orig_forms and use_orig_form_for_parser
             self.model = MultiTaskFlexiPipeTagger(
                 self.config.bert_model,
                 num_upos=len(self.upos_labels),
@@ -2220,7 +1959,9 @@ class FlexiPipeTagger:
                 num_lemmas=len(self.lemma_labels) if hasattr(self, 'lemma_labels') and self.lemma_labels else 0,
                 num_deprels=len(self.deprel_labels) if hasattr(self, 'deprel_labels') and self.deprel_labels else 0,
                 train_parser=self.config.train_parser,
-                train_lemmatizer=self.config.train_lemmatizer
+                train_lemmatizer=self.config.train_lemmatizer,
+                num_orig_forms=len(self.orig_forms) if use_orig_form else 0,
+                use_orig_form_for_parser=use_orig_form
             )
             
             # Resize embeddings to match tokenizer vocabulary size
@@ -2335,6 +2076,7 @@ class FlexiPipeTagger:
         all_lemmas = set()
         all_deprels = set()
         all_norm_forms = set()
+        all_orig_forms = set()
         
         for sentence in train_sentences + dev_sentences:
             for token in sentence:
@@ -2369,6 +2111,12 @@ class FlexiPipeTagger:
                     has_normalization = True
                     if self.config.train_normalizer:
                         all_norm_forms.add(norm_form.lower())
+                orig_form = token.get('orig_form', '_')
+                if orig_form and orig_form != '_':
+                    has_orig_forms = True
+                    if self.config.train_parser:
+                        # Collect original forms for transpositional parsing
+                        all_orig_forms.add(orig_form.lower())  # Normalize to lowercase
         
         # Auto-adjust component training based on data availability
         if not has_lemma and self.config.train_lemmatizer:
@@ -2385,12 +2133,19 @@ class FlexiPipeTagger:
         elif has_normalization and self.config.train_normalizer:
             print(f"Found normalization data: {len(all_norm_forms)} unique normalized forms", file=sys.stderr)
         
+        # Check for original forms (for transpositional parsing)
+        use_orig_form_for_parser = False
+        if has_orig_forms and self.config.train_parser:
+            use_orig_form_for_parser = True
+            print(f"Found original form data: {len(all_orig_forms)} unique original forms (transpositional parsing enabled)", file=sys.stderr)
+        
         self.upos_labels = sorted(all_upos)
         self.xpos_labels = sorted(all_xpos)
         self.feats_labels = sorted(all_feats)
         self.lemma_labels = sorted(all_lemmas) if self.config.train_lemmatizer else []
         self.deprel_labels = sorted(all_deprels) if self.config.train_parser else []
         self.norm_forms = sorted(all_norm_forms) if self.config.train_normalizer else []
+        self.orig_forms = sorted(all_orig_forms) if use_orig_form_for_parser else []
         
         print(f"Found {len(self.upos_labels)} UPOS labels, {len(self.xpos_labels)} XPOS labels, {len(self.feats_labels)} FEATS labels", file=sys.stderr)
         if self.config.train_lemmatizer:
@@ -2413,6 +2168,19 @@ class FlexiPipeTagger:
         if self.config.train_parser:
             self.deprel_to_id = {label: i for i, label in enumerate(self.deprel_labels)}
             self.id_to_deprel = {i: label for i, label in enumerate(self.deprel_labels)}
+        
+        # Create original form mappings (for transpositional parsing)
+        if use_orig_form_for_parser:
+            self.orig_form_to_id = {form: i for i, form in enumerate(self.orig_forms)}
+            self.id_to_orig_form = {i: form for i, form in enumerate(self.orig_forms)}
+            # Add special token for missing original forms
+            if '_' not in self.orig_form_to_id:
+                self.orig_form_to_id['_'] = len(self.orig_forms)
+                self.id_to_orig_form[len(self.orig_forms)] = '_'
+                self.orig_forms.append('_')
+        else:
+            self.orig_form_to_id = {}
+            self.id_to_orig_form = {}
         
         # Initialize or train tokenizer
         if self.config.train_tokenizer:
@@ -2441,7 +2209,9 @@ class FlexiPipeTagger:
             num_norms=len(self.norm_forms) if self.config.train_normalizer else 0,
             train_parser=self.config.train_parser,
             train_lemmatizer=self.config.train_lemmatizer,
-            train_normalizer=self.config.train_normalizer
+            train_normalizer=self.config.train_normalizer,
+            num_orig_forms=len(self.orig_forms) if use_orig_form_for_parser else 0,
+            use_orig_form_for_parser=use_orig_form_for_parser
         )
         
         # Resize embeddings if tokenizer vocabulary size differs from base model
@@ -2772,6 +2542,12 @@ class FlexiPipeTagger:
             label_mappings['norm_forms'] = self.norm_forms
             label_mappings['norm_to_id'] = self.norm_to_id
             label_mappings['id_to_norm'] = {v: k for k, v in self.norm_to_id.items()}
+        # Save original form mappings for transpositional parsing
+        if hasattr(self, 'orig_forms') and self.orig_forms:
+            label_mappings['orig_forms'] = self.orig_forms
+            label_mappings['orig_form_to_id'] = self.orig_form_to_id
+            label_mappings['id_to_orig_form'] = {v: k for k, v in self.orig_form_to_id.items()}
+            label_mappings['use_orig_form_for_parser'] = True
         with open(Path(self.config.output_dir) / 'label_mappings.json', 'w', encoding='utf-8') as f:
             json.dump(label_mappings, f, ensure_ascii=False, indent=2)
         
@@ -2907,6 +2683,7 @@ class FlexiPipeTagger:
             norm_list = []
             head_list = []
             deprel_list = []
+            orig_form_list = []
             words_with_context = []  # Words with UPOS context embedded
             
             for sentence in examples['sentences']:
@@ -2918,6 +2695,7 @@ class FlexiPipeTagger:
                 norms = [token.get('norm_form', '_') for token in sentence]
                 heads = [token.get('head', 0) for token in sentence]
                 deprels = [token.get('deprel', '_') for token in sentence]
+                orig_forms = [token.get('orig_form', '_') for token in sentence]
                 
                 # NOTE: Removed UPOS context tokens - they were hurting performance
                 # BERT's contextual understanding is already strong enough
@@ -2935,6 +2713,9 @@ class FlexiPipeTagger:
                 if self.config.train_parser:
                     head_list.append(heads)
                     deprel_list.append(deprels)
+                    # Collect original forms for transpositional parsing
+                    if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                        orig_form_list.append([of.lower() if of != '_' else '_' for of in orig_forms])
             
             # Tokenize words (no context tokens anymore)
             tokenized = tokenizer(
@@ -2954,6 +2735,7 @@ class FlexiPipeTagger:
             aligned_norm = []
             aligned_head = []
             aligned_deprel = []
+            aligned_orig_form = []
             
             for i, (words, upos_labels, xpos_labels, feats_labels) in enumerate(zip(words_list, upos_list, xpos_list, feats_list)):
                 if self.config.train_lemmatizer:
@@ -2963,6 +2745,8 @@ class FlexiPipeTagger:
                 if self.config.train_parser:
                     head_labels = head_list[i]
                     deprel_labels = deprel_list[i]
+                    if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id and orig_form_list:
+                        orig_form_labels = orig_form_list[i]
                 word_ids = tokenized.word_ids(batch_index=i)
                 aligned_upos_seq = []
                 aligned_xpos_seq = []
@@ -2971,6 +2755,7 @@ class FlexiPipeTagger:
                 aligned_norm_seq = []
                 aligned_head_seq = []
                 aligned_deprel_seq = []
+                aligned_orig_form_seq = []
                 
                 # Since we no longer use context tokens, mapping is 1:1
                 # But keep the structure for compatibility
@@ -2990,6 +2775,8 @@ class FlexiPipeTagger:
                         if self.config.train_parser:
                             aligned_head_seq.append(-100)
                             aligned_deprel_seq.append(-100)
+                            if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                                aligned_orig_form_seq.append(-100)
                     elif word_idx != previous_word_idx:
                         # First subword token of a context-enhanced word
                         # Map back to original word index
@@ -3027,6 +2814,12 @@ class FlexiPipeTagger:
                                 
                                 deprel = deprel_labels[orig_word_idx] if orig_word_idx < len(deprel_labels) else '_'
                                 aligned_deprel_seq.append(self.deprel_to_id.get(deprel, 0))
+                                
+                                # Original form for transpositional parsing
+                                if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id and orig_form_list:
+                                    orig_form = orig_form_labels[orig_word_idx] if orig_word_idx < len(orig_form_labels) else '_'
+                                    orig_form_lower = orig_form.lower() if orig_form != '_' else '_'
+                                    aligned_orig_form_seq.append(self.orig_form_to_id.get(orig_form_lower, self.orig_form_to_id.get('_', 0)))
                         else:
                             # Should not happen now, but keep for safety
                             aligned_upos_seq.append(-100)
@@ -3039,6 +2832,8 @@ class FlexiPipeTagger:
                             if self.config.train_parser:
                                 aligned_head_seq.append(-100)
                                 aligned_deprel_seq.append(-100)
+                                if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                                    aligned_orig_form_seq.append(-100)
                     else:
                         # Subsequent subword tokens - use -100 to ignore
                         aligned_upos_seq.append(-100)
@@ -3051,6 +2846,8 @@ class FlexiPipeTagger:
                         if self.config.train_parser:
                             aligned_head_seq.append(-100)
                             aligned_deprel_seq.append(-100)
+                            if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                                aligned_orig_form_seq.append(-100)
                     
                     previous_word_idx = word_idx
                 
@@ -3064,6 +2861,8 @@ class FlexiPipeTagger:
                 if self.config.train_parser:
                     aligned_head.append(aligned_head_seq)
                     aligned_deprel.append(aligned_deprel_seq)
+                    if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                        aligned_orig_form.append(aligned_orig_form_seq)
             
             tokenized['labels_upos'] = aligned_upos
             tokenized['labels_xpos'] = aligned_xpos
@@ -3075,6 +2874,8 @@ class FlexiPipeTagger:
             if self.config.train_parser:
                 tokenized['labels_head'] = aligned_head
                 tokenized['labels_deprel'] = aligned_deprel
+                if hasattr(self, 'orig_form_to_id') and self.orig_form_to_id:
+                    tokenized['orig_form_ids'] = aligned_orig_form
             
             return tokenized
         
@@ -3103,6 +2904,9 @@ class FlexiPipeTagger:
             segment: If True, segment raw text into sentences (for 'raw' or 'plain' format)
             tokenize: If True, tokenize sentences into words (for 'raw' or 'plain' format)
         """
+        import time
+        start_time = time.time()
+        
         if self.config.debug:
             print(f"[DEBUG] tag() called: input_file={input_file}, format={format}, segment={segment}, tokenize={tokenize}", file=sys.stderr)
         # Only load model if we need it (not needed for normalization-only with vocabulary)
@@ -3219,7 +3023,17 @@ class FlexiPipeTagger:
         
         # Load input
         if format == "teitok":
+            # Store original XML tree for later preservation
+            try:
+                import xml.etree.ElementTree as ET
+                self.original_teitok_tree = ET.parse(input_file)
+                self.original_teitok_file = input_file
+            except Exception as e:
+                if self.config.debug:
+                    print(f"[DEBUG] Could not store original TEITOK tree: {e}", file=sys.stderr)
             sentences = load_teitok_xml(input_file, normalization_attr=self.config.normalization_attr)
+            # Track that we processed TEITOK input
+            self.operations_performed.append("processed_teitok_input")
         elif format == "raw":
             # Raw text: segment and tokenize
             with open(input_file, 'r', encoding='utf-8') as f:
@@ -3379,9 +3193,16 @@ class FlexiPipeTagger:
                         'head': token.get('head', '_'),  # Use '_' when no parser
                         'deprel': token.get('deprel', '_'),
                     }
-                    # Preserve _original_text if present (for # text = comment)
+                    # Preserve _original_text and sentence ID if present (for # text = and # sent_id = comments)
                     if '_original_text' in token:
                         tagged_token['_original_text'] = token.get('_original_text')
+                    if '_sentence_id' in token:
+                        tagged_token['_sentence_id'] = token.get('_sentence_id')
+                    # Preserve token ID from TEITOK XML (@id or @xml:id)
+                    if 'tok_id' in token and token.get('tok_id'):
+                        tagged_token['tok_id'] = token.get('tok_id')
+                    if 'dtok_id' in token and token.get('dtok_id'):
+                        tagged_token['dtok_id'] = token.get('dtok_id')
                     # Add normalization fields if present
                     if 'norm_form' in token and token.get('norm_form'):
                         tagged_token['norm_form'] = token.get('norm_form')
@@ -3391,7 +3212,10 @@ class FlexiPipeTagger:
                         tagged_token['split_forms'] = token.get('split_forms', None)
                     tagged_sentence.append(tagged_token)
                 tagged_sentences.append(tagged_sentence)
-            print(f"Normalization-only mode: Processed {len(tagged_sentences)} sentences, {sum(len(s) for s in tagged_sentences)} tokens", file=sys.stderr)
+            total_tokens = sum(len(s) for s in tagged_sentences)
+            elapsed_time = time.time() - start_time
+            tok_per_sec = total_tokens / elapsed_time if elapsed_time > 0 else 0
+            print(f"Normalization-only mode: Processed {len(tagged_sentences)} sentences, {total_tokens} tokens in {elapsed_time:.2f}s ({tok_per_sec:.1f} tok/s)", file=sys.stderr)
             if self.config.debug:
                 print(f"[DEBUG] Returning {len(tagged_sentences)} tagged sentences from normalization-only mode", file=sys.stderr)
             # Return early - don't continue to model-based processing
@@ -3409,9 +3233,15 @@ class FlexiPipeTagger:
                 # Extract word forms
                 words = [token.get('form', '_') for token in sentence]
                 
+                # Get capitalizable tags statistics from vocabulary metadata (language-agnostic)
+                capitalizable_tags = None
+                if self.vocab_metadata and 'capitalizable_tags' in self.vocab_metadata:
+                    # Use statistics directly (already in dict format)
+                    capitalizable_tags = self.vocab_metadata['capitalizable_tags']
+                
                 # Tag with Viterbi
-                upos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='upos')
-                xpos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='xpos')
+                upos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='upos', capitalizable_tags=capitalizable_tags)
+                xpos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='xpos', capitalizable_tags=capitalizable_tags)
                 
                 # Build tagged sentence
                 tagged_sentence = []
@@ -3435,6 +3265,7 @@ class FlexiPipeTagger:
                             form,
                             self.vocab,
                             conservative=self.config.conservative_normalization,
+                            similarity_threshold=self.config.similarity_threshold,
                             inflection_suffixes=self.inflection_suffixes
                         )
                         if normalized:
@@ -3446,20 +3277,49 @@ class FlexiPipeTagger:
                         # Use normalization from preprocessing if available
                         norm_form = token.get('norm_form')
                     
-                    # Get FEATS from vocab (use most frequent analysis for predicted UPOS/XPOS)
+                    # Get FEATS from vocab (use UPOS+FEATS matching by default, fallback to XPOS)
                     feats = '_'
                     entry = self.vocab.get(form) or self.vocab.get(form.lower())
                     if entry:
                         if isinstance(entry, list):
-                            # Find best matching analysis
+                            # Find best matching analysis based on config
                             best_entry = None
                             best_count = 0
-                            for analysis in entry:
-                                if analysis.get('upos') == upos and analysis.get('xpos') == xpos:
-                                    count = analysis.get('count', 0)
-                                    if count > best_count:
-                                        best_count = count
-                                        best_entry = analysis
+                            use_xpos = self.config.use_xpos_for_tagging
+                            
+                            if use_xpos:
+                                # XPOS-first: try XPOS match, then UPOS+FEATS
+                                for analysis in entry:
+                                    if xpos and xpos != '_' and analysis.get('xpos') == xpos:
+                                        count = analysis.get('count', 0)
+                                        if count > best_count:
+                                            best_count = count
+                                            best_entry = analysis
+                                if not best_entry and upos and upos != '_':
+                                    # Fallback to UPOS match
+                                    for analysis in entry:
+                                        if analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+                            else:
+                                # UPOS+FEATS-first (default): try UPOS match first
+                                for analysis in entry:
+                                    if upos and upos != '_' and analysis.get('upos') == upos:
+                                        count = analysis.get('count', 0)
+                                        if count > best_count:
+                                            best_count = count
+                                            best_entry = analysis
+                                if not best_entry and xpos and xpos != '_':
+                                    # Fallback to XPOS match
+                                    for analysis in entry:
+                                        if analysis.get('xpos') == xpos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+                            
                             if not best_entry:
                                 # Fallback to most frequent
                                 best_entry = max(entry, key=lambda a: a.get('count', 0))
@@ -3469,25 +3329,60 @@ class FlexiPipeTagger:
                     
                     # Get lemma: check vocab entry first, using reg form if available
                     # The lemma in vocab corresponds to the reg form (if present), not the original form
+                    # Also store best_entry for expan lookup (must match the selected XPOS/UPOS)
                     lemma = '_'
+                    best_entry_for_expan = None  # Store the entry that was selected for tagging
                     entry = self.vocab.get(form) or self.vocab.get(form.lower())
                     
                     if entry:
                         best_entry = None
                         if isinstance(entry, list):
-                            # Find best matching analysis based on UPOS/XPOS
+                            # Find best matching analysis based on UPOS/XPOS/FEATS
+                            # Prioritize based on use_xpos_for_tagging config
                             best_count = 0
-                            for analysis in entry:
-                                if analysis.get('upos') == upos and analysis.get('xpos') == xpos:
-                                    count = analysis.get('count', 0)
-                                    if count > best_count:
-                                        best_count = count
-                                        best_entry = analysis
+                            use_xpos = self.config.use_xpos_for_tagging
+                            
+                            if use_xpos:
+                                # XPOS-first: try XPOS match, then UPOS+FEATS
+                                for analysis in entry:
+                                    if xpos and xpos != '_' and analysis.get('xpos') == xpos:
+                                        count = analysis.get('count', 0)
+                                        if count > best_count:
+                                            best_count = count
+                                            best_entry = analysis
+                                if not best_entry and upos and upos != '_':
+                                    # Fallback to UPOS match
+                                    for analysis in entry:
+                                        if analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+                            else:
+                                # UPOS+FEATS-first (default): try UPOS match first
+                                for analysis in entry:
+                                    if upos and upos != '_' and analysis.get('upos') == upos:
+                                        count = analysis.get('count', 0)
+                                        if count > best_count:
+                                            best_count = count
+                                            best_entry = analysis
+                                if not best_entry and xpos and xpos != '_':
+                                    # Fallback to XPOS match
+                                    for analysis in entry:
+                                        if analysis.get('xpos') == xpos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+                            
                             if not best_entry:
                                 # Fallback to most frequent
                                 best_entry = max(entry, key=lambda a: a.get('count', 0))
                         elif isinstance(entry, dict):
                             best_entry = entry
+                        
+                        # Store best_entry for expan lookup (only use expan from the selected entry)
+                        best_entry_for_expan = best_entry
                         
                         if best_entry:
                             # If entry has reg field, lemma corresponds to reg form, not original
@@ -3502,7 +3397,7 @@ class FlexiPipeTagger:
                                     lemma = entry_lemma
                                 else:
                                     # No lemma in entry, but has reg - lookup lemma for reg form
-                                    lemma = self._predict_from_vocab(reg, 'lemma', xpos=xpos, upos=upos)
+                                    lemma = self._predict_from_vocab(reg, 'lemma', xpos=xpos, upos=upos, feats=feats)
                             else:
                                 # No reg field: use lemma directly from entry
                                 if entry_lemma and entry_lemma != '_':
@@ -3511,11 +3406,11 @@ class FlexiPipeTagger:
                     # If no lemma found yet, try normalization form if available
                     if lemma == '_':
                         if norm_form and norm_form != '_':
-                            lemma = self._predict_from_vocab(norm_form, 'lemma', xpos=xpos, upos=upos)
+                            lemma = self._predict_from_vocab(norm_form, 'lemma', xpos=xpos, upos=upos, feats=feats)
                     
                     # If still no lemma, try original form with pattern-based lemmatization
                     if lemma == '_':
-                        lemma = self._predict_from_vocab(form, 'lemma', xpos=xpos, upos=upos)
+                        lemma = self._predict_from_vocab(form, 'lemma', xpos=xpos, upos=upos, feats=feats)
                     
                     # Final fallback
                     if lemma == '_':
@@ -3532,9 +3427,17 @@ class FlexiPipeTagger:
                         'deprel': '_',
                     }
                     
-                    # Preserve original text
+                    # Preserve original text and sentence ID
                     if '_original_text' in token:
                         tagged_token['_original_text'] = token.get('_original_text')
+                    if '_sentence_id' in token:
+                        tagged_token['_sentence_id'] = token.get('_sentence_id')
+                    
+                    # Preserve token ID from TEITOK XML (@id or @xml:id)
+                    if 'tok_id' in token and token.get('tok_id'):
+                        tagged_token['tok_id'] = token.get('tok_id')
+                    if 'dtok_id' in token and token.get('dtok_id'):
+                        tagged_token['dtok_id'] = token.get('dtok_id')
                     
                     # Add normalization fields
                     if norm_form:
@@ -3542,12 +3445,43 @@ class FlexiPipeTagger:
                     if 'orig_form' in token:
                         tagged_token['orig_form'] = token.get('orig_form')
                     
+                    # Add expan from vocabulary entry that was selected for tagging
+                    # Only use expan from the same entry that matched the XPOS/UPOS
+                    expan = None
+                    if best_entry_for_expan:
+                        # Only use expan from the entry that was actually selected for tagging
+                        if 'expan' in best_entry_for_expan and best_entry_for_expan.get('expan') and best_entry_for_expan.get('expan') != '_':
+                            expan = best_entry_for_expan.get('expan')
+                    
+                    if expan:
+                        tagged_token['expan'] = expan
+                    
                     tagged_sentence.append(tagged_token)
                 
                 tagged_sentences.append(tagged_sentence)
             
+            total_tokens = sum(len(s) for s in tagged_sentences)
+            elapsed_time = time.time() - start_time
+            tok_per_sec = total_tokens / elapsed_time if elapsed_time > 0 else 0
+            print(f"Viterbi tagging complete: {len(tagged_sentences)} sentences, {total_tokens} tokens in {elapsed_time:.2f}s ({tok_per_sec:.1f} tok/s)", file=sys.stderr)
             if self.config.debug:
                 print(f"[DEBUG] Viterbi tagging complete: {len(tagged_sentences)} sentences", file=sys.stderr)
+            
+            # Track operations
+            if self.config.normalize:
+                self.operations_performed.append("normalized")
+            if self.config.parse:
+                self.operations_performed.append("parsed")
+            else:
+                self.operations_performed.append("tagged")
+            self.operations_performed.append("lemmatized")
+            self._last_tagged_sentences = tagged_sentences  # Store for revision statement
+            
+            # Write output if specified
+            if output_file:
+                self.write_output(tagged_sentences, output_file, format)
+            
+            return tagged_sentences
         else:
             # Need model for tagging/parsing - process sentences in batches
             tagged_sentences = []
@@ -3576,17 +3510,61 @@ class FlexiPipeTagger:
             input_ids = tokenized['input_ids'].to(self.device)
             attention_mask = tokenized['attention_mask'].to(self.device)
             
+            # Extract original form IDs for transpositional parsing (if available)
+            orig_form_ids = None
+            if (hasattr(self, 'orig_form_to_id') and self.orig_form_to_id and 
+                self.model.use_orig_form_for_parser and self.model.orig_form_embed is not None):
+                # Extract orig_form from tokens and convert to IDs
+                orig_form_ids_list = []
+                for sent_idx, sentence in enumerate(batch_sentences):
+                    word_ids = tokenized.word_ids(batch_index=sent_idx)
+                    orig_form_seq = []
+                    current_word_idx = None
+                    for token_idx, word_id in enumerate(word_ids):
+                        if word_id is not None and word_id != current_word_idx:
+                            current_word_idx = word_id
+                            if word_id < len(sentence):
+                                orig_form = sentence[word_id].get('orig_form', '_')
+                                orig_form_lower = orig_form.lower() if orig_form != '_' else '_'
+                                orig_form_id = self.orig_form_to_id.get(orig_form_lower, self.orig_form_to_id.get('_', 0))
+                                orig_form_seq.append(orig_form_id)
+                            else:
+                                orig_form_seq.append(self.orig_form_to_id.get('_', 0))
+                        elif word_id is None:
+                            # Special token (CLS, SEP, PAD) - use '_' ID
+                            orig_form_seq.append(self.orig_form_to_id.get('_', 0))
+                        else:
+                            # Subsequent subword token - use same ID as first subword
+                            if orig_form_seq:
+                                orig_form_seq.append(orig_form_seq[-1])
+                            else:
+                                orig_form_seq.append(self.orig_form_to_id.get('_', 0))
+                    # Pad to max_length
+                    while len(orig_form_seq) < self.config.max_length:
+                        orig_form_seq.append(self.orig_form_to_id.get('_', 0))
+                    orig_form_ids_list.append(orig_form_seq[:self.config.max_length])
+                
+                # Convert to tensor
+                orig_form_ids = torch.tensor(orig_form_ids_list, dtype=torch.long, device=self.device)
+            
             # Predict with model
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=input_ids,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    orig_form_ids=orig_form_ids
                 )
                 
-                # Get predictions
-                pred_upos = torch.argmax(outputs['logits_upos'], dim=-1)
-                pred_xpos = torch.argmax(outputs['logits_xpos'], dim=-1)
-                pred_feats = torch.argmax(outputs['logits_feats'], dim=-1)
+                # Get predictions and confidence scores for confidence-based blending
+                # Compute softmax probabilities to get confidence scores
+                probs_upos = torch.nn.functional.softmax(outputs['logits_upos'], dim=-1)
+                probs_xpos = torch.nn.functional.softmax(outputs['logits_xpos'], dim=-1)
+                probs_feats = torch.nn.functional.softmax(outputs['logits_feats'], dim=-1)
+                
+                # Get max probabilities (confidence scores)
+                max_probs_upos, pred_upos = torch.max(probs_upos, dim=-1)
+                max_probs_xpos, pred_xpos = torch.max(probs_xpos, dim=-1)
+                max_probs_feats, pred_feats = torch.max(probs_feats, dim=-1)
                 
                 # Lemma predictions (if lemmatizer was trained)
                 pred_lemmas = None
@@ -3626,6 +3604,7 @@ class FlexiPipeTagger:
                 
                 current_word_idx = None
                 word_predictions = {}  # orig_word_idx -> (upos, xpos, feats, lemma, norm, head, deprel)
+                word_confidence = {}  # orig_word_idx -> (upos_conf, xpos_conf, feats_conf) for confidence-based blending
                 token_to_word = {}  # token_idx -> orig_word_idx (for head mapping)
                 
                 # Collect predictions for each word (take first subword token)
@@ -3639,9 +3618,17 @@ class FlexiPipeTagger:
                             xpos_id = pred_xpos[sent_idx][token_idx].item()
                             feats_id = pred_feats[sent_idx][token_idx].item()
                             
+                            # Get confidence scores
+                            upos_conf = max_probs_upos[sent_idx][token_idx].item()
+                            xpos_conf = max_probs_xpos[sent_idx][token_idx].item()
+                            feats_conf = max_probs_feats[sent_idx][token_idx].item()
+                            
                             upos = self.id_to_upos.get(upos_id, '_')
                             xpos = self.id_to_xpos.get(xpos_id, '_')
                             feats = self.id_to_feats.get(feats_id, '_')
+                            
+                            # Store confidence scores for confidence-based blending
+                            word_confidence[orig_word_idx] = (upos_conf, xpos_conf, feats_conf)
                             
                             # Lemma prediction
                             lemma = '_'
@@ -3714,30 +3701,70 @@ class FlexiPipeTagger:
                         elif vocab_upos and vocab_upos != '_':
                             tagged_token['upos'] = vocab_upos
                         else:
-                            # Use model prediction
-                            if word_idx in word_predictions:
-                                tagged_token['upos'] = word_predictions[word_idx][0]
-                            else:
-                                # Fallback to vocabulary or similarity
-                                tagged_token['upos'] = self._predict_from_vocab(form, 'upos')
+                            # Confidence-based blending: use vocab if model confidence is low
+                            use_vocab_for_upos = False
+                            if (self.config.use_vocabulary and 
+                                word_idx in word_confidence and 
+                                word_confidence[word_idx][0] < self.config.confidence_threshold):
+                                # Model confidence is low, try vocabulary
+                                vocab_upos_fallback = self._predict_from_vocab(form, 'upos')
+                                if vocab_upos_fallback and vocab_upos_fallback != '_':
+                                    tagged_token['upos'] = vocab_upos_fallback
+                                    use_vocab_for_upos = True
+                            
+                            if not use_vocab_for_upos:
+                                # Use model prediction (either high confidence or no vocab match)
+                                if word_idx in word_predictions:
+                                    tagged_token['upos'] = word_predictions[word_idx][0]
+                                else:
+                                    # Fallback to vocabulary or similarity
+                                    tagged_token['upos'] = self._predict_from_vocab(form, 'upos')
                         
                         if existing_xpos != '_':
                             tagged_token['xpos'] = existing_xpos
                         elif vocab_xpos and vocab_xpos != '_':
                             tagged_token['xpos'] = vocab_xpos
-                        elif word_idx in word_predictions:
-                            tagged_token['xpos'] = word_predictions[word_idx][1]
                         else:
-                            tagged_token['xpos'] = self._predict_from_vocab(form, 'xpos')
+                            # Confidence-based blending: use vocab if model confidence is low
+                            use_vocab_for_xpos = False
+                            if (self.config.use_vocabulary and 
+                                word_idx in word_confidence and 
+                                word_confidence[word_idx][1] < self.config.confidence_threshold):
+                                # Model confidence is low, try vocabulary
+                                vocab_xpos_fallback = self._predict_from_vocab(form, 'xpos')
+                                if vocab_xpos_fallback and vocab_xpos_fallback != '_':
+                                    tagged_token['xpos'] = vocab_xpos_fallback
+                                    use_vocab_for_xpos = True
+                            
+                            if not use_vocab_for_xpos:
+                                # Use model prediction (either high confidence or no vocab match)
+                                if word_idx in word_predictions:
+                                    tagged_token['xpos'] = word_predictions[word_idx][1]
+                                else:
+                                    tagged_token['xpos'] = self._predict_from_vocab(form, 'xpos')
                         
                         if existing_feats != '_':
                             tagged_token['feats'] = existing_feats
                         elif vocab_feats and vocab_feats != '_':
                             tagged_token['feats'] = vocab_feats
-                        elif word_idx in word_predictions:
-                            tagged_token['feats'] = word_predictions[word_idx][2]
                         else:
-                            tagged_token['feats'] = self._predict_from_vocab(form, 'feats')
+                            # Confidence-based blending: use vocab if model confidence is low
+                            use_vocab_for_feats = False
+                            if (self.config.use_vocabulary and 
+                                word_idx in word_confidence and 
+                                word_confidence[word_idx][2] < self.config.confidence_threshold):
+                                # Model confidence is low, try vocabulary
+                                vocab_feats_fallback = self._predict_from_vocab(form, 'feats')
+                                if vocab_feats_fallback and vocab_feats_fallback != '_':
+                                    tagged_token['feats'] = vocab_feats_fallback
+                                    use_vocab_for_feats = True
+                            
+                            if not use_vocab_for_feats:
+                                # Use model prediction (either high confidence or no vocab match)
+                                if word_idx in word_predictions:
+                                    tagged_token['feats'] = word_predictions[word_idx][2]
+                                else:
+                                    tagged_token['feats'] = self._predict_from_vocab(form, 'feats')
                         
                         if existing_lemma != '_':
                             tagged_token['lemma'] = existing_lemma
@@ -3765,6 +3792,64 @@ class FlexiPipeTagger:
                             # If not parsing, clear head/deprel
                             tagged_token['head'] = '_'
                             tagged_token['deprel'] = '_'
+                        
+                        # Add expan from vocabulary entry that matches the selected XPOS/UPOS
+                        # Only use expan from the same entry that was used for tagging
+                        expan = None
+                        xpos = tagged_token.get('xpos', '_')
+                        upos = tagged_token.get('upos', '_')
+                        entry = self.vocab.get(form) or self.vocab.get(form.lower())
+                        
+                        if entry:
+                            best_entry_for_expan = None
+                            if isinstance(entry, list):
+                                # Find the entry that matches the selected XPOS/UPOS
+                                use_xpos = self.config.use_xpos_for_tagging
+                                best_count = 0
+                                
+                                if use_xpos:
+                                    # XPOS-first: try XPOS match, then UPOS
+                                    for analysis in entry:
+                                        if xpos and xpos != '_' and analysis.get('xpos') == xpos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry_for_expan = analysis
+                                    if not best_entry_for_expan and upos and upos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('upos') == upos:
+                                                count = analysis.get('count', 0)
+                                                if count > best_count:
+                                                    best_count = count
+                                                    best_entry_for_expan = analysis
+                                else:
+                                    # UPOS-first: try UPOS match, then XPOS
+                                    for analysis in entry:
+                                        if upos and upos != '_' and analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry_for_expan = analysis
+                                    if not best_entry_for_expan and xpos and xpos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('xpos') == xpos:
+                                                count = analysis.get('count', 0)
+                                                if count > best_count:
+                                                    best_count = count
+                                                    best_entry_for_expan = analysis
+                                
+                                if not best_entry_for_expan:
+                                    # Fallback to most frequent
+                                    best_entry_for_expan = max(entry, key=lambda a: a.get('count', 0))
+                            elif isinstance(entry, dict):
+                                best_entry_for_expan = entry
+                            
+                            # Only use expan from the entry that was selected for tagging
+                            if best_entry_for_expan and 'expan' in best_entry_for_expan and best_entry_for_expan.get('expan') and best_entry_for_expan.get('expan') != '_':
+                                expan = best_entry_for_expan.get('expan')
+                        
+                        if expan:
+                            tagged_token['expan'] = expan
                     else:
                         # Use model predictions (ignore existing annotations, but respect vocab if priority enabled)
                         if word_idx in word_predictions:
@@ -3844,10 +3929,74 @@ class FlexiPipeTagger:
                             tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form)
                             tagged_token['head'] = '_'
                             tagged_token['deprel'] = '_'
+                        
+                        # Add expan from vocabulary entry that matches the selected XPOS/UPOS
+                        # Only use expan from the same entry that was used for tagging
+                        expan = None
+                        xpos = tagged_token.get('xpos', '_')
+                        upos = tagged_token.get('upos', '_')
+                        entry = self.vocab.get(form) or self.vocab.get(form.lower())
+                        
+                        if entry:
+                            best_entry_for_expan = None
+                            if isinstance(entry, list):
+                                # Find the entry that matches the selected XPOS/UPOS
+                                use_xpos = self.config.use_xpos_for_tagging
+                                best_count = 0
+                                
+                                if use_xpos:
+                                    # XPOS-first: try XPOS match, then UPOS
+                                    for analysis in entry:
+                                        if xpos and xpos != '_' and analysis.get('xpos') == xpos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry_for_expan = analysis
+                                    if not best_entry_for_expan and upos and upos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('upos') == upos:
+                                                count = analysis.get('count', 0)
+                                                if count > best_count:
+                                                    best_count = count
+                                                    best_entry_for_expan = analysis
+                                else:
+                                    # UPOS-first: try UPOS match, then XPOS
+                                    for analysis in entry:
+                                        if upos and upos != '_' and analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry_for_expan = analysis
+                                    if not best_entry_for_expan and xpos and xpos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('xpos') == xpos:
+                                                count = analysis.get('count', 0)
+                                                if count > best_count:
+                                                    best_count = count
+                                                    best_entry_for_expan = analysis
+                                
+                                if not best_entry_for_expan:
+                                    # Fallback to most frequent
+                                    best_entry_for_expan = max(entry, key=lambda a: a.get('count', 0))
+                            elif isinstance(entry, dict):
+                                best_entry_for_expan = entry
+                            
+                            # Only use expan from the entry that was selected for tagging
+                            if best_entry_for_expan and 'expan' in best_entry_for_expan and best_entry_for_expan.get('expan') and best_entry_for_expan.get('expan') != '_':
+                                expan = best_entry_for_expan.get('expan')
+                        
+                        if expan:
+                            tagged_token['expan'] = expan
                     
                     tagged_sentence.append(tagged_token)
                 
                 tagged_sentences.append(tagged_sentence)
+        
+        # Calculate final statistics (for model-based tagging)
+        total_tokens = sum(len(s) for s in tagged_sentences)
+        elapsed_time = time.time() - start_time
+        tok_per_sec = total_tokens / elapsed_time if elapsed_time > 0 else 0
+        print(f"Tagging complete: {len(tagged_sentences)} sentences, {total_tokens} tokens in {elapsed_time:.2f}s ({tok_per_sec:.1f} tok/s)", file=sys.stderr)
         
         # Write output
         if output_file:
@@ -3906,7 +4055,7 @@ class FlexiPipeTagger:
                             form, 
                             self.vocab, 
                             conservative=self.config.conservative_normalization,
-                            similarity_threshold=0.8 if self.config.conservative_normalization else 0.7,
+                            similarity_threshold=self.config.similarity_threshold,
                             inflection_suffixes=self.inflection_suffixes
                         )
                     
@@ -3982,50 +4131,85 @@ class FlexiPipeTagger:
         # The lemma corresponds to the Reg form, not the original form
         lemma_form = norm_form if norm_form and norm_form != '_' else form
         
+        if self.config.debug:
+            print(f"[DEBUG LEMMA] Form: '{form}', Lemma form: '{lemma_form}', XPOS: '{xpos}', UPOS: '{upos}', Norm form: '{norm_form}'", file=sys.stderr)
+        
         # Get BERT prediction if available
         bert_lemma = None
         if self.model.train_lemmatizer and word_idx in word_predictions and len(word_predictions[word_idx]) > 3:
             bert_lemma = word_predictions[word_idx][3]
             if bert_lemma == '_':
                 bert_lemma = None
+            if self.config.debug:
+                print(f"[DEBUG LEMMA] BERT lemma: '{bert_lemma}'", file=sys.stderr)
         
         # Get vocabulary prediction (use normalized form if available)
         vocab_lemma = None
         if self.config.use_vocabulary:
-            vocab_lemma = self._predict_from_vocab(lemma_form, 'lemma', xpos=xpos, upos=upos)
+            # Get FEATS if available from word_predictions
+            feats = None
+            if word_idx in word_predictions and len(word_predictions[word_idx]) > 2:
+                feats = word_predictions[word_idx][2]
+                if feats == '_':
+                    feats = None
+            
+            vocab_lemma = self._predict_from_vocab(lemma_form, 'lemma', xpos=xpos, upos=upos, feats=feats, debug=self.config.debug)
             if vocab_lemma == '_':
                 vocab_lemma = None
+            if self.config.debug:
+                print(f"[DEBUG LEMMA] Vocab lemma: '{vocab_lemma}'", file=sys.stderr)
         
         # Apply lemma_method priority
+        final_lemma = None
         if lemma_method == 'similarity':
             # Similarity first: try vocab, then BERT, then fallback
             if vocab_lemma:
-                return vocab_lemma
+                final_lemma = vocab_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=similarity)", file=sys.stderr)
             elif bert_lemma:
-                return bert_lemma
+                final_lemma = bert_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=similarity)", file=sys.stderr)
             else:
-                return form.lower()
+                final_lemma = form.lower()
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=similarity)", file=sys.stderr)
         
         elif lemma_method == 'bert':
             # BERT first: try BERT, then vocab, then fallback
             if bert_lemma:
-                return bert_lemma
+                final_lemma = bert_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=bert)", file=sys.stderr)
             elif vocab_lemma:
-                return vocab_lemma
+                final_lemma = vocab_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=bert)", file=sys.stderr)
             else:
-                return form.lower()
+                final_lemma = form.lower()
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=bert)", file=sys.stderr)
         
         else:  # 'auto' - default behavior
             # Auto: try BERT first, then vocab, then fallback
             # This is the original behavior
             if bert_lemma:
-                return bert_lemma
+                final_lemma = bert_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=auto)", file=sys.stderr)
             elif vocab_lemma:
-                return vocab_lemma
+                final_lemma = vocab_lemma
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=auto)", file=sys.stderr)
             else:
-                return form.lower()
+                final_lemma = form.lower()
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=auto)", file=sys.stderr)
+        
+        return final_lemma
     
-    def _predict_from_vocab(self, form: str, field: str, xpos: str = None, upos: str = None) -> str:
+    def _predict_from_vocab(self, form: str, field: str, xpos: str = None, upos: str = None, feats: str = None, debug: bool = False) -> str:
         """Predict from vocabulary or similarity matching.
         
         For lemmatization, uses XPOS-aware lookup (like neotag):
@@ -4047,38 +4231,97 @@ class FlexiPipeTagger:
             form: Word form
             field: Field to predict ('lemma', 'upos', 'xpos', 'feats')
             xpos: XPOS tag (optional, used for context-aware lemmatization)
-            upos: UPOS tag (optional, used as fallback)
+            upos: UPOS tag (optional, used for context-aware lemmatization)
+            feats: FEATS tag (optional, used for context-aware lemmatization)
         """
         form_lower = form.lower()
+        use_xpos = self.config.use_xpos_for_tagging
         
-        def get_field_from_entry(entry, field, xpos=None, upos=None):
+        def get_field_from_entry(entry, field, xpos=None, upos=None, feats=None, debug_entry=False):
             """Helper to extract field from vocabulary entry (single object or array).
             
             For ambiguous words (arrays), uses count/frequency to prefer most likely analysis.
             """
             if isinstance(entry, list):
-                # Multiple analyses: try to find best match using XPOS/UPOS context
-                # If context matches, prefer by count (most frequent)
+                # Multiple analyses: try to find best match using context
+                # Default: prioritize UPOS+FEATS (UD standard), fallback to XPOS if UPOS/FEATS not available
+                # If use_xpos_for_tagging=True: prioritize XPOS, fallback to UPOS+FEATS
                 matches = []
                 
-                if xpos and xpos != '_':
-                    # Try to find analyses matching XPOS
-                    for analysis in entry:
-                        if analysis.get('xpos') == xpos:
-                            count = analysis.get('count', 0)
-                            matches.append((count, analysis))
-                
-                if not matches and upos and upos != '_':
-                    # Try to find analyses matching UPOS
-                    for analysis in entry:
-                        if analysis.get('upos') == upos:
-                            count = analysis.get('count', 0)
-                            matches.append((count, analysis))
+                if use_xpos:
+                    # XPOS-first mode: try XPOS match first
+                    if xpos and xpos != '_':
+                        if debug_entry or debug:
+                            print(f"[DEBUG LEMMA] Looking for XPOS match: '{xpos}'", file=sys.stderr)
+                        for analysis in entry:
+                            analysis_xpos = analysis.get('xpos')
+                            if debug_entry or debug:
+                                print(f"[DEBUG LEMMA]   Checking analysis: xpos='{analysis_xpos}', lemma='{analysis.get('lemma', '_')}', count={analysis.get('count', 0)}", file=sys.stderr)
+                            if analysis_xpos == xpos:
+                                count = analysis.get('count', 0)
+                                matches.append((count, analysis))
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA]   MATCH found! xpos='{analysis_xpos}' == '{xpos}'", file=sys.stderr)
+                    
+                    # Fallback to UPOS+FEATS if no XPOS match
+                    if not matches and upos and upos != '_':
+                        if debug_entry or debug:
+                            print(f"[DEBUG LEMMA] No XPOS match, trying UPOS+FEATS: upos='{upos}', feats='{feats}'", file=sys.stderr)
+                        for analysis in entry:
+                            analysis_upos = analysis.get('upos', '_')
+                            analysis_feats = analysis.get('feats', '_')
+                            if analysis_upos == upos:
+                                # If FEATS provided, require match; otherwise just UPOS match
+                                if feats and feats != '_':
+                                    if analysis_feats == feats:
+                                        count = analysis.get('count', 0)
+                                        matches.append((count, analysis))
+                                else:
+                                    count = analysis.get('count', 0)
+                                    matches.append((count, analysis))
+                else:
+                    # UPOS+FEATS-first mode (default): try UPOS+FEATS match first
+                    if upos and upos != '_':
+                        if debug_entry or debug:
+                            print(f"[DEBUG LEMMA] Looking for UPOS+FEATS match: upos='{upos}', feats='{feats}'", file=sys.stderr)
+                        for analysis in entry:
+                            analysis_upos = analysis.get('upos', '_')
+                            analysis_feats = analysis.get('feats', '_')
+                            if analysis_upos == upos:
+                                # If FEATS provided, require match; otherwise just UPOS match
+                                if feats and feats != '_':
+                                    if analysis_feats == feats:
+                                        count = analysis.get('count', 0)
+                                        matches.append((count, analysis))
+                                        if debug_entry or debug:
+                                            print(f"[DEBUG LEMMA]   MATCH found! upos='{analysis_upos}', feats='{analysis_feats}'", file=sys.stderr)
+                                else:
+                                    count = analysis.get('count', 0)
+                                    matches.append((count, analysis))
+                                    if debug_entry or debug:
+                                        print(f"[DEBUG LEMMA]   MATCH found! upos='{analysis_upos}'", file=sys.stderr)
+                    
+                    # Fallback to XPOS if no UPOS+FEATS match and XPOS available
+                    if not matches and xpos and xpos != '_':
+                        if debug_entry or debug:
+                            print(f"[DEBUG LEMMA] No UPOS+FEATS match, trying XPOS: '{xpos}'", file=sys.stderr)
+                        for analysis in entry:
+                            analysis_xpos = analysis.get('xpos')
+                            if analysis_xpos == xpos:
+                                count = analysis.get('count', 0)
+                                matches.append((count, analysis))
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA]   MATCH found! xpos='{analysis_xpos}' == '{xpos}'", file=sys.stderr)
                 
                 if matches:
                     # Sort by count (descending) and return field from most frequent match
                     matches.sort(key=lambda x: x[0], reverse=True)
-                    return matches[0][1].get(field, '_')
+                    result = matches[0][1].get(field, '_')
+                    if debug_entry or debug:
+                        print(f"[DEBUG LEMMA] Returning from context match: '{result}' (from analysis with count={matches[0][0]})", file=sys.stderr)
+                    return result
+                elif (debug_entry or debug) and ((xpos and xpos != '_') or (upos and upos != '_')):
+                    print(f"[DEBUG LEMMA] No context match found, falling through to fallback logic", file=sys.stderr)
                 
                 # No context match: return from most frequent analysis (sorted by count)
                 # BUT: If looking for XPOS/UPOS/FEATS, only consider analyses that have that field
@@ -4095,30 +4338,32 @@ class FlexiPipeTagger:
                             # No entries have this field - return '_' to indicate not found
                             return '_'
                     elif field == 'lemma':
-                        # For lemmatization: if XPOS/UPOS context was provided but didn't match,
-                        # only consider analyses that have XPOS/UPOS tags (more reliable)
-                        # This ensures context-aware lemmatization (e.g., "rueda" as noun vs verb)
-                        if xpos and xpos != '_':
-                            # XPOS provided: only consider analyses with XPOS tags
-                            entries_with_xpos = [a for a in entry if a.get('xpos') and a.get('xpos') != '_']
-                            if entries_with_xpos:
-                                # Use most frequent among entries with XPOS
-                                sorted_entries = sorted(entries_with_xpos, key=lambda x: x.get('count', 0), reverse=True)
-                                return sorted_entries[0].get(field, '_')
-                            # No entries with XPOS - return '_' to trigger pattern-based fallback
-                            return '_'
-                        elif upos and upos != '_':
-                            # UPOS provided (but no XPOS): only consider analyses with UPOS tags
-                            entries_with_upos = [a for a in entry if a.get('upos') and a.get('upos') != '_']
-                            if entries_with_upos:
-                                sorted_entries = sorted(entries_with_upos, key=lambda x: x.get('count', 0), reverse=True)
-                                return sorted_entries[0].get(field, '_')
-                            # No entries with UPOS - return '_' to trigger pattern-based fallback
-                            return '_'
+                        # For lemmatization: if context was provided but didn't match,
+                        # we should NOT fall back to wrong entries - that defeats the purpose
+                        # Return '_' to trigger pattern-based fallback
+                        if use_xpos:
+                            if xpos and xpos != '_':
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA] No exact XPOS match for '{xpos}', but XPOS provided - returning '_' to trigger pattern-based fallback", file=sys.stderr)
+                                return '_'
+                            elif upos and upos != '_':
+                                # UPOS provided but no XPOS match - return '_' to trigger pattern-based fallback
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA] No exact UPOS+FEATS match, but UPOS provided - returning '_' to trigger pattern-based fallback", file=sys.stderr)
+                                return '_'
                         else:
-                            # No context: use all entries (most frequent)
-                            sorted_entries = sorted(entry, key=lambda x: x.get('count', 0), reverse=True)
-                            return sorted_entries[0].get(field, '_')
+                            if upos and upos != '_':
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA] No exact UPOS+FEATS match, but UPOS provided - returning '_' to trigger pattern-based fallback", file=sys.stderr)
+                                return '_'
+                            elif xpos and xpos != '_':
+                                # XPOS provided but no UPOS+FEATS match - return '_' to trigger pattern-based fallback
+                                if debug_entry or debug:
+                                    print(f"[DEBUG LEMMA] No exact XPOS match for '{xpos}', but XPOS provided - returning '_' to trigger pattern-based fallback", file=sys.stderr)
+                                return '_'
+                        # No context provided: use all entries (most frequent)
+                        sorted_entries = sorted(entry, key=lambda x: x.get('count', 0), reverse=True)
+                        return sorted_entries[0].get(field, '_')
                     else:
                         # For other fields, use all entries
                         sorted_entries = sorted(entry, key=lambda x: x.get('count', 0), reverse=True)
@@ -4138,12 +4383,26 @@ class FlexiPipeTagger:
             # Try exact case first
             key = f"{form}:{xpos}"
             if key in self.vocab:
-                return get_field_from_entry(self.vocab[key], field, xpos, upos)
+                if debug:
+                    print(f"[DEBUG LEMMA] Found form:xpos key: '{key}'", file=sys.stderr)
+                result = get_field_from_entry(self.vocab[key], field, xpos, upos, debug_entry=debug)
+                if debug:
+                    print(f"[DEBUG LEMMA] Result from '{key}': '{result}'", file=sys.stderr)
+                return result
+            elif debug:
+                print(f"[DEBUG LEMMA] Form:xpos key '{key}' not found in vocab", file=sys.stderr)
             
             # Try lowercase
             key = f"{form_lower}:{xpos}"
             if key in self.vocab:
-                return get_field_from_entry(self.vocab[key], field, xpos, upos)
+                if debug:
+                    print(f"[DEBUG LEMMA] Found form:xpos key (lowercase): '{key}'", file=sys.stderr)
+                result = get_field_from_entry(self.vocab[key], field, xpos, upos, debug_entry=debug)
+                if debug:
+                    print(f"[DEBUG LEMMA] Result from '{key}': '{result}'", file=sys.stderr)
+                return result
+            elif debug:
+                print(f"[DEBUG LEMMA] Form:xpos key '{key}' (lowercase) not found in vocab", file=sys.stderr)
         
         # Standard form-only lookup: try exact case first, then lowercase
         # This is important for case-sensitive distinctions:
@@ -4152,26 +4411,64 @@ class FlexiPipeTagger:
         
         # Try exact case match first
         if form in self.vocab:
-            vocab_result = get_field_from_entry(self.vocab[form], field, xpos, upos)
-            # For lemmatization: if vocab returns the form itself (or '_'), try pattern-based as fallback
-            if field == 'lemma' and vocab_result in ('_', form_lower, form):
-                # Vocab didn't provide a useful lemma, try pattern-based
+            if debug:
+                print(f"[DEBUG LEMMA] Found form in vocab: '{form}'", file=sys.stderr)
+                entry = self.vocab[form]
+                if isinstance(entry, list):
+                    print(f"[DEBUG LEMMA] Entry has {len(entry)} analyses:", file=sys.stderr)
+                    for i, analysis in enumerate(entry):
+                        print(f"[DEBUG LEMMA]   [{i}] xpos={analysis.get('xpos', '_')}, upos={analysis.get('upos', '_')}, lemma={analysis.get('lemma', '_')}, count={analysis.get('count', 0)}", file=sys.stderr)
+                else:
+                    print(f"[DEBUG LEMMA] Entry: xpos={entry.get('xpos', '_')}, upos={entry.get('upos', '_')}, lemma={entry.get('lemma', '_')}", file=sys.stderr)
+            vocab_result = get_field_from_entry(self.vocab[form], field, xpos, upos, debug_entry=debug)
+            if debug:
+                print(f"[DEBUG LEMMA] Result from form '{form}': '{vocab_result}'", file=sys.stderr)
+            # For lemmatization: if vocab returns '_', try pattern-based as fallback
+            # BUT: if vocab returns the form itself, it might still be correct (e.g., "era" noun -> "era")
+            # Only reject if it's '_' or if we got it from a fallback (no XPOS match)
+            if field == 'lemma' and vocab_result == '_':
+                # Vocab didn't provide a lemma, try pattern-based
                 if xpos and xpos != '_':
-                    pattern_lemma = self._apply_lemmatization_patterns(form, xpos)
+                    if debug:
+                        print(f"[DEBUG LEMMA] Vocab returned '_', trying pattern-based", file=sys.stderr)
+                    pattern_lemma = self._apply_lemmatization_patterns(form, xpos, debug=debug)
                     if pattern_lemma and pattern_lemma != '_':
+                        if debug:
+                            print(f"[DEBUG LEMMA] Pattern-based lemma: '{pattern_lemma}'", file=sys.stderr)
                         return pattern_lemma
+            # If vocab returned the form itself, it's still valid if it came from an XPOS match
+            # Only try pattern-based if vocab returned '_'
             return vocab_result
         
         # Fall back to lowercase match
         if form_lower in self.vocab:
-            vocab_result = get_field_from_entry(self.vocab[form_lower], field, xpos, upos)
-            # For lemmatization: if vocab returns the form itself (or '_'), try pattern-based as fallback
-            if field == 'lemma' and vocab_result in ('_', form_lower, form):
-                # Vocab didn't provide a useful lemma, try pattern-based
+            if debug:
+                print(f"[DEBUG LEMMA] Found form_lower in vocab: '{form_lower}'", file=sys.stderr)
+                entry = self.vocab[form_lower]
+                if isinstance(entry, list):
+                    print(f"[DEBUG LEMMA] Entry has {len(entry)} analyses:", file=sys.stderr)
+                    for i, analysis in enumerate(entry):
+                        print(f"[DEBUG LEMMA]   [{i}] xpos={analysis.get('xpos', '_')}, upos={analysis.get('upos', '_')}, lemma={analysis.get('lemma', '_')}, count={analysis.get('count', 0)}", file=sys.stderr)
+                else:
+                    print(f"[DEBUG LEMMA] Entry: xpos={entry.get('xpos', '_')}, upos={entry.get('upos', '_')}, lemma={entry.get('lemma', '_')}", file=sys.stderr)
+            vocab_result = get_field_from_entry(self.vocab[form_lower], field, xpos, upos, debug_entry=debug)
+            if debug:
+                print(f"[DEBUG LEMMA] Result from form_lower '{form_lower}': '{vocab_result}'", file=sys.stderr)
+            # For lemmatization: if vocab returns '_', try pattern-based as fallback
+            # BUT: if vocab returns the form itself, it might still be correct (e.g., "era" noun -> "era")
+            # Only reject if it's '_' or if we got it from a fallback (no XPOS match)
+            if field == 'lemma' and vocab_result == '_':
+                # Vocab didn't provide a lemma, try pattern-based
                 if xpos and xpos != '_':
-                    pattern_lemma = self._apply_lemmatization_patterns(form, xpos)
+                    if debug:
+                        print(f"[DEBUG LEMMA] Vocab returned '_', trying pattern-based", file=sys.stderr)
+                    pattern_lemma = self._apply_lemmatization_patterns(form, xpos, debug=debug)
                     if pattern_lemma and pattern_lemma != '_':
+                        if debug:
+                            print(f"[DEBUG LEMMA] Pattern-based lemma: '{pattern_lemma}'", file=sys.stderr)
                         return pattern_lemma
+            # If vocab returned the form itself, it's still valid if it came from an XPOS match
+            # Only try pattern-based if vocab returned '_'
             return vocab_result
         
         # Pattern-based similarity lemmatization for OOV words (TreeTagger/Neotag style)
@@ -4183,10 +4480,18 @@ class FlexiPipeTagger:
             non_inflecting_prefixes = ['SP', 'CC', 'CS', 'I', 'F', 'Z']  # Prepositions, conjunctions, interjections, punctuation, numbers
             if any(xpos.startswith(prefix) for prefix in non_inflecting_prefixes):
                 # For non-inflecting POS, lemma should be the form itself
+                if debug:
+                    print(f"[DEBUG LEMMA] XPOS '{xpos}' is non-inflecting, returning form_lower: '{form_lower}'", file=sys.stderr)
                 return form_lower
-            lemma = self._apply_lemmatization_patterns(form, xpos)
+            if debug:
+                print(f"[DEBUG LEMMA] Trying pattern-based lemmatization for form '{form}' with XPOS '{xpos}'", file=sys.stderr)
+            lemma = self._apply_lemmatization_patterns(form, xpos, debug=debug)
             if lemma and lemma != '_':
+                if debug:
+                    print(f"[DEBUG LEMMA] Pattern-based lemma: '{lemma}'", file=sys.stderr)
                 return lemma
+            elif debug:
+                print(f"[DEBUG LEMMA] Pattern-based lemmatization returned '{lemma}' (no match)", file=sys.stderr)
         
         # Try similarity matching (fallback for cases where pattern-based doesn't work)
         # BUT: Skip similarity matching for non-inflecting POS tags
@@ -4196,16 +4501,26 @@ class FlexiPipeTagger:
                 # For non-inflecting POS, lemma should be the form itself
                 return form_lower
         
+        if debug:
+            print(f"[DEBUG LEMMA] Trying similarity matching for form '{form}'", file=sys.stderr)
         similar = find_similar_words(form, self.vocab, self.config.similarity_threshold)
         if similar:
             best_match = similar[0][0]
+            if debug:
+                print(f"[DEBUG LEMMA] Found similar words (showing top 5):", file=sys.stderr)
+                for i, (match_word, score) in enumerate(similar[:5]):
+                    print(f"[DEBUG LEMMA]   [{i}] '{match_word}' (similarity: {score:.3f})", file=sys.stderr)
             similar_entry = self.vocab[best_match]
             
             # Handle array format
             if isinstance(similar_entry, list):
                 result = similar_entry[0].get(field, '_') if similar_entry else '_'
+                if debug:
+                    print(f"[DEBUG LEMMA] Similar entry '{best_match}' has {len(similar_entry)} analyses, using first: '{result}'", file=sys.stderr)
             else:
                 result = similar_entry.get(field, '_')
+                if debug:
+                    print(f"[DEBUG LEMMA] Similar entry '{best_match}' result: '{result}'", file=sys.stderr)
             
             # For lemmatization of OOV words via similarity matching:
             # - If the similar word has a reg field, use its lemma directly (don't transform)
@@ -4283,7 +4598,7 @@ class FlexiPipeTagger:
         
         return '_'
     
-    def _apply_lemmatization_patterns(self, form: str, xpos: str) -> str:
+    def _apply_lemmatization_patterns(self, form: str, xpos: str, debug: bool = False) -> str:
         """
         Apply lemmatization patterns to OOV word (TreeTagger/Neotag style).
         
@@ -4301,10 +4616,15 @@ class FlexiPipeTagger:
             Lemma or '_' if no pattern matches
         """
         if not self.lemmatization_patterns or xpos not in self.lemmatization_patterns:
+            if debug:
+                print(f"[DEBUG LEMMA PATTERNS] No patterns for XPOS '{xpos}'", file=sys.stderr)
             return '_'
         
         form_lower = form.lower()
         patterns = self.lemmatization_patterns[xpos]
+        
+        if debug:
+            print(f"[DEBUG LEMMA PATTERNS] Found {len(patterns)} patterns for XPOS '{xpos}'", file=sys.stderr)
         
         # Find all matching patterns (patterns where suffix_from matches the end of the form)
         matching_patterns = []
@@ -4334,10 +4654,27 @@ class FlexiPipeTagger:
                         lemma = base + suffix_to  # Will be just "base" if suffix_to is empty
                         # Verify lemma is reasonable (not empty, not too short)
                         if len(lemma) >= 2:
+                            # Additional validation: filter out unrealistic patterns at application time
+                            # This catches patterns that might have slipped through during building
+                            # 1. Very short suffix patterns that add characters (likely errors)
+                            if len(suffix_from) <= 1 and len(suffix_to) > len(suffix_from) + 1:
+                                # Skip: very short suffix adding more than 1 character is unrealistic
+                                # Example: "o" -> "oto" (1 char -> 3 chars) is suspicious
+                                if debug:
+                                    print(f"[DEBUG LEMMA PATTERNS] Skipping unrealistic pattern: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}' (too short, adds too many chars)", file=sys.stderr)
+                                continue
+                            if len(suffix_from) == 2 and len(suffix_to) > len(suffix_from) + 2:
+                                # Skip: 2-char suffix adding more than 2 characters is suspicious
+                                if debug:
+                                    print(f"[DEBUG LEMMA PATTERNS] Skipping unrealistic pattern: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}' (adds too many chars)", file=sys.stderr)
+                                continue
+                            
                             # Store: (suffix_length, count, lemma)
                             # "No change" patterns (suffix_from == suffix_to) are valid and important
                             # Deletion patterns (suffix_to == '') are also valid if count is high
                             matching_patterns.append((len(suffix_from), count, lemma))
+                            if debug:
+                                print(f"[DEBUG LEMMA PATTERNS] Pattern matches: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}', lemma='{lemma}', count={count}", file=sys.stderr)
             elif suffix_to:
                 # Pattern: add suffix_to (less common, but possible)
                 if len(form_lower) >= min_base:
@@ -4346,12 +4683,17 @@ class FlexiPipeTagger:
                         matching_patterns.append((0, count, lemma))  # Suffix length 0 for add patterns
         
         if not matching_patterns:
+            if debug:
+                print(f"[DEBUG LEMMA PATTERNS] No matching patterns for form '{form}'", file=sys.stderr)
             return '_'
         
         # Resolve conflicts: if multiple patterns match, prefer:
         # 1. Longest suffix (most specific match)
         # 2. Highest count (most distinct lemma/form pairs) when suffix lengths are equal
         matching_patterns.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        
+        if debug:
+            print(f"[DEBUG LEMMA PATTERNS] Selected best pattern: suffix_length={matching_patterns[0][0]}, count={matching_patterns[0][1]}, lemma='{matching_patterns[0][2]}'", file=sys.stderr)
         
         # Return lemma from the best matching pattern
         return matching_patterns[0][2]
@@ -4590,6 +4932,10 @@ class FlexiPipeTagger:
                                         if next_form != '_' and next_form not in punct_no_space_after:
                                             sentence_text += " "
                     
+                    # Write # sent_id = comment if available (from TEITOK XML <s> @id)
+                    if sentence and sentence[0].get('_sentence_id'):
+                        f.write(f"# sent_id = {sentence[0]['_sentence_id']}\n")
+                    
                     # Write # text = comment (always required in CoNLL-U)
                     f.write(f"# text = {sentence_text}\n")
                     
@@ -4614,11 +4960,18 @@ class FlexiPipeTagger:
                         
                         # Build MISC column with original/normalized forms and SpaceAfter
                         misc_parts = []
+                        # Token ID from TEITOK XML (@id or @xml:id)
+                        if 'tok_id' in token and token['tok_id']:
+                            misc_parts.append(f"TokId={token['tok_id']}")
                         if 'orig_form' in token and token['orig_form'] != form:
                             misc_parts.append(f"OrigForm={token['orig_form']}")
-                        # Normalization: always use Reg= in CoNLL-U MISC (standard format)
+                        # Normalization: use Normalized= in CoNLL-U MISC
                         if 'norm_form' in token and token['norm_form'] and token['norm_form'] != '_':
-                            misc_parts.append(f"Reg={token['norm_form']}")
+                            misc_parts.append(f"Normalized={token['norm_form']}")
+                        # Expansion: use Expansion= in CoNLL-U MISC, and add Abbr=Yes
+                        if 'expan' in token and token['expan'] and token['expan'] != '_':
+                            misc_parts.append(f"Expansion={token['expan']}")
+                            misc_parts.append("Abbr=Yes")
                         if 'split_forms' in token:
                             misc_parts.append(f"SplitForms={'+'.join(token['split_forms'])}")
                         
@@ -4660,8 +5013,9 @@ class FlexiPipeTagger:
                             tagged_words.append(form)
                     f.write(' '.join(tagged_words) + '\n')
             elif format == "teitok":
-                # TODO: Implement TEITOK XML output
-                print("TEITOK output not yet implemented", file=sys.stderr)
+                # For TEITOK XML, we need to handle file vs stdout differently
+                # Pass the file handle and whether it's stdout
+                self._write_teitok_xml(sentences, f, is_stdout=use_stdout)
             else:
                 # Unknown format - default to CoNLL-U
                 if self.config.debug:
@@ -4759,7 +5113,11 @@ class FlexiPipeTagger:
                         if 'orig_form' in token and token['orig_form'] != form:
                             misc_parts.append(f"OrigForm={token['orig_form']}")
                         if 'norm_form' in token and token['norm_form'] and token['norm_form'] != '_':
-                            misc_parts.append(f"Reg={token['norm_form']}")
+                            misc_parts.append(f"Normalized={token['norm_form']}")
+                        # Expansion: use Expansion= in CoNLL-U MISC, and add Abbr=Yes
+                        if 'expan' in token and token['expan'] and token['expan'] != '_':
+                            misc_parts.append(f"Expansion={token['expan']}")
+                            misc_parts.append("Abbr=Yes")
                         if 'split_forms' in token:
                             misc_parts.append(f"SplitForms={'+'.join(token['split_forms'])}")
                         
@@ -4800,6 +5158,439 @@ class FlexiPipeTagger:
                 if self.config.debug:
                     print(f"[DEBUG] Wrote to stdout, flushing...", file=sys.stderr)
                 sys.stdout.flush()
+    
+    def _write_teitok_xml(self, sentences: List[List[Dict]], output_file, is_stdout: bool = False):
+        """Write tagged sentences to TEITOK XML format.
+        
+        If original TEITOK XML was loaded, preserves all structure and only updates NLP annotations.
+        Otherwise, creates new TEITOK XML structure from tagged sentences.
+        
+        Args:
+            sentences: List of tagged sentences
+            output_file: File handle or stdout to write to
+            is_stdout: Whether output_file is stdout (affects how XML is written)
+        """
+        import xml.etree.ElementTree as ET
+        from datetime import datetime
+        
+        if self.original_teitok_tree is not None:
+            # Update existing TEITOK XML: preserve all structure, only update NLP annotations
+            root = self.original_teitok_tree.getroot()
+            
+            # Create mapping from tok_id to token data
+            tok_id_to_data = {}
+            for sentence in sentences:
+                for token in sentence:
+                    tok_id = token.get('tok_id', '')
+                    if tok_id:
+                        tok_id_to_data[tok_id] = token
+                    # Also check dtok_id
+                    dtok_id = token.get('dtok_id', '')
+                    if dtok_id:
+                        tok_id_to_data[dtok_id] = token
+            
+            # Update all <tok> and <dtok> elements with new annotations
+            # IMPORTANT: Only update NLP attributes, preserve all other attributes and structure
+            for tok in root.findall('.//tok'):
+                tok_id = tok.get('id', '') or tok.get('{http://www.w3.org/XML/1998/namespace}id', '')
+                if tok_id and tok_id in tok_id_to_data:
+                    token_data = tok_id_to_data[tok_id]
+                    # Update NLP attributes (only if new values are available)
+                    # Preserve all other attributes (typesetting, hands, linebreaks, etc.)
+                    if token_data.get('lemma') and token_data.get('lemma') != '_':
+                        tok.set('lemma', token_data['lemma'])
+                    if token_data.get('upos') and token_data.get('upos') != '_':
+                        tok.set('upos', token_data['upos'])
+                    if token_data.get('xpos') and token_data.get('xpos') != '_':
+                        # Use configured xpos attribute name
+                        xpos_attr = self.config.xpos_attr
+                        tok.set(xpos_attr, token_data['xpos'])
+                    if token_data.get('feats') and token_data.get('feats') != '_':
+                        tok.set('feats', token_data['feats'])
+                    if token_data.get('norm_form') and token_data.get('norm_form') != '_':
+                        # Use configured normalization attribute
+                        norm_attr = self.config.normalization_attr
+                        tok.set(norm_attr, token_data['norm_form'])
+                    if token_data.get('expan') and token_data.get('expan') != '_':
+                        # Use configured expansion attribute
+                        expan_attr = self.config.expansion_attr
+                        tok.set(expan_attr, token_data['expan'])
+                    if token_data.get('head') and token_data.get('head') != '_' and token_data.get('head') != '0':
+                        tok.set('head', str(token_data['head']))
+                    if token_data.get('deprel') and token_data.get('deprel') != '_':
+                        tok.set('deprel', token_data['deprel'])
+                
+                # Also update dtok children
+                for dtok in tok.findall('.//dtok'):
+                    dtok_id = dtok.get('id', '') or dtok.get('{http://www.w3.org/XML/1998/namespace}id', '')
+                    if dtok_id and dtok_id in tok_id_to_data:
+                        token_data = tok_id_to_data[dtok_id]
+                        if token_data.get('lemma') and token_data.get('lemma') != '_':
+                            dtok.set('lemma', token_data['lemma'])
+                        if token_data.get('upos') and token_data.get('upos') != '_':
+                            dtok.set('upos', token_data['upos'])
+                        if token_data.get('xpos') and token_data.get('xpos') != '_':
+                            xpos_attr = self.config.xpos_attr
+                            dtok.set(xpos_attr, token_data['xpos'])
+                        if token_data.get('feats') and token_data.get('feats') != '_':
+                            dtok.set('feats', token_data['feats'])
+                        if token_data.get('norm_form') and token_data.get('norm_form') != '_':
+                            norm_attr = self.config.normalization_attr
+                            dtok.set(norm_attr, token_data['norm_form'])
+                        if token_data.get('expan') and token_data.get('expan') != '_':
+                            expan_attr = self.config.expansion_attr
+                            dtok.set(expan_attr, token_data['expan'])
+            
+            # Add revision statement
+            self._add_revision_statement(root, sentences)
+            
+            # Check if original XML has xml:space="preserve" on <text>
+            # If so, only pretty-print teiHeader, not the text content
+            text_elem = root.find('.//text')
+            should_pretty_print_text = True
+            if text_elem is not None:
+                xml_space = text_elem.get('{http://www.w3.org/XML/1998/namespace}space')
+                if xml_space == 'preserve':
+                    should_pretty_print_text = False
+                    # Pretty-print only the teiHeader for readability
+                    teiHeader = root.find('.//teiHeader')
+                    if teiHeader is not None:
+                        ET.indent(teiHeader, space="  ")
+            
+            # Write XML
+            if should_pretty_print_text:
+                ET.indent(root, space="  ")
+            tree = ET.ElementTree(root)
+            # Handle stdout vs file differently
+            if is_stdout:
+                # For stdout, write as string
+                # ET.tostring doesn't support xml_declaration, so we add it manually
+                xml_str = ET.tostring(root, encoding='unicode')
+                output_file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                output_file.write(xml_str)
+                output_file.write('\n')
+            else:
+                # For file, use tree.write() with file path or binary mode
+                # If it's a file handle opened in text mode, we need to write as string
+                if hasattr(output_file, 'mode') and 'b' not in output_file.mode:
+                    # Text mode file handle - write as string
+                    xml_str = ET.tostring(root, encoding='unicode')
+                    output_file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                    output_file.write(xml_str)
+                    output_file.write('\n')
+                else:
+                    # Binary mode or file path - use tree.write()
+                    tree.write(output_file, encoding='utf-8', xml_declaration=True)
+        else:
+            # Create new TEITOK XML from tagged sentences
+            root = ET.Element('TEI')
+            teiHeader = ET.SubElement(root, 'teiHeader')
+            fileDesc = ET.SubElement(teiHeader, 'fileDesc')
+            titleStmt = ET.SubElement(fileDesc, 'titleStmt')
+            title = ET.SubElement(titleStmt, 'title')
+            title.text = 'FlexiPipe Tagged Text'
+            
+            # Add revision statement
+            self._add_revision_statement(root, sentences)
+            
+            text = ET.SubElement(root, 'text')
+            # Add xml:space="preserve" to preserve whitespace
+            text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            body = ET.SubElement(text, 'body')
+            
+            # Create sentences from tagged data
+            for sent_idx, sentence in enumerate(sentences):
+                s = ET.SubElement(body, 's')
+                # Add sentence ID if available
+                if sentence and sentence[0].get('_sentence_id'):
+                    s.set('id', sentence[0]['_sentence_id'])
+                else:
+                    s.set('id', f's-{sent_idx + 1}')
+                
+                # Determine SpaceAfter for each token (same logic as CoNLL-U output)
+                # SpaceAfter=No means there's no space after this token
+                space_after_flags = []
+                
+                # Check if we have original text stored in the sentence
+                original_text = None
+                for token in sentence:
+                    if '_original_text' in token:
+                        original_text = token.get('_original_text')
+                        break
+                
+                if original_text:
+                    # Derive SpaceAfter from original text by matching tokens
+                    # This matches the CoNLL-U output logic exactly
+                    text_pos = 0  # Position in original text
+                    
+                    for token_idx, token in enumerate(sentence):
+                        form = token.get('form', '_')
+                        if form == '_':
+                            space_after_flags.append(True)
+                            continue
+                        
+                        # Check if token has SpaceAfter=No in MISC (highest priority)
+                        misc_str = token.get('misc', '_')
+                        space_after = None
+                        
+                        if misc_str and misc_str != '_':
+                            misc_parts = misc_str.split('|')
+                            if 'SpaceAfter=No' in misc_parts:
+                                space_after = False
+                        
+                        # If MISC doesn't specify, derive from original text
+                        if space_after is None:
+                            # Try to find the token in the original text starting from text_pos
+                            # First try exact match (case-sensitive)
+                            found_pos = original_text.find(form, text_pos)
+                            
+                            if found_pos == -1:
+                                # Try case-insensitive match
+                                original_text_lower = original_text.lower()
+                                form_lower = form.lower()
+                                found_pos_lower = original_text_lower.find(form_lower, text_pos)
+                                
+                                if found_pos_lower != -1:
+                                    found_pos = found_pos_lower
+                            
+                            if found_pos != -1 and found_pos >= text_pos:
+                                # Found the token, check if there's a space after it
+                                end_pos = found_pos + len(form)
+                                if end_pos < len(original_text):
+                                    # Check if there's whitespace after the token
+                                    next_char = original_text[end_pos]
+                                    space_after = next_char.isspace()
+                                else:
+                                    # End of original text
+                                    if token_idx == len(sentence) - 1:
+                                        # Last token - don't set SpaceAfter=No just because it's at the end
+                                        space_after = True
+                                    else:
+                                        space_after = False
+                                
+                                # Update text_pos for next token
+                                text_pos = end_pos
+                                # If there's whitespace, skip it for next token search
+                                if space_after:
+                                    while text_pos < len(original_text) and original_text[text_pos].isspace():
+                                        text_pos += 1
+                            else:
+                                # Token not found in original text - use heuristics
+                                misc_str = token.get('misc', '_')
+                                space_after = True  # Default
+                                
+                                if misc_str and misc_str != '_':
+                                    misc_parts = misc_str.split('|')
+                                    if 'SpaceAfter=No' in misc_parts:
+                                        space_after = False
+                                else:
+                                    punct_no_space = [',', ';', ':', '.', '!', '?', ')', ']', '}', '"', "'", '»', '«']
+                                    if form in punct_no_space:
+                                        space_after = False
+                                
+                                # Try to advance text_pos anyway to avoid getting stuck
+                                if text_pos < len(original_text):
+                                    temp_pos = text_pos
+                                    while temp_pos < len(original_text) and original_text[temp_pos].isspace():
+                                        temp_pos += 1
+                                    if temp_pos < len(original_text):
+                                        text_pos = temp_pos
+                        
+                        space_after_flags.append(space_after)
+                else:
+                    # No original text - use MISC or heuristics (same as before)
+                    for token_idx, token in enumerate(sentence):
+                        form = token.get('form', '_')
+                        if form == '_':
+                            space_after_flags.append(True)
+                            continue
+                        
+                        # Check if token has SpaceAfter=No in MISC (highest priority)
+                        misc_str = token.get('misc', '_')
+                        space_after = None
+                        
+                        if misc_str and misc_str != '_':
+                            misc_parts = misc_str.split('|')
+                            if 'SpaceAfter=No' in misc_parts:
+                                space_after = False
+                        
+                        # If MISC doesn't specify, infer from context
+                        if space_after is None:
+                            if token_idx < len(sentence) - 1:
+                                next_form = sentence[token_idx + 1].get('form', '_')
+                                if next_form != '_':
+                                    punct_no_space_before = [',', ';', ':', '.', '!', '?', ')', ']', '}', '"', "'", '»', '«']
+                                    space_after = next_form not in punct_no_space_before
+                                else:
+                                    space_after = True
+                            else:
+                                space_after = False
+                        
+                        space_after_flags.append(space_after)
+                
+                # Create tokens with proper spacing
+                for token_idx, token in enumerate(sentence):
+                    form = token.get('form', '_')
+                    if form == '_':
+                        continue
+                    
+                    tok = ET.SubElement(s, 'tok')
+                    tok_id = token.get('tok_id', '')
+                    if tok_id:
+                        tok.set('id', tok_id)
+                    else:
+                        tok.set('id', f'w-{sent_idx + 1}-{token_idx + 1}')
+                    
+                    tok.text = form
+                    
+                    # Add space after token (as tail) if SpaceAfter is True
+                    # The space goes after this token, before the next one
+                    if token_idx < len(space_after_flags) and space_after_flags[token_idx]:
+                        # Add a tail (whitespace after the element) if there's a next token
+                        if token_idx < len(sentence) - 1:
+                            # Check if next token is not empty
+                            next_form = sentence[token_idx + 1].get('form', '_')
+                            if next_form != '_':
+                                tok.tail = ' '
+                            else:
+                                tok.tail = None
+                        else:
+                            # Last token - no space after
+                            tok.tail = None
+                    else:
+                        # SpaceAfter=No - no space after this token
+                        tok.tail = None
+                    
+                    # Add NLP attributes
+                    if token.get('lemma') and token.get('lemma') != '_':
+                        tok.set('lemma', token['lemma'])
+                    if token.get('upos') and token.get('upos') != '_':
+                        tok.set('upos', token['upos'])
+                    if token.get('xpos') and token.get('xpos') != '_':
+                        # Use configured xpos attribute name
+                        xpos_attr = self.config.xpos_attr
+                        tok.set(xpos_attr, token['xpos'])
+                    if token.get('feats') and token.get('feats') != '_':
+                        tok.set('feats', token['feats'])
+                    if token.get('norm_form') and token.get('norm_form') != '_':
+                        # Use configured normalization attribute
+                        norm_attr = self.config.normalization_attr
+                        tok.set(norm_attr, token['norm_form'])
+                    if token.get('expan') and token.get('expan') != '_':
+                        # Use configured expansion attribute
+                        expan_attr = self.config.expansion_attr
+                        tok.set(expan_attr, token['expan'])
+                    if token.get('head') and token.get('head') != '_' and token.get('head') != '0':
+                        tok.set('head', str(token['head']))
+                    if token.get('deprel') and token.get('deprel') != '_':
+                        tok.set('deprel', token['deprel'])
+            
+            # Write XML
+            # Don't pretty-print the whole tree since we have xml:space="preserve" on <text>
+            # But pretty-print the teiHeader for readability
+            teiHeader = root.find('.//teiHeader')
+            if teiHeader is not None:
+                ET.indent(teiHeader, space="  ")
+            tree = ET.ElementTree(root)
+            # Handle stdout vs file differently
+            if is_stdout:
+                # For stdout, write as string
+                # ET.tostring doesn't support xml_declaration, so we add it manually
+                xml_str = ET.tostring(root, encoding='unicode')
+                output_file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                output_file.write(xml_str)
+                output_file.write('\n')
+            else:
+                # For file, use tree.write() with file path or binary mode
+                # If it's a file handle opened in text mode, we need to write as string
+                if hasattr(output_file, 'mode') and 'b' not in output_file.mode:
+                    # Text mode file handle - write as string
+                    xml_str = ET.tostring(root, encoding='unicode')
+                    output_file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                    output_file.write(xml_str)
+                    output_file.write('\n')
+                else:
+                    # Binary mode or file path - use tree.write()
+                    tree.write(output_file, encoding='utf-8', xml_declaration=True)
+    
+    def _add_revision_statement(self, root, sentences: List[List[Dict]]):
+        """Add revision statement to TEITOK XML.
+        
+        Args:
+            root: Root element of TEITOK XML tree
+            sentences: List of tagged sentences (to check for lemmatization)
+        """
+        import xml.etree.ElementTree as ET
+        from datetime import datetime
+        
+        # Find or create revisionDesc
+        revisionDesc = root.find('.//revisionDesc')
+        if revisionDesc is None:
+            # Find teiHeader
+            teiHeader = root.find('.//teiHeader')
+            if teiHeader is None:
+                # Create teiHeader structure if it doesn't exist
+                teiHeader = ET.Element('teiHeader')
+                fileDesc = ET.SubElement(teiHeader, 'fileDesc')
+                titleStmt = ET.SubElement(fileDesc, 'titleStmt')
+                title = ET.SubElement(titleStmt, 'title')
+                title.text = 'FlexiPipe Tagged Text'
+                # Insert at beginning
+                root.insert(0, teiHeader)
+            
+            revisionDesc = ET.SubElement(teiHeader, 'revisionDesc')
+        
+        # Create change element
+        change = ET.SubElement(revisionDesc, 'change')
+        change.set('who', 'flexiPipe')
+        change.set('when', datetime.now().isoformat())
+        
+        # Build description of operations
+        operations = []
+        if 'processed_teitok_input' in self.operations_performed:
+            operations.append("processed TEITOK XML input")
+        if self.config.normalize:
+            operations.append("normalized orthographic variants")
+        if self.config.parse:
+            operations.append("parsed dependencies")
+        if self.config.tag_only or (not self.config.parse_only and not self.config.parse):
+            operations.append("tagged with UPOS/XPOS/FEATS")
+        
+        # Check if lemmatization was performed (any token has lemma)
+        has_lemmas = False
+        for sentence in sentences:
+            for token in sentence:
+                if token.get('lemma') and token.get('lemma') != '_' and token.get('lemma') != token.get('form', '').lower():
+                    has_lemmas = True
+                    break
+            if has_lemmas:
+                break
+        if has_lemmas:
+            operations.append("lemmatized")
+        
+        # Add model/vocab info
+        method_parts = []
+        if self.model_path:
+            method_parts.append(f"model: {self.model_path.name}")
+        elif self.transition_probs:
+            method_parts.append("Viterbi tagging with vocabulary")
+        if self.external_vocab:
+            method_parts.append("vocabulary-based")
+        # Add vocabulary file name if available
+        if self.vocab_file_paths:
+            if len(self.vocab_file_paths) == 1:
+                vocab_name = Path(self.vocab_file_paths[0]).name
+                method_parts.append(f"vocab: {vocab_name}")
+            else:
+                # Multiple vocab files - show count and most specific
+                vocab_names = [Path(p).name for p in self.vocab_file_paths]
+                method_parts.append(f"vocab: {len(vocab_names)} files ({vocab_names[-1]} most specific)")
+        
+        description = "FlexiPipe: " + ", ".join(operations)
+        if method_parts:
+            description += " (" + ", ".join(method_parts) + ")"
+        
+        change.text = description
     
     def calculate_accuracy(self, gold_file: Path, pred_file: Path, format: str = "conllu"):
         """Calculate accuracy metrics."""

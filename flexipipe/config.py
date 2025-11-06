@@ -24,6 +24,7 @@ class FlexiPipeConfig:
     similarity_threshold: float = 0.7
     use_vocabulary: bool = True
     vocab_priority: bool = False  # If True, vocabulary takes priority over model predictions for all tasks
+    confidence_threshold: float = 0.7  # If model confidence < threshold, use vocabulary predictions (confidence-based blending)
     respect_existing: bool = True
     lemma_method: str = 'auto'  # 'bert', 'similarity', or 'auto' (default: try BERT first, fallback to similarity)
     # Historic document processing (neotag replacement)
@@ -40,6 +41,7 @@ class FlexiPipeConfig:
     normalization_suffixes_file: Optional[Path] = None  # Optional JSON file with suffix list for normalization inflections
     lemma_anchor: str = 'both'  # How to derive suffixes: 'reg' | 'form' | 'both'
     xpos_attr: str = 'xpos'  # TEITOK attribute(s) for XPOS (comma-separated fallbacks allowed)
+    use_xpos_for_tagging: bool = False  # If True, use XPOS for tagging/lemmatization; if False (default), use UPOS+FEATS
     # Parsing configuration
     parse: bool = False  # Whether to run parsing (predict head/deprel)
     tag_only: bool = False  # Only tag (UPOS/XPOS/FEATS), skip parsing

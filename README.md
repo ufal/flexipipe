@@ -333,13 +333,21 @@ python flexipipe.py tag input.txt \
   - Language-specific models often perform better (e.g., `bert-base-german-cased` for German)
 
 **Vocabulary Options**:
-- `--vocab`: JSON vocabulary file for tuning to local corpus
+- `--vocab`: JSON vocabulary file(s) for tuning to local corpus
   - Format: `{"word": {"upos": "...", "xpos": "...", "feats": "...", "lemma": "..."}, "word:xpos": {"lemma": "..."}}`
   - Automatically merged with model vocabulary (external vocab overrides model vocab)
+  - **Multiple vocab files supported**: Specify multiple files (e.g., `--vocab general.json local.json`)
+    - Later files override earlier ones for the same words
+    - All analyses are preserved, but later vocab files get higher priority for sorting
 - `--vocab-priority`: Give vocabulary priority over model predictions for all tasks (UPOS/XPOS/FEATS/LEMMA)
   - Useful for tuning to local corpus without retraining
   - When enabled: vocabulary checked first, model predictions as fallback
   - When disabled: model predictions first, vocabulary as fallback
+- `--confidence-threshold`: Confidence threshold for confidence-based blending (default: 0.7)
+  - If model confidence < threshold, use vocabulary predictions instead
+  - Helps with OOV words and domain-specific terms where model is uncertain
+  - Works automatically when `--vocab` is provided (no need for `--vocab-priority`)
+  - Example: If model predicts UPOS with 0.5 confidence, vocabulary prediction is used if available
 
 **Annotation Options**:
 - `--respect-existing`: Preserve existing annotations in input (default: True)
@@ -632,8 +640,12 @@ Case-sensitive forms are stored separately to handle language-specific distincti
    - **Fallback**: If no exact match, uses most frequent (first) analysis in array
 
 4. **Priority System**:
-   - With `--vocab-priority`: Vocabulary checked first, model predictions as fallback
-   - Without `--vocab-priority`: Model predictions first, vocabulary as fallback
+   - **`--vocab-priority`**: Vocabulary checked first, model predictions as fallback (always use vocab if available)
+   - **Confidence-based blending** (default when `--vocab` is provided): Model predictions first, but if model confidence < threshold, use vocabulary instead
+     - Helps with OOV words and domain-specific terms where model is uncertain
+     - Configurable via `--confidence-threshold` (default: 0.7)
+     - Example: Model predicts with 0.5 confidence → vocabulary prediction used if available
+   - **Without `--vocab-priority` and low confidence**: Model predictions first, vocabulary as fallback
 
 ### Annotation Pipeline
 
@@ -746,13 +758,32 @@ python flexipipe_create_vocab.py \
     --folder /path/to/local/corpus \
     --output local_vocab.json
 
-# 3. Use with vocab priority for domain-specific tagging
+# 3a. Use with vocab priority for domain-specific tagging (always use vocab if available)
 python flexipipe.py tag input.txt \
     --model models/base \
     --vocab local_vocab.json \
     --vocab-priority \
     --output output.conllu
+
+# 3b. Use with confidence-based blending (use vocab when model is uncertain)
+python flexipipe.py tag input.txt \
+    --model models/base \
+    --vocab local_vocab.json \
+    --confidence-threshold 0.7 \
+    --output output.conllu
+
+# 3c. Combine multiple vocab files (general + specific)
+python flexipipe.py tag input.txt \
+    --model models/base \
+    --vocab general_vocab.json local_vocab.json \
+    --confidence-threshold 0.7 \
+    --output output.conllu
 ```
+
+**Confidence-based blending** (option 3b) is recommended for most use cases:
+- Uses model predictions when confident (high accuracy)
+- Falls back to vocabulary when model is uncertain (OOV words, domain-specific terms)
+- Best of both worlds: model accuracy + vocabulary coverage
 
 ### Historic Document Processing (neotag replacement)
 
@@ -876,14 +907,6 @@ If you see "tokenizers parallelism" warnings:
 
 ## Future Enhancements
 
-- [ ] **Multi-lingual training support**: Train on multiple UD treebanks simultaneously (e.g., all Romance languages together)
-  - Currently: Train one model per language/treebank
-  - Future: Single model trained on multiple treebanks for cross-lingual transfer
-- [ ] **GPU acceleration for inference**: Currently uses GPU if available, but could be optimized further
-- [ ] **Batch processing optimization**: Faster processing for very large files
-- [ ] **TEITOK XML output format**: Currently only supports CoNLL-U and plain text output
-- [ ] **Interactive tagging interface**: Web-based or CLI interface for manual correction
-- [ ] **Active learning support**: Intelligent selection of examples for annotation
-- [ ] **More pre-trained models**: Pre-trained models for common languages available for download
+See `dev/TODO.md` for a complete list of planned enhancements and improvements.
 
 **Note**: The pipeline itself is already language-agnostic and supports all languages through any BERT model. Language-specific models (e.g., `bert-base-german-cased`) typically perform better than multilingual models for individual languages, but multilingual models enable handling multiple languages with a single model.

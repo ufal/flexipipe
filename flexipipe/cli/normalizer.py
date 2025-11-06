@@ -318,7 +318,10 @@ def load_normalization_pairs(file_path: Path) -> List[Tuple[str, str]]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='BERT-based text normalizer')
+    parser = argparse.ArgumentParser(
+        description='BERT-based text normalizer',
+        prog='flexipipe normalizer'
+    )
     subparsers = parser.add_subparsers(dest='mode', help='Mode')
     
     # Train mode

@@ -63,6 +63,7 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
     
     # Track transitions if requested
     transitions = None
+    capitalization_info = None
     if track_transitions:
         transitions = {
             'upos': defaultdict(int),  # (prev_upos, curr_upos) -> count
@@ -70,16 +71,41 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
             'start': defaultdict(int),  # upos -> count (sentence-start)
             'sentences': 0
         }
+        # Track capitalization statistics: for each tag, count capitalized vs lowercase in non-initial positions
+        # Structure: {tag: {'capitalized': count, 'lowercase': count}}
+        capitalization_info = {
+            'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
+            'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
+        }
     
     try:
         tree = ET.parse(file_path)
         root = tree.getroot()
         
+        # Helper function to check if a token is sentence-final punctuation
+        def is_sentence_final_punct(form: str) -> bool:
+            """Check if form is sentence-final punctuation."""
+            if not form:
+                return False
+            # Common sentence-final punctuation
+            return form in {'.', '!', '?', '…', '…', '。', '！', '？'}
+        
+        # Helper function to check if word is all-caps (should be ignored)
+        def is_all_caps(form: str) -> bool:
+            """Check if word is all uppercase (likely abbreviation or emphasis, not capitalization rule)."""
+            if not form:
+                return False
+            # Check if all alphabetic characters are uppercase and there's at least one letter
+            has_letter = any(c.isalpha() for c in form)
+            return has_letter and form.isupper()
+        
         for s in root.findall('.//s'):
             prev_upos = None
             prev_xpos = None
             is_first_token = True
+            prev_form = None  # Track previous token form for punctuation-based sentence detection
             
+            token_idx = 0
             for tok in s.findall('.//tok'):
                 # Check if this tok has dtok children (contraction)
                 dtoks = tok.findall('.//dtok')
@@ -98,19 +124,47 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                         xpos = get_attribute_with_fallback(dt, xpos_attr)
                         xpos = xpos if xpos else '_'
                         
-                        # Skip entries without XPOS - they cause problems during tagging
-                        if not xpos or xpos == '_':
-                            continue
-                        
-                        feats = dt.get('feats', '_')
-                        lemma = dt.get('lemma', '_').lower() if dt.get('lemma', '_') != '_' else '_'
                         # Get normalization and expansion with specified attributes (with fallback)
                         norm_form = get_attribute_with_fallback(dt, reg_attr) or '_'
                         expan_form = get_attribute_with_fallback(dt, expan_attr) or '_'
                         
+                        # Skip entries without XPOS - they cause problems during tagging
+                        # EXCEPTION: Include entries without XPOS if they have a normalization (reg) field
+                        # This is important for normalization - we need form->reg mappings even without POS tags
+                        if (not xpos or xpos == '_') and (not norm_form or norm_form == '_'):
+                            continue
+                        
+                        feats = dt.get('feats', '_')
+                        lemma = dt.get('lemma', '_').lower() if dt.get('lemma', '_') != '_' else '_'
+                        
+                        # Track capitalization statistics: only for non-initial positions
+                        # Skip all-caps words for capitalization tracking (abbreviations, emphasis, etc.)
+                        is_all_caps_word = is_all_caps(form)
+                        
+                        is_capitalized = form and form[0].isupper() and form_lower != form
+                        # Check if sentence-initial: either first token in sentence OR after sentence-final punctuation
+                        is_sentence_initial = (token_idx == 0) or (prev_form and is_sentence_final_punct(prev_form))
+                        
+                        # Only track capitalization if not all-caps and not sentence-initial
+                        if capitalization_info and not is_sentence_initial and not is_all_caps_word:
+                            # Track statistics for this tag in non-initial position
+                            if upos and upos != '_':
+                                if is_capitalized:
+                                    capitalization_info['upos'][upos]['capitalized'] += 1
+                                else:
+                                    capitalization_info['upos'][upos]['lowercase'] += 1
+                            if xpos and xpos != '_':
+                                if is_capitalized:
+                                    capitalization_info['xpos'][xpos]['capitalized'] += 1
+                                else:
+                                    capitalization_info['xpos'][xpos]['lowercase'] += 1
+                        
                         # Store with both original case and lowercase for proper handling
                         annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form)
                         word_annotations[annotation_key] += 1
+                        
+                        prev_form = form
+                        token_idx += 1
                         
                         # Track transitions for Viterbi
                         if track_transitions and transitions:
@@ -138,19 +192,47 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                     xpos = get_attribute_with_fallback(tok, xpos_attr)
                     xpos = xpos if xpos else '_'
                     
-                    # Skip entries without XPOS - they cause problems during tagging
-                    if not xpos or xpos == '_':
-                        continue
-                    
-                    feats = tok.get('feats', '_')
-                    lemma = tok.get('lemma', '_').lower() if tok.get('lemma', '_') != '_' else '_'
                     # Get normalization and expansion with specified attributes (with fallback)
                     norm_form = get_attribute_with_fallback(tok, reg_attr) or '_'
                     expan_form = get_attribute_with_fallback(tok, expan_attr) or '_'
                     
+                    # Skip entries without XPOS - they cause problems during tagging
+                    # EXCEPTION: Include entries without XPOS if they have a normalization (reg) field
+                    # This is important for normalization - we need form->reg mappings even without POS tags
+                    if (not xpos or xpos == '_') and (not norm_form or norm_form == '_'):
+                        continue
+                    
+                    feats = tok.get('feats', '_')
+                    lemma = tok.get('lemma', '_').lower() if tok.get('lemma', '_') != '_' else '_'
+                    
+                    # Track capitalization statistics: only for non-initial positions
+                    # Skip all-caps words for capitalization tracking (abbreviations, emphasis, etc.)
+                    is_all_caps_word = is_all_caps(form)
+                    
+                    is_capitalized = form and form[0].isupper() and form_lower != form
+                    # Check if sentence-initial: either first token in sentence OR after sentence-final punctuation
+                    is_sentence_initial = (token_idx == 0) or (prev_form and is_sentence_final_punct(prev_form))
+                    
+                    # Only track capitalization if not all-caps and not sentence-initial
+                    if capitalization_info and not is_sentence_initial and not is_all_caps_word:
+                        # Track statistics for this tag in non-initial position
+                        if upos and upos != '_':
+                            if is_capitalized:
+                                capitalization_info['upos'][upos]['capitalized'] += 1
+                            else:
+                                capitalization_info['upos'][upos]['lowercase'] += 1
+                        if xpos and xpos != '_':
+                            if is_capitalized:
+                                capitalization_info['xpos'][xpos]['capitalized'] += 1
+                            else:
+                                capitalization_info['xpos'][xpos]['lowercase'] += 1
+                    
                     # Store with both original case and lowercase for proper handling
                     annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form)
                     word_annotations[annotation_key] += 1
+                    
+                    prev_form = form
+                    token_idx += 1
                     
                     # Track transitions for Viterbi
                     if track_transitions and transitions:
@@ -175,8 +257,10 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
         print(f"Error processing {file_path}: {e}", file=sys.stderr)
     
     if track_transitions:
-        return word_annotations, transitions
-    return word_annotations
+        return word_annotations, transitions, capitalization_info
+    else:
+        # Return empty capitalization_info when not tracking transitions
+        return word_annotations, None, {'upos': {}, 'xpos': {}}
 
 
 def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg_attr: str = 'reg', expan_attr: str = 'expan', debug: bool = False):
@@ -205,6 +289,12 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     upos_start_counts = defaultdict(int)  # upos -> count (for sentence-start probabilities)
     total_sentences = 0
     
+    # Track capitalization statistics: for each tag, count capitalized vs lowercase in non-initial positions
+    capitalizable_tags = {
+        'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
+        'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
+    }
+    
     # Find all XML files recursively
     xml_files = list(folder_path.rglob('*.xml'))
     
@@ -226,7 +316,7 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             percent = (file_idx * 100) // total_files if total_files > 0 else 0
             print(f"Processing: {file_idx}/{total_files} files ({percent}%)...", file=sys.stderr, end='\r')
         
-        word_annotations, transitions = extract_vocab_from_teitok_xml(xml_file, xpos_attr, reg_attr, expan_attr, track_transitions=True)
+        word_annotations, transitions, capitalization_info = extract_vocab_from_teitok_xml(xml_file, xpos_attr, reg_attr, expan_attr, track_transitions=True)
         
         # Merge into main annotations dictionary
         # Track both case-sensitive and lowercase separately
@@ -250,6 +340,15 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             for upos, count in transitions.get('start', {}).items():
                 upos_start_counts[upos] += count
             total_sentences += transitions.get('sentences', 0)
+        
+        # Merge capitalization statistics
+        if capitalization_info:
+            for tag, stats in capitalization_info['upos'].items():
+                capitalizable_tags['upos'][tag]['capitalized'] += stats['capitalized']
+                capitalizable_tags['upos'][tag]['lowercase'] += stats['lowercase']
+            for tag, stats in capitalization_info['xpos'].items():
+                capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
+                capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
     
     # Print newline at the end to clear the progress line (if progress was shown)
     if not debug and total_files > 0:
@@ -433,11 +532,12 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
                 vocab[form_lower] = entries
     
     # Return both vocabulary and transition probabilities
-    return vocab, transition_probs
+    return vocab, transition_probs, capitalizable_tags
 
 
 def main():
     parser = argparse.ArgumentParser(
+        prog='flexipipe create-vocab',
         description='Extract vocabulary from TEITOK XML files for FlexiPipe',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -475,6 +575,9 @@ Examples:
                        help='Attribute name(s) for XPOS in TEITOK XML (default: xpos). '
                             'Use "pos" or "msd" for corpora not in UD format. '
                             'For inheritance, use comma-separated values like "pos,msd" (tries @pos first, then @msd).')
+    parser.add_argument('--language', type=str,
+                       help='Language code (e.g., "es" for Spanish, "de" for German) for capitalization rules. '
+                            'Used to determine which tags can be capitalized in non-initial positions.')
     parser.add_argument('--reg', default='reg',
                        help='Attribute name(s) for normalization/regularization in TEITOK XML (default: reg, can be nform). '
                             'For inheritance, use comma-separated values like "nform,fform" (tries @nform first, then @fform). '
@@ -516,10 +619,14 @@ Examples:
         'start': defaultdict(float),  # {tag: prob}
         'sentences': 0
     }
+    merged_capitalizable_tags = {
+        'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
+        'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
+    }
     
     for folder_idx, folder in enumerate(args.folders, 1):
         print(f"\n[{folder_idx}/{len(args.folders)}] Processing folder: {folder}", file=sys.stderr)
-        vocab, transition_probs = build_vocabulary_from_folder(folder, args.xpos_attr, args.reg, args.expan, debug=args.debug)
+        vocab, transition_probs, capitalizable_tags = build_vocabulary_from_folder(folder, args.xpos_attr, args.reg, args.expan, debug=args.debug)
         
         if not vocab:
             print(f"Warning: No vocabulary entries found in {folder}. Skipping.", file=sys.stderr)
@@ -608,6 +715,14 @@ Examples:
                         merged_transitions['start'][tag] = prob
             
             merged_transitions['sentences'] += transition_probs.get('sentences', 0)
+        
+        # Merge capitalization statistics
+        for tag, stats in capitalizable_tags['upos'].items():
+            merged_capitalizable_tags['upos'][tag]['capitalized'] += stats['capitalized']
+            merged_capitalizable_tags['upos'][tag]['lowercase'] += stats['lowercase']
+        for tag, stats in capitalizable_tags['xpos'].items():
+            merged_capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
+            merged_capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
     
     # Convert defaultdicts to regular dicts for JSON serialization
     transition_probs_final = {
@@ -683,6 +798,11 @@ Examples:
         'source_folders': [str(f) for f in args.folders],
         'xpos_attr': args.xpos_attr,
         'reg_attr': args.reg,
+        'language': args.language if args.language else None,
+        'capitalizable_tags': {
+            'upos': {tag: dict(stats) for tag, stats in merged_capitalizable_tags['upos'].items()},
+            'xpos': {tag: dict(stats) for tag, stats in merged_capitalizable_tags['xpos'].items()}
+        },
         'vocab_stats': {
             'total_entries': len(vocab),
             'word_entries': word_entries,

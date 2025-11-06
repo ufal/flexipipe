@@ -6,7 +6,7 @@ from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 
 def viterbi_tag_sentence(sentence: List[str], vocab: Dict, transition_probs: Dict, 
-                         tag_type: str = 'upos') -> List[str]:
+                         tag_type: str = 'upos', capitalizable_tags: Optional[Dict[str, Dict]] = None) -> List[str]:
     """
     Tag a sentence using Viterbi algorithm.
     
@@ -15,6 +15,8 @@ def viterbi_tag_sentence(sentence: List[str], vocab: Dict, transition_probs: Dic
         vocab: Vocabulary dictionary (form -> analysis or list of analyses)
         transition_probs: Transition probabilities dict with 'upos' or 'xpos' keys
         tag_type: 'upos' or 'xpos'
+        capitalizable_tags: Dictionary with 'upos' and 'xpos' keys, each containing a dict mapping
+                          tags to {'capitalized': count, 'lowercase': count} statistics from corpus
     
     Returns:
         List of predicted tags
@@ -83,43 +85,133 @@ def viterbi_tag_sentence(sentence: List[str], vocab: Dict, transition_probs: Dic
         uniform = 1.0 / len(all_tags)
         default_emission = {tag: uniform for tag in all_tags}
     
+    # Helper function to get capitalization ratio for a tag
+    def get_capitalization_ratio(tag: str) -> float:
+        """Get the ratio of capitalized vs total occurrences for a tag in non-initial positions."""
+        if not capitalizable_tags:
+            return 0.0
+        tag_stats = capitalizable_tags.get(tag_type, {}).get(tag)
+        if not tag_stats:
+            return 0.0
+        total = tag_stats.get('capitalized', 0) + tag_stats.get('lowercase', 0)
+        if total == 0:
+            return 0.0
+        return tag_stats.get('capitalized', 0) / total
+    
     # Build emission probabilities for each word
     # emission[word_idx][tag] = log probability
     emission = []
-    for word in sentence:
+    for word_idx, word in enumerate(sentence):
         word_emission = {}
         word_lower = word.lower()
         
-        # Get entry from vocab (try exact case, then lowercase)
-        entry = vocab.get(word) or vocab.get(word_lower)
+        # Check if word is capitalized and not sentence-initial
+        is_capitalized = word and word[0].isupper() and word_lower != word
+        is_sentence_initial = (word_idx == 0)
+        is_capitalized_non_initial = is_capitalized and not is_sentence_initial
         
-        if entry:
-            # Word in vocab - use frequency-based emission
-            # BUT: Filter out analyses that don't have the requested tag_type
-            # This prevents using entries without XPOS for XPOS tagging
-            if isinstance(entry, list):
+        # Get entry from vocab (try exact case first, then lowercase)
+        # If exact case entry exists but doesn't have the tag_type, also check lowercase
+        entry = vocab.get(word)
+        entry_lower = None
+        if word_lower != word:
+            entry_lower = vocab.get(word_lower)
+        
+        # If exact case entry doesn't exist, try lowercase
+        if not entry:
+            entry = entry_lower
+            entry_lower = None
+        
+        # Helper function to extract tag probabilities from an entry
+        def extract_tag_probs(entry_item):
+            """Extract tag probabilities from a vocabulary entry."""
+            probs = {}
+            if isinstance(entry_item, list):
                 # Multiple analyses - filter to only those with the tag_type
-                analyses_with_tag = [a for a in entry if a.get(tag_type) and a.get(tag_type) != '_']
+                analyses_with_tag = [a for a in entry_item if a.get(tag_type) and a.get(tag_type) != '_']
                 if analyses_with_tag:
-                    # Use only analyses that have the tag
                     total_count = sum(a.get('count', 1) for a in analyses_with_tag)
                     for analysis in analyses_with_tag:
                         tag = analysis.get(tag_type, '_')
                         if tag != '_':
                             count = analysis.get('count', 1)
-                            # Use log probability (add small smoothing)
                             prob = (count + 0.1) / (total_count + 0.1 * len(all_tags))
-                            word_emission[tag] = word_emission.get(tag, 0) + prob
-                # If no analyses have the tag, treat as OOV (fall through to OOV handling)
+                            probs[tag] = probs.get(tag, 0) + prob
             else:
                 # Single analysis - check if it has the tag
-                tag = entry.get(tag_type, '_')
+                tag = entry_item.get(tag_type, '_')
                 if tag != '_':
-                    count = entry.get('count', 1)
-                    # Normalize to probability
+                    count = entry_item.get('count', 1)
                     prob = (count + 0.1) / (count + 0.1 * len(all_tags))
-                    word_emission[tag] = prob
-                # If entry doesn't have the tag, treat as OOV (fall through to OOV handling)
+                    probs[tag] = prob
+            return probs
+        
+        if entry:
+            # Extract tag probabilities from exact case entry
+            word_emission = extract_tag_probs(entry)
+            
+            # If exact case entry doesn't have the tag_type, also check lowercase entry
+            if not word_emission and entry_lower:
+                word_emission = extract_tag_probs(entry_lower)
+            elif entry_lower:
+                # Both entries exist - combine probabilities (weighted by counts)
+                lower_probs = extract_tag_probs(entry_lower)
+                if lower_probs:
+                    # Combine probabilities from both entries
+                    # Weight by total counts
+                    exact_total = sum(a.get('count', 1) for a in (entry if isinstance(entry, list) else [entry]))
+                    lower_total = sum(a.get('count', 1) for a in (entry_lower if isinstance(entry_lower, list) else [entry_lower]))
+                    total_combined = exact_total + lower_total
+                    
+                    # Normalize and combine
+                    for tag, prob in lower_probs.items():
+                        # Weight by counts
+                        weighted_prob = prob * (lower_total / total_combined) if total_combined > 0 else prob
+                        word_emission[tag] = word_emission.get(tag, 0) + weighted_prob
+            
+            # Adjust probabilities based on capitalization statistics for non-initial capitalized words
+            if is_capitalized_non_initial and capitalizable_tags and word_emission:
+                # Calculate capitalization ratios for all tags in emission
+                tag_ratios = {}
+                for tag in word_emission.keys():
+                    tag_ratios[tag] = get_capitalization_ratio(tag)
+                
+                # Find tags with high capitalization ratio (e.g., >50%)
+                high_ratio_tags = [tag for tag, ratio in tag_ratios.items() if ratio > 0.5]
+                low_ratio_tags = [tag for tag, ratio in tag_ratios.items() if ratio <= 0.5]
+                
+                if high_ratio_tags:
+                    # Boost tags with high capitalization ratio (proportional to ratio)
+                    for tag in high_ratio_tags:
+                        ratio = tag_ratios[tag]
+                        # Boost more for higher ratios (e.g., 100% -> 10x, 50% -> 2x)
+                        boost_factor = 1.0 + (ratio * 9.0)  # Linear scaling: 0.5 -> 5.5x, 1.0 -> 10x
+                        word_emission[tag] *= boost_factor
+                    
+                    # Reduce tags with low capitalization ratio
+                    for tag in low_ratio_tags:
+                        # Reduce more for lower ratios
+                        ratio = tag_ratios[tag]
+                        reduce_factor = 0.1 + (ratio * 0.4)  # 0.0 -> 0.1x, 0.5 -> 0.3x
+                        word_emission[tag] *= reduce_factor
+                elif low_ratio_tags and capitalizable_tags.get(tag_type):
+                    # No high-ratio tags in emission, but we have statistics from corpus
+                    # Check if any high-ratio tags exist in all_tags
+                    available_high_ratio = []
+                    for tag in capitalizable_tags.get(tag_type, {}).keys():
+                        if tag in all_tags:
+                            ratio = get_capitalization_ratio(tag)
+                            if ratio > 0.5:
+                                available_high_ratio.append((tag, ratio))
+                    
+                    if available_high_ratio:
+                        # Add high-ratio tags with probability proportional to their ratio
+                        total_ratio = sum(ratio for _, ratio in available_high_ratio)
+                        for tag, ratio in available_high_ratio:
+                            word_emission[tag] = 0.8 * (ratio / total_ratio) if total_ratio > 0 else 0.8 / len(available_high_ratio)
+                        # Strongly reduce other tags
+                        for tag in low_ratio_tags:
+                            word_emission[tag] *= 0.01
             
             # Normalize to probabilities and convert to log space
             total_prob = sum(word_emission.values())
@@ -127,10 +219,40 @@ def viterbi_tag_sentence(sentence: List[str], vocab: Dict, transition_probs: Dic
                 for tag in word_emission:
                     word_emission[tag] = word_emission[tag] / total_prob
             else:
-                # Uniform distribution if no counts
-                uniform = 1.0 / len(all_tags)
-                for tag in all_tags:
-                    word_emission[tag] = uniform
+                # Entry exists but has no valid tags for this tag_type
+                # Check if it's punctuation before falling back to uniform distribution
+                is_punctuation_only = bool(word and not re.search(r'[a-zA-Z0-9]', word) and re.search(r'[^\s]', word))
+                
+                if is_punctuation_only:
+                    # Punctuation-only word - assign appropriate punctuation tag
+                    if tag_type == 'upos':
+                        if 'PUNCT' in all_tags:
+                            word_emission['PUNCT'] = 1.0
+                        else:
+                            # If PUNCT not in tags, use uniform distribution
+                            uniform = 1.0 / len(all_tags)
+                            for tag in all_tags:
+                                word_emission[tag] = uniform
+                    else:
+                        # For XPOS, find punctuation tags
+                        punct_tags = [tag for tag in all_tags if (
+                            tag.startswith('F') and len(tag) <= 4
+                            or tag in ('PUNCT', 'Punct', 'punct')
+                        )]
+                        if punct_tags:
+                            prob = 1.0 / len(punct_tags)
+                            for tag in punct_tags:
+                                word_emission[tag] = prob
+                        else:
+                            # No punctuation tags found - use uniform distribution
+                            uniform = 1.0 / len(all_tags)
+                            for tag in all_tags:
+                                word_emission[tag] = uniform
+                else:
+                    # Not punctuation - use uniform distribution
+                    uniform = 1.0 / len(all_tags)
+                    for tag in all_tags:
+                        word_emission[tag] = uniform
         else:
             # OOV word - check if it's punctuation-only first
             # Historic texts often have punctuation marks not in vocabulary

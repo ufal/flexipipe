@@ -1733,9 +1733,17 @@ class FlexiPipeTagger:
                         'deprel': '_',
                     }
                     
-                    # Preserve original text
+                    # Preserve original text and sentence ID
                     if '_original_text' in token:
                         tagged_token['_original_text'] = token.get('_original_text')
+                    if '_sentence_id' in token:
+                        tagged_token['_sentence_id'] = token.get('_sentence_id')
+                    
+                    # Preserve token ID from TEITOK XML (@id or @xml:id)
+                    if 'tok_id' in token and token.get('tok_id'):
+                        tagged_token['tok_id'] = token.get('tok_id')
+                    if 'dtok_id' in token and token.get('dtok_id'):
+                        tagged_token['dtok_id'] = token.get('dtok_id')
                     
                     # Add normalization fields
                     if norm_form:
@@ -2297,16 +2305,11 @@ class FlexiPipeTagger:
                             return '_'
                     elif field == 'lemma':
                         # For lemmatization: if XPOS/UPOS context was provided but didn't match,
-                        # only consider analyses that have XPOS/UPOS tags (more reliable)
-                        # This ensures context-aware lemmatization (e.g., "rueda" as noun vs verb)
+                        # we should NOT fall back to all entries with XPOS - that defeats the purpose
+                        # Instead, return '_' to trigger pattern-based fallback, which uses the XPOS correctly
                         if xpos and xpos != '_':
-                            # XPOS provided: only consider analyses with XPOS tags
-                            entries_with_xpos = [a for a in entry if a.get('xpos') and a.get('xpos') != '_']
-                            if entries_with_xpos:
-                                # Use most frequent among entries with XPOS
-                                sorted_entries = sorted(entries_with_xpos, key=lambda x: x.get('count', 0), reverse=True)
-                                return sorted_entries[0].get(field, '_')
-                            # No entries with XPOS - return '_' to trigger pattern-based fallback
+                            # XPOS was provided but didn't match - don't use wrong XPOS entries
+                            # Return '_' to trigger pattern-based lemmatization which uses the XPOS correctly
                             return '_'
                         elif upos and upos != '_':
                             # UPOS provided (but no XPOS): only consider analyses with UPOS tags
@@ -2791,6 +2794,10 @@ class FlexiPipeTagger:
                                         if next_form != '_' and next_form not in punct_no_space_after:
                                             sentence_text += " "
                     
+                    # Write # sent_id = comment if available (from TEITOK XML <s> @id)
+                    if sentence and sentence[0].get('_sentence_id'):
+                        f.write(f"# sent_id = {sentence[0]['_sentence_id']}\n")
+                    
                     # Write # text = comment (always required in CoNLL-U)
                     f.write(f"# text = {sentence_text}\n")
                     
@@ -2815,6 +2822,9 @@ class FlexiPipeTagger:
                         
                         # Build MISC column with original/normalized forms and SpaceAfter
                         misc_parts = []
+                        # Token ID from TEITOK XML (@id or @xml:id)
+                        if 'tok_id' in token and token['tok_id']:
+                            misc_parts.append(f"TokId={token['tok_id']}")
                         if 'orig_form' in token and token['orig_form'] != form:
                             misc_parts.append(f"OrigForm={token['orig_form']}")
                         # Normalization: always use Reg= in CoNLL-U MISC (standard format)

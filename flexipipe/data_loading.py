@@ -8,7 +8,8 @@ from typing import List, Dict, Optional
 import xml.etree.ElementTree as ET
 
 # CoNLL-U MISC expansion keys (configurable via --expan)
-CONLLU_EXPANSION_KEYS = ['Exp', 'Expan', 'Expand', 'Expansion', 'fform', 'FFORM']
+# Expansion is the new standard format, others are for backward compatibility
+CONLLU_EXPANSION_KEYS = ['Expansion', 'Exp', 'Expan', 'Expand', 'fform', 'FFORM']
 
 def set_conllu_expansion_key(key: Optional[str]):
     """Configure which MISC key to consider as expansion (e.g., 'Exp', 'fform')."""
@@ -71,27 +72,38 @@ def parse_conllu_simple(line: str) -> Optional[Dict]:
                 'misc': parts[9] if len(parts) > 9 else '_',
             })
             
-            # Extract normalization from MISC column (Reg=...)
+            # Extract normalization from MISC column (Normalized= or Reg= for backward compatibility)
+            # Also extract OrigForm= for transpositional parsing
             misc = parts[9] if len(parts) > 9 else '_'
             if misc and misc != '_':
-                # Parse MISC column for Reg= (normalization)
+                # Parse MISC column for Normalized= or Reg= (normalization)
                 misc_parts = misc.split('|')
                 norm_form = '_'
                 expan_form = '_'
+                orig_form = '_'
                 for misc_part in misc_parts:
-                    if misc_part.startswith('Reg='):
-                        norm_form = misc_part[4:]  # Extract value after "Reg="
+                    if misc_part.startswith('Normalized='):
+                        norm_form = misc_part[11:]  # Extract value after "Normalized="
+                    elif misc_part.startswith('Reg='):
+                        norm_form = misc_part[4:]  # Extract value after "Reg=" (backward compatibility)
+                    elif misc_part.startswith('OrigForm='):
+                        orig_form = misc_part[9:]  # Extract value after "OrigForm="
                     else:
                         for k in CONLLU_EXPANSION_KEYS:
                             prefix = f"{k}="
                             if misc_part.startswith(prefix):
                                 expan_form = misc_part[len(prefix):]
                                 break
+                        # Also check for Expansion= (new format)
+                        if misc_part.startswith('Expansion='):
+                            expan_form = misc_part[10:]  # Extract value after "Expansion="
                 token['norm_form'] = norm_form
                 token['expan'] = expan_form if expan_form else '_'
+                token['orig_form'] = orig_form if orig_form else '_'
             else:
                 token['norm_form'] = '_'
                 token['expan'] = '_'
+                token['orig_form'] = '_'
         except (ValueError, IndexError):
             pass
     
@@ -402,6 +414,9 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
             sentence_tokens = []
             token_num = 1
             
+            # Get sentence ID: try @id first, then @xml:id
+            sentence_id = s.get('id', '') or s.get('{http://www.w3.org/XML/1998/namespace}id', '')
+            
             # Try to get original text from sentence element (if available)
             # Some TEITOK files store original text as an attribute or in a text node
             original_sentence_text = s.text or s.get('text', None)
@@ -410,13 +425,15 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                 original_sentence_text = None
             
             for tok in s.findall('.//tok'):
-                tok_id = tok.get('id', '')
+                # Get token ID: try @id first, then @xml:id
+                tok_id = tok.get('id', '') or tok.get('{http://www.w3.org/XML/1998/namespace}id', '')
                 dtoks = tok.findall('.//dtok')
                 
                 if dtoks:
                     # Contraction: process each dtok
                     for dt in dtoks:
-                        dt_id = dt.get('id', '')
+                        # Get dtok ID: try @id first, then @xml:id
+                        dt_id = dt.get('id', '') or dt.get('{http://www.w3.org/XML/1998/namespace}id', '')
                         form = dt.get('form', '') or (dt.text or '').strip()
                         if form:
                             # Get normalization (try specified attr first, then common fallbacks)
@@ -464,7 +481,9 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                         token_num += 1
             
             if sentence_tokens:
-                # Store original text in first token if available
+                # Store sentence ID and original text in first token if available
+                if sentence_id:
+                    sentence_tokens[0]['_sentence_id'] = sentence_id
                 if original_sentence_text:
                     sentence_tokens[0]['_original_text'] = original_sentence_text
                 sentences.append(sentence_tokens)
