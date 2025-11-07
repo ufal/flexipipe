@@ -6,7 +6,7 @@ A fast, accurate FlexiPipe tagger and parser that respects existing annotations 
 
 - **BERT-based tagging and parsing**: Uses fine-tuned transformer models for UPOS/XPOS/FEATS/LEMMA prediction and dependency parsing
 - **Auto-detection of components**: Automatically detects and trains only available components (lemmatizer, parser, normalizer) based on training data
-- **Normalization training**: Integrated normalization head that learns orthographic variants from training data (TEITOK @nform/@reg or CoNLL-U Reg=)
+- **Normalization training**: Integrated normalization head that learns orthographic variants from training data (TEITOK @nform/@reg or CoNLL-U Normalization=)
 - **Tokenizer training**: Train custom WordPiece tokenizers from corpus data (default: enabled)
 - **Sentence segmentation**: Rule-based sentence splitting for raw text input
 - **Word tokenization**: UD-style tokenization that handles contractions, compounds, and punctuation
