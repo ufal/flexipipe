@@ -16,6 +16,9 @@ A fast, accurate FlexiPipe tagger and parser that respects existing annotations 
 - **OOV similarity matching**: Finds similar words based on endings/beginnings for unknown words
 - **Vocabulary support**: Word-level vocabulary with linguistic annotations (separate from tokenizer's subword vocab)
 - **External vocabulary**: Extend/override model vocabulary without retraining
+- **External lexicons**: UniMorph or JSON lexicons for OOV fallback (not merged with vocabulary)
+- **Tagset-based conversion**: On-the-fly conversion of XPOS to UPOS/FEATS using TEITOK tagset definitions
+- **Transition-based parsing**: Fallback dependency parser using learned transition probabilities
 - **Multiple formats**: Supports CoNLL-U (including VRT format with 1-3 columns), TEITOK XML, plain text, and raw text
 - **Full pipeline**: Raw text → sentences → tokens → tags → parse
 - **Historic document support**: Normalization and contraction splitting for neotag replacement
@@ -81,11 +84,24 @@ A fast, accurate FlexiPipe tagger and parser that respects existing annotations 
 
 ### Dependency Parsing
 
-- **Biaffine Attention**: Neural architecture for dependency head prediction
+- **Neural Parser (Biaffine Attention)**: Primary parsing method when model is trained with parser
   - Arc dimension: 500 (configurable)
   - Computes scores for all possible head-dependent pairs: `[batch, seq_len, seq_len]`
   - Memory-efficient: Processes in chunks to avoid memory issues
   - Predicts dependency relations (DEPREL) using separate MLP head
+  - Automatically used when model has parser component trained
+
+- **Transition-based Parser**: Fallback parser when neural parser is unavailable or fails
+  - Uses dependency transition probabilities learned from training corpus
+  - Greedy scoring approach based on POS patterns, distance, and agreement
+  - Supports agreement checking when tagset definition is provided (e.g., ADJ-NOUN Gender/Number agreement)
+  - Automatically falls back to heuristic parser if no transition probabilities available
+  - Particularly useful for vocabulary-based tagging (Viterbi mode) without a trained model
+
+- **Heuristic Parser**: Basic fallback when no transition probabilities are available
+  - Rule-based attachment patterns (DET-NOUN, ADJ-NOUN, ADP-NOUN, etc.)
+  - Language-agnostic: Learns attachment preferences from sentence structure
+  - Enhanced version uses vocabulary to learn language-specific preferences (e.g., ADJ-NOUN vs NOUN-ADJ order)
 
 ### Vocabulary Management
 
@@ -348,14 +364,34 @@ python flexipipe.py tag input.txt \
   - Helps with OOV words and domain-specific terms where model is uncertain
   - Works automatically when `--vocab` is provided (no need for `--vocab-priority`)
   - Example: If model predicts UPOS with 0.5 confidence, vocabulary prediction is used if available
+- `--lexicon`: External lexicon file(s) (UniMorph or JSON format) for OOV fallback
+  - **UniMorph format**: Tab-separated `lemma\tform\tfeatures` (e.g., `lächeln\tlächelt\tV;IND;SG;3;PRS`)
+  - **JSON format**: Same structure as vocabulary files, but without counts
+  - **OOV fallback only**: Lexicons are checked only when words are not in primary vocabulary
+  - **Not merged**: Lexicons remain separate from vocabulary to preserve corpus-specific priorities
+  - **Multiple lexicons**: Can specify multiple files (e.g., `--lexicon general.tsv domain.tsv`)
+  - See [UniMorph Lexicon Format](#unimorph-lexicon-format) section for details
 
 **Annotation Options**:
 - `--respect-existing`: Preserve existing annotations in input (default: True)
 - `--no-respect-existing`: Ignore existing annotations and retag everything
+- `--tagset`: Path to TEITOK tagset XML file for XPOS to UPOS/FEATS conversion
+  - Enables on-the-fly conversion of XPOS tags to UPOS and UD FEATS
+  - Uses EAGLES-style tagset definitions (e.g., `NCMS000` → `NOUN` + `Gender=Masc|Number=Sing`)
+  - Useful when input has XPOS but no UPOS/FEATS annotations
+  - Also improves parsing accuracy through agreement checking (e.g., ADJ-NOUN agreement)
+- `--guess-ud`: Output guessed UPOS and FEATS derived from XPOS using tagset definition
+  - Requires `--tagset` to be specified
+  - Automatically converts XPOS tags to UPOS and FEATS based on tagset rules
+  - Overrides existing UPOS/FEATS if they are missing or `_`
+  - Useful for corpora with XPOS-only annotations (e.g., EAGLES-style tagsets)
 
 **Parsing Options**:
 - `--parse`: Run dependency parsing (predict head and deprel)
-  - Requires model trained with `--train-parser` (default: enabled)
+  - Uses neural parser if model was trained with `--train-parser` (default: enabled)
+  - Falls back to transition-based parser if neural parser unavailable or fails
+  - Transition-based parser uses dependency transition probabilities from vocabulary (if available)
+  - Falls back to heuristic parser if no transitions available
 - `--tag-only`: Only tag (UPOS/XPOS/FEATS), skip parsing
 - `--parse-only`: Only parse (assumes tags already exist), skip tagging
 - `--lemma-method`: Lemmatization method (choices: `bert`, `similarity`, `auto`)
@@ -515,7 +551,8 @@ Built automatically during training, saved as `model_vocab.json`. Contains word-
 FlexiPipe supports multiple vocabulary formats:
 
 1. **FlexiPipe JSON format** (recommended): JSON file for tuning to local corpus (extends/overrides model vocabulary). Can be created using `flexipipe create-vocab`.
-2. **UniMorph lexicon format**: Tab-separated format (`form\tlemma\tfeatures`) for morphological lexicons.
+2. **UniMorph lexicon format**: Tab-separated format (`lemma\tform\tfeatures`) for morphological lexicons, used as OOV fallback.
+3. **External lexicons**: JSON format without counts, used as OOV fallback only (not merged with vocabulary).
 
 ### Format Specification
 
@@ -613,28 +650,30 @@ Case-sensitive forms are stored separately to handle language-specific distincti
 }
 ```
 
-#### UniMorph Lexicon Format
+#### External Lexicon Support
 
-FlexiPipe can load UniMorph lexicons directly. UniMorph format is tab-separated:
+FlexiPipe supports external lexicons as a fallback for OOV (out-of-vocabulary) words. Lexicons are **not merged** with vocabulary files - they remain separate to preserve corpus-specific priorities.
 
-```
-lemma	form	features
-```
+**Lexicon Formats**:
 
-**Example**:
-```
-lächeln	lächelt	V;IND;SG;3;PRS
-gehen	geht	V;IND;SG;3;PRS
-Haus	Häuser	N;PL;NOM
-```
+1. **UniMorph Format** (tab-separated):
+   ```
+   lemma	form	features
+   ```
+   Example:
+   ```
+   lächeln	lächelt	V;IND;SG;3;PRS
+   gehen	geht	V;IND;SG;3;PRS
+   Haus	Häuser	N;PL;NOM
+   ```
+   - **lemma**: The lemma (dictionary form) - first column
+   - **form**: The inflected word form - second column
+   - **features**: UniMorph features (semicolon-separated, e.g., `V;IND;SG;3;PRS`) - third column
+   - **Note**: UniMorph format is `lemma\tform\tfeatures`, not `form\tlemma\tfeatures`. The lemma comes first.
 
-**Format details**:
-- **lemma**: The lemma (dictionary form) - first column
-- **form**: The inflected word form - second column
-- **features**: UniMorph features (semicolon-separated, e.g., `V;IND;SG;3;PRS`) - third column
+2. **JSON Format**: Same structure as vocabulary files, but without counts (counts default to 1)
 
-**Note**: UniMorph format is `lemma\tform\tfeatures`, not `form\tlemma\tfeatures`. The lemma comes first.
-
+**Feature Conversion**:
 FlexiPipe automatically converts UniMorph features to UD FEATS format where possible:
 - UniMorph POS tags (e.g., `V`, `N`, `ADJ`) are mapped to UPOS
 - Common UniMorph features are converted to UD format:
@@ -646,11 +685,22 @@ FlexiPipe automatically converts UniMorph features to UD FEATS format where poss
 
 **Usage**:
 ```bash
-# Use as lexicon (OOV fallback only)
-python -m flexipipe tag input.txt --lexicon lexicon.tsv --vocab corpus_vocab.json --output output.conllu
+# Use lexicon as OOV fallback (with vocabulary)
+python -m flexipipe tag input.txt \
+    --vocab corpus_vocab.json \
+    --lexicon unimorph.tsv \
+    --output output.conllu
 
-# Or use lexicon alone (if no corpus vocabulary available)
-python -m flexipipe tag input.txt --lexicon lexicon.tsv --output output.conllu
+# Multiple lexicons (checked in order)
+python -m flexipipe tag input.txt \
+    --vocab corpus_vocab.json \
+    --lexicon general.tsv domain.tsv \
+    --output output.conllu
+
+# Lexicon alone (if no corpus vocabulary available)
+python -m flexipipe tag input.txt \
+    --lexicon lexicon.tsv \
+    --output output.conllu
 ```
 
 **Important**: Lexicons are used as **fallback for OOV words only**. They are not merged with vocabulary files. This means:
@@ -658,12 +708,13 @@ python -m flexipipe tag input.txt --lexicon lexicon.tsv --output output.conllu
 - If a word is OOV (not in vocabulary), the lexicon is checked as a fallback
 - This ensures corpus-specific vocabulary (with counts) takes priority over general lexicons
 
-UniMorph lexicons are particularly useful for:
+**Use Cases**:
 - Low-resource languages with available UniMorph data
 - Adding morphological information from external lexicons
 - Supplementing corpus-derived vocabularies with comprehensive morphological paradigms
+- Providing lemma and FEATS information for OOV words when vocabulary doesn't have them
 
-**Note**: UniMorph entries are assigned a default count of 1 (since UniMorph doesn't include frequency information). This works fine for lemmatization and tagging.
+**Note**: Lexicon entries are assigned a default count of 1 (since lexicons don't include frequency information). This works fine for lemmatization and tagging.
 
 **Vocabulary Features**:
 - **Arrays for ambiguity**: Multiple analyses stored as arrays, sorted by frequency (most frequent first)
@@ -696,22 +747,38 @@ UniMorph lexicons are particularly useful for:
    - **Context-aware**: Uses XPOS/UPOS context to disambiguate array entries
    - **Fallback**: If no exact match, uses most frequent (first) analysis in array
 
-4. **Priority System**:
+4. **Lexicon System** (OOV fallback):
+   - **Separate from vocabulary**: Lexicons are not merged with vocabulary files
+   - **OOV fallback only**: Checked only when words are not in primary vocabulary
+   - **UniMorph support**: Automatic conversion of UniMorph features to UD FEATS format
+   - **Multiple lexicons**: Can specify multiple lexicon files (checked in order)
+   - **Default counts**: Lexicon entries assigned count of 1 (no frequency information)
+
+5. **Priority System**:
    - **`--vocab-priority`**: Vocabulary checked first, model predictions as fallback (always use vocab if available)
    - **Confidence-based blending** (default when `--vocab` is provided): Model predictions first, but if model confidence < threshold, use vocabulary instead
      - Helps with OOV words and domain-specific terms where model is uncertain
      - Configurable via `--confidence-threshold` (default: 0.7)
      - Example: Model predicts with 0.5 confidence → vocabulary prediction used if available
    - **Without `--vocab-priority` and low confidence**: Model predictions first, vocabulary as fallback
+   - **Lexicon fallback**: After vocabulary, lexicons are checked for OOV words
 
 ### Annotation Pipeline
 
 1. **Respects Existing Annotations**: If UPOS/XPOS/FEATS are already provided in the input, they are preserved (unless `--no-respect-existing` is used)
 
-2. **OOV Handling**: For unknown words:
+2. **XPOS to UPOS/FEATS Conversion** (when `--tagset` and `--guess-ud` are provided):
+   - Loads TEITOK tagset XML file (EAGLES-style tagset definition)
+   - Converts XPOS tags to UPOS and UD FEATS based on tagset rules
+   - Example: `NCMS000` → `NOUN` + `Gender=Masc|Number=Sing`
+   - Used for parsing agreement checking (e.g., ADJ-NOUN Gender/Number agreement)
+   - Overrides existing UPOS/FEATS if they are missing or `_`
+
+3. **OOV Handling**: For unknown words:
    - First checks vocabulary file (if `--vocab-priority` enabled)
    - Then uses model predictions
    - Then uses vocabulary lookup (if `--vocab-priority` disabled)
+   - Then checks lexicon files (OOV fallback)
    - Finally uses similarity matching (endings/beginnings)
    - Falls back to default (usually NOUN)
 
@@ -726,7 +793,17 @@ UniMorph lexicons are particularly useful for:
    - Expands contractions to component parts
    - Maintains proper alignment
 
-5. **Similarity Matching**: 
+5. **Dependency Parsing Strategy**:
+   - **Neural parser** (primary): Uses trained BERT model if parser component was trained
+   - **Transition-based parser** (fallback): Uses dependency transition probabilities from vocabulary
+     - Scores attachments based on POS patterns, distance, and agreement
+     - Greedy assignment avoiding cycles
+     - Supports agreement checking when tagset definition is provided
+   - **Heuristic parser** (final fallback): Rule-based patterns with learned language preferences
+     - Enhanced version learns attachment preferences from sentence structure
+     - Language-agnostic: Adapts to ADJ-NOUN vs NOUN-ADJ order automatically
+
+6. **Similarity Matching**: 
    - Checks word endings (last 3-6 characters)
    - Checks word beginnings (first 2-4 characters)
    - Scores by length similarity
