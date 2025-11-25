@@ -46,10 +46,8 @@ vocabs/
 # Web interface (optional, can be distributed but often local-only)
 # web/
 
-# Third-party libraries (included directly in repo)
-# third_party/ is tracked, but we ignore .git directories if they exist
-third_party/*/.git
-third_party/*/.gitignore
+# Third-party libraries (fetched via CMake FetchContent, not stored in repo)
+third_party/
 
 # Models and vocabularies
 models/

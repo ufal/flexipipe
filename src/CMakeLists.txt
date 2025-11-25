@@ -25,15 +25,38 @@ set(SOURCES
     io_teitok_writer.cpp
 )
 
-# Add rapidjson (header-only)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rapidjson/include)
+# Use FetchContent for dependencies (modern CMake approach)
+include(FetchContent)
+
+# Add rapidjson (header-only library)
+FetchContent_Declare(
+    rapidjson
+    URL https://github.com/Tencent/rapidjson/archive/refs/tags/v1.1.0.tar.gz
+)
+FetchContent_MakeAvailable(rapidjson)
+include_directories(${rapidjson_SOURCE_DIR}/include)
 
 # Add pugixml (needs to be compiled)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pugixml/src)
-set(PUGIXML_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pugixml/src/pugixml.cpp)
+find_package(pugixml QUIET)
+if(NOT pugixml_FOUND)
+    FetchContent_Declare(
+        pugixml
+        URL https://github.com/zeux/pugixml/archive/refs/tags/v1.14.tar.gz
+    )
+    set(PUGIXML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PUGIXML_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(pugixml)
+endif()
 
 # Executable
-add_executable(flexipipe_cpp ${SOURCES} ${PUGIXML_SOURCE})
+add_executable(flexipipe_cpp ${SOURCES})
+
+# Link pugixml
+if(pugixml_FOUND)
+    target_link_libraries(flexipipe_cpp PRIVATE pugixml::pugixml)
+else()
+    target_link_libraries(flexipipe_cpp PRIVATE pugixml)
+endif()
 
 # Link libraries (if needed)
 # target_link_libraries(flexipipe_cpp ...)
