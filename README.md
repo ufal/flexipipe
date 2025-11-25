@@ -7,18 +7,20 @@ UDMorph REST).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
 existing annotations, and exports both CoNLL-U (with optional implicit MWTs
 and IOB NER) and TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures.
 
-The CLI centers around four workflows:
+The CLI centers around several workflows:
 
 | Command | Purpose |
 | --- | --- |
-| `python -m flexipipe tag` | Tag/parse/normalize input with any backend |
+| `python -m flexipipe tag` / `process` | Tag/parse/normalize input with any backend |
 | `python -m flexipipe check` | Evaluate a backend against a gold treebank |
 | `python -m flexipipe train` | Train flexitag or (where implemented) neural backends |
+| `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
+| `python -m flexipipe info` | List backends, models, examples, or tasks |
 | `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, implicit MWT) |
 
-Use `python -m flexipipe --list-backends` or `python -m flexipipe --list-models --backend <name>`
-whenever you need an overview of available integrations or available/downloadable
-models.
+Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`, 
+`python -m flexipipe info examples`, or `python -m flexipipe info tasks` to explore
+available integrations, models, example texts, and supported tasks.
 
 ---
 
@@ -63,11 +65,12 @@ models.
 
 ## Installation & Requirements
 
-1. **Python 3.11** (matches the checked-in wheels)
+1. **Python 3.8+** (Python 3.11 recommended)
 2. Install Python requirements:
    ```bash
    python -m pip install -r requirements.txt
    ```
+   Note: `torch>=2.6.0` is required for security (CVE-2025-32434). The transformers backend will check this at runtime.
 3. For neural backends install their optional extras on demand:
    ```bash
    # SpaCy
@@ -78,6 +81,8 @@ models.
    ```
 4. Build the native flexitag modules (`flexitag`, `viterbi_cpp`) if needed via CMake
    (see `README_CPP.md` for details).
+   
+   **Note**: C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build. No manual installation needed.
 
 ---
 
@@ -290,6 +295,66 @@ possible).
 
 ---
 
+## Information Commands
+
+```bash
+# List all available backends
+python -m flexipipe info backends
+
+# List available models for a backend
+python -m flexipipe info models --backend transformers
+
+# List available example texts (UDHR)
+python -m flexipipe info examples
+
+# List all supported tasks
+python -m flexipipe info tasks
+```
+
+## Format Conversion
+
+The `convert` command supports multiple conversion types:
+
+### Convert TEITOK to UD-style CoNLL-U splits
+
+```bash
+# Convert TEITOK corpus to train/dev/test splits
+python -m flexipipe convert \
+  --type treebank \
+  --input /path/to/teitok/corpus \
+  --output /path/to/output \
+  --train-ratio 0.8 \
+  --dev-ratio 0.1 \
+  --test-ratio 0.1
+
+# Convert CoNLL-U file(s) to splits (handles missing sections)
+python -m flexipipe convert \
+  --type treebank \
+  --input test.conllu \
+  --output splits/
+
+# Rerunning preserves existing splits based on sent_id
+# (prevents test set contamination when data is updated)
+```
+
+**Features:**
+- **Longer sent_ids**: Includes source filename (e.g., `corpus-s1`, `article-s2`) for tracking
+- **Split preservation**: When rerunning, existing splits are preserved based on `sent_id` to avoid test contamination
+- **Handles missing sections**: Can split treebanks that only have test, or only train+test sections
+- **CoNLL-U input support**: Can convert from CoNLL-U files directly (not just TEITOK)
+
+### Using Example Texts
+
+```bash
+# Process UDHR example for a language
+python -m flexipipe process \
+  --backend classla \
+  --language bg \
+  --example udhr
+```
+
+---
+
 ## Evaluation & Debugging Tips
 
 * Use `--debug` for both `tag` and `check` to enable:
@@ -308,9 +373,10 @@ possible).
 flexipipe/              # Main Python package (CLI, backends, converters)
 flexitag/               # C++ flexitag sources and bindings
 src/                    # Additional C++ helpers (tokenizer, TEITOK writer, etc.)
-dev/, docs/, tests/     # Design docs, experiments, and sample data
 README_CPP.md           # Native build instructions
 ```
+
+**Note**: Third-party C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build and are not stored in the repository.
 
 ---
 
@@ -320,10 +386,8 @@ README_CPP.md           # Native build instructions
   `Sentence.entities`, `space_after`).
 * Keep README sections in sync when adding backends, CLI switches, or config
   keys.
-* Pending tasks (as of the current commit history):
-  * Implement end-to-end transformers backend.
-  * Broaden training hooks for SpaCy/Stanza/Flair.
-  * Expand automated tests for REST integrations and TEITOK formatting.
+* The transformers backend is fully implemented with model discovery and metadata support.
+* Training hooks are available for flexitag and some neural backends.
 
 Please open issues or start discussions if you bump into missing features,
 incomplete documentation, or ideas for new backend integrations.
