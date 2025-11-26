@@ -39,15 +39,13 @@ def get_udpipe_model_entries(
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
     verbose: bool = False,
 ) -> Dict[str, Dict[str, str]]:
-    cache_key = "udpipe"
+    cache_key = f"udpipe:{endpoint}"
     if use_cache and not refresh_cache:
         cached = read_model_cache_entry(cache_key, max_age_seconds=cache_ttl_seconds)
         if cached and cache_entries_standardized(cached):
             return cached
 
     prepared_models: Dict[str, Dict[str, str]] = {}
-    endpoint = url or DEFAULT_REST_ENDPOINT
-
     try:
         response = requests.get(
             endpoint.replace("/process", "/models"),
@@ -60,35 +58,51 @@ def get_udpipe_model_entries(
             print(f"[flexipipe] Warning: failed to fetch UDPipe models: {exc}")
         payload = {}
 
-    models = payload.get("models", {}) if isinstance(payload, dict) else {}
+    models_obj = payload.get("models") if isinstance(payload, dict) else None
+    if isinstance(models_obj, dict):
+        iterable = models_obj.items()
+    elif isinstance(models_obj, list):
+        iterable = ((item.get("name"), item) for item in models_obj if isinstance(item, dict))
+    else:
+        iterable = []
 
-    for model_name, model_info in models.items():
+    for model_name, model_info in iterable:
+        if not model_name:
+            continue
         try:
-            lang_name_raw = model_info.get("language", "")
-            lang_display = lang_name_raw.replace("_", " ").title()
-            components = model_info if isinstance(model_info, list) else []
+            components: List[str]
+            language_hint: Optional[str] = None
+            if isinstance(model_info, dict):
+                components = model_info.get("components") or model_info.get("available_components") or []
+                language_hint = model_info.get("language") or model_info.get("lang") or model_info.get("abbr")
+            elif isinstance(model_info, list):
+                components = [str(comp) for comp in model_info]
+            else:
+                components = []
 
-            from ..language_utils import clean_language_name
+            slug = model_name.split("-ud-")[0]
+            slug_parts = slug.split("-")
+            primary_lang = slug_parts[0] if slug_parts else slug
+            lang_candidate = (
+                language_hint
+                or primary_lang
+                or model_name.split("_")[0]
+            )
+            lang_candidate = lang_candidate.replace("_", " ").replace("-", " ").strip()
 
-            lang_metadata = standardize_language_metadata(language_code=None, language_name=lang_display)
-            lang_code = lang_metadata.get(LANGUAGE_FIELD_ISO)
-            if not lang_code:
-                lang_metadata_fallback = standardize_language_metadata(
-                    language_code=None, language_name=lang_name_raw.replace("_", " ")
-                )
-                lang_code = lang_metadata_fallback.get(LANGUAGE_FIELD_ISO) or lang_name_raw.lower()
-
-            lang_display_final = lang_metadata.get(LANGUAGE_FIELD_NAME) or lang_display
-            lang_display_final = clean_language_name(lang_display_final)
+            lang_metadata = standardize_language_metadata(language_code=None, language_name=lang_candidate)
+            lang_code = lang_metadata.get(LANGUAGE_FIELD_ISO) or primary_lang[:2].lower()
+            lang_display_final = clean_language_name(lang_metadata.get(LANGUAGE_FIELD_NAME) or lang_candidate.title())
 
             feature_parts: List[str] = []
-            if "tokenizer" in components:
+            lowered_components = [comp.lower() for comp in components]
+            if "tokenizer" in lowered_components:
                 feature_parts.append("tokenization")
-            if "tagger" in components:
+            if "tagger" in lowered_components:
                 feature_parts.extend(["lemma", "upos", "xpos", "feats"])
-            if "parser" in components:
+            if "parser" in lowered_components:
                 feature_parts.append("depparse")
-            features = ", ".join(feature_parts) if feature_parts else "unknown"
+            features = ", ".join(feature_parts) if feature_parts else "tokenization, tagging, parsing"
 
             entry = build_model_entry(
                 "udpipe",
@@ -97,13 +111,15 @@ def get_udpipe_model_entries(
                 language_name=lang_display_final,
                 features=features,
                 components=components,
-                preferred=lang_code == "en" and "ewt" in model_name.lower(),
+                preferred=lang_code == "en" and ("ewt" in model_name.lower() or "english" in model_name.lower()),
             )
             prepared_models[model_name] = entry
-        except Exception:
+        except Exception as exc:
+            if verbose:
+                print(f"[flexipipe] Warning: failed to parse UDPipe model '{model_name}': {exc}")
             continue
 
-    if refresh_cache:
+    if prepared_models:
         try:
             write_model_cache_entry(cache_key, prepared_models)
         except (OSError, PermissionError):
