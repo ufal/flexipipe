@@ -776,39 +776,62 @@ def _auto_select_model_for_language(
         remaining = [b for b in LANGUAGE_BACKEND_PRIORITY if b not in search_order and b not in excluded]
     combined_order = search_order + remaining
 
+    def _load_backend_entries_for_order(
+        order: Collection[str],
+        *,
+        refresh: bool,
+    ) -> dict[str, dict]:
+        entries_map: dict[str, dict] = {}
+        for backend in order:
+            if refresh and (getattr(args, "verbose", False) or getattr(args, "debug", False)):
+                print(f"[flexipipe] Fetching model registry for backend '{backend}' (network request)...")
+            try:
+                entries_map[backend] = _load_backend_entries(
+                    backend,
+                    args,
+                    use_cache=not refresh,
+                    refresh_cache=refresh,
+                    verbose=False,
+                )
+            except Exception as exc:
+                entries_map.setdefault(backend, {})
+                if refresh and (getattr(args, "verbose", False) or getattr(args, "debug", False)):
+                    print(f"[flexipipe] Warning: could not refresh model registry for backend '{backend}': {exc}")
+        return entries_map
+
     def ensure_entries(order: list[str]) -> dict[str, dict]:
-        # Try to use unified catalog for faster model selection
+        entries_map: dict[str, dict] = {}
+        # Try unified catalog first
         try:
             from .model_catalog import build_unified_catalog
+
             catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
-            
-            # Convert catalog to entries_map format
-            entries_map: dict[str, dict] = {}
-            for catalog_key, entry in catalog.items():
+            for entry in catalog.values():
                 backend = entry.get("backend")
                 if not backend or backend not in order:
                     continue
-                if backend not in entries_map:
-                    entries_map[backend] = {}
+                entries_map.setdefault(backend, {})
                 model_name = entry.get("model")
                 if model_name:
                     entries_map[backend][model_name] = entry
-            return entries_map
         except Exception:
-            # Fallback to per-backend loading
-            entries_map: dict[str, dict] = {}
-            for backend in order:
-                try:
-                    entries_map[backend] = _load_backend_entries(
-                        backend,
-                        args,
-                        use_cache=True,
-                        refresh_cache=False,
-                        verbose=False,
-                    )
-                except Exception:
-                    continue
-            return entries_map
+            pass
+
+        missing_backends = [backend for backend in order if backend not in entries_map]
+        if missing_backends:
+            entries_map.update(_load_backend_entries_for_order(missing_backends, refresh=False))
+
+        # Ensure all keys exist even if empty
+        for backend in order:
+            entries_map.setdefault(backend, {})
+
+        empty_backends = [backend for backend in order if not entries_map.get(backend)]
+        if empty_backends:
+            refreshed = _load_backend_entries_for_order(empty_backends, refresh=True)
+            for backend in empty_backends:
+                if refreshed.get(backend):
+                    entries_map[backend] = refreshed[backend]
+        return entries_map
 
     query = resolve_language_query(language)
 
@@ -4510,6 +4533,29 @@ def _prompt_choice(prompt: str, choices: List[str], default: Optional[str] = Non
         print(f"Please choose one of: {options}")
 
 
+def _prefetch_backend_registries(backends: Collection[str], *, verbose: bool = False) -> None:
+    """
+    Prefetch registry entries for given backends so auto-selection works immediately.
+    """
+    if not backends:
+        return
+    from .backend_registry import get_model_entries
+
+    for backend in backends:
+        try:
+            if verbose:
+                print(f"[flexipipe] Prefetching registry for backend '{backend}'...")
+            get_model_entries(
+                backend,
+                use_cache=False,
+                refresh_cache=True,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[flexipipe] Warning: failed to prefetch registry for backend '{backend}': {exc}")
+
+
 def _run_config_wizard() -> int:
     from .model_storage import (
         get_flexipipe_models_dir,
@@ -4597,6 +4643,9 @@ def _run_config_wizard() -> int:
                 print(f"[flexipipe] Failed to prepare language model: {exc}")
     else:
         print(f"[flexipipe] Skipping fastText download (language detector '{language_detector}' does not require it).")
+
+    print("\n[flexipipe] Prefetching model registries for installed backends (this may take a moment)...")
+    _prefetch_backend_registries(LANGUAGE_BACKEND_PRIORITY, verbose=True)
 
     print("\n[flexipipe] Wizard complete. Run 'python -m flexipipe config --show' to review settings.\n")
     return 0
