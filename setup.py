@@ -3,11 +3,16 @@
 Setup script for FlexiPipe
 """
 
-from setuptools import setup, find_packages, Extension
-from setuptools.command.build_ext import build_ext
-from pathlib import Path
-import pybind11
+import shutil
 import sys
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+import pybind11
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
 
 # Read README for long description
 readme_file = Path(__file__).parent / "README.md"
@@ -63,6 +68,68 @@ EXTRAS["dev"] = sorted(
         ]
     )
 )
+
+DEPS_BASE = Path(__file__).parent
+
+
+def _download_and_extract(url: str, target_dir: Path) -> Path:
+    if target_dir.exists():
+        return target_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        archive_path = tmp_path / url.split("/")[-1]
+        with urllib.request.urlopen(url) as response:
+            data = response.read()
+        archive_path.write_bytes(data)
+        with tarfile.open(archive_path, "r:*") as tar:
+            tar.extractall(tmp_path)
+        extracted_roots = [p for p in tmp_path.iterdir() if p.is_dir()]
+        if not extracted_roots:
+            raise RuntimeError(f"Failed to extract dependency from {url}")
+        root = extracted_roots[0]
+        # Copy contents into target_dir
+        for child in root.iterdir():
+            dest = target_dir / child.name
+            if dest.exists():
+                continue
+            if child.is_dir():
+                shutil.copytree(child, dest)
+            else:
+                shutil.copy2(child, dest)
+    return target_dir
+
+
+class FlexiBuildExt(build_ext):
+    RAPIDJSON_URL = "https://github.com/Tencent/rapidjson/archive/refs/tags/v1.1.0.tar.gz"
+    PUGIXML_URL = "https://github.com/zeux/pugixml/archive/refs/tags/v1.14.tar.gz"
+
+    def run(self):
+        rapidjson_include, pugixml_src_dir, pugixml_source = self._prepare_third_party()
+        for ext in self.extensions:
+            if ext.name == "flexipipe.pipeline_cpp":
+                include_dirs = list(ext.include_dirs or [])
+                include_dirs.extend([rapidjson_include, pugixml_src_dir])
+                ext.include_dirs = include_dirs
+                sources = list(ext.sources or [])
+                if pugixml_source not in sources:
+                    sources.append(pugixml_source)
+                ext.sources = sources
+        super().run()
+
+    def _prepare_third_party(self):
+        build_temp = Path(self.build_temp or "build")
+        deps_dir = build_temp / "_deps"
+        deps_dir.mkdir(parents=True, exist_ok=True)
+
+        rapidjson_dir = _download_and_extract(self.RAPIDJSON_URL, deps_dir / "rapidjson")
+        pugixml_dir = _download_and_extract(self.PUGIXML_URL, deps_dir / "pugixml")
+
+        rapidjson_include = str((rapidjson_dir / "include").resolve())
+        pugixml_src_dir = str((pugixml_dir / "src").resolve())
+        pugixml_source = str((pugixml_dir / "src" / "pugixml.cpp").resolve())
+        return rapidjson_include, pugixml_src_dir, pugixml_source
+
 
 setup(
     name="flexipipe",
@@ -129,8 +196,6 @@ setup(
             include_dirs=[
                 pybind11.get_include(),
                 "src",
-                "third_party/rapidjson/include",
-                "third_party/pugixml/src",
             ],
             language="c++",
             extra_compile_args=[
@@ -141,12 +206,9 @@ setup(
                 "/std:c++17",
                 "/O2",
             ],
-            extra_objects=[
-                "third_party/pugixml/src/pugixml.cpp",
-            ] if sys.platform != "win32" else [],
         ),
     ],
-    cmdclass={"build_ext": build_ext},
+    cmdclass={"build_ext": FlexiBuildExt},
     zip_safe=False,
 )
 
