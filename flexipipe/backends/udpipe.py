@@ -20,15 +20,19 @@ from ..language_utils import (
     clean_language_name,
     standardize_language_metadata,
 )
+from ..model_registry import DEFAULT_REGISTRY_BASE_URL, get_registry_url
 from ..model_storage import (
     get_backend_models_dir,
+    get_backend_registry_file,
     read_model_cache_entry,
+    write_backend_registry_file,
     write_model_cache_entry,
 )
 from ..neural_backend import BackendManager, NeuralResult
 
 MODEL_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 DEFAULT_REST_ENDPOINT = "https://lindat.mff.cuni.cz/services/udpipe/api/process"
+DEFAULT_UDPIPE_REGISTRY_URL = DEFAULT_REGISTRY_BASE_URL.rstrip("/") + "/udpipe.json"
 
 
 def get_udpipe_model_entries(
@@ -39,12 +43,144 @@ def get_udpipe_model_entries(
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
     verbose: bool = False,
 ) -> Dict[str, Dict[str, str]]:
+    endpoint = url or DEFAULT_REST_ENDPOINT
+    registry_url = get_registry_url("udpipe")
+
+    curated_entries = _load_curated_udpipe_registry(
+        registry_url,
+        force_download=refresh_cache or not use_cache,
+        verbose=verbose,
+    )
+    if curated_entries:
+        return curated_entries
+
+    if verbose:
+        print("[flexipipe] Warning: curated UDPipe registry unavailable; falling back to live UDPipe API.")
+
     cache_key = f"udpipe:{endpoint}"
     if use_cache and not refresh_cache:
         cached = read_model_cache_entry(cache_key, max_age_seconds=cache_ttl_seconds)
         if cached and cache_entries_standardized(cached):
             return cached
 
+    fallback_entries = fetch_udpipe_models_from_api(endpoint=endpoint, verbose=verbose)
+    if fallback_entries:
+        try:
+            write_model_cache_entry(cache_key, fallback_entries)
+        except (OSError, PermissionError):
+            pass
+    return fallback_entries
+
+
+def _load_curated_udpipe_registry(
+    registry_url: Optional[str],
+    *,
+    force_download: bool,
+    verbose: bool,
+) -> Dict[str, Dict[str, str]]:
+    if not registry_url:
+        return {}
+
+    registry_path = _ensure_curated_registry_local_copy(
+        registry_url,
+        force_download=force_download,
+        verbose=verbose,
+    )
+    if registry_path is None or not registry_path.exists():
+        return {}
+    try:
+        with registry_path.open("r", encoding="utf-8") as handle:
+            registry_payload = json.load(handle)
+    except Exception as exc:
+        if verbose:
+            print(f"[flexipipe] Warning: failed to read UDPipe registry cache: {exc}")
+        return {}
+    return _entries_from_curated_registry(registry_payload, verbose=verbose)
+
+
+def _ensure_curated_registry_local_copy(
+    registry_url: str,
+    *,
+    force_download: bool,
+    verbose: bool,
+) -> Optional[Path]:
+    registry_path = get_backend_registry_file("udpipe")
+    if registry_path.exists() and not force_download:
+        return registry_path
+
+    try:
+        if registry_url.startswith("file://"):
+            source_path = Path(registry_url[7:])
+            if not source_path.exists():
+                raise FileNotFoundError(f"registry file not found: {source_path}")
+            with source_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            write_backend_registry_file("udpipe", data)
+        else:
+            response = requests.get(registry_url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            write_backend_registry_file("udpipe", data)
+        if verbose:
+            print(f"[flexipipe] Saved curated UDPipe registry to {registry_path}")
+        return registry_path
+    except Exception as exc:
+        if verbose:
+            print(f"[flexipipe] Warning: failed to fetch curated UDPipe registry ({registry_url}): {exc}")
+        if registry_path.exists() and not force_download:
+            return registry_path
+        return None
+
+
+def _entries_from_curated_registry(
+    registry_payload: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> Dict[str, Dict[str, str]]:
+    sources = registry_payload.get("sources", {}) if isinstance(registry_payload, dict) else {}
+    entries: Dict[str, Dict[str, str]] = {}
+    for source_name, models in sources.items():
+        if not isinstance(models, list):
+            continue
+        for model_info in models:
+            if not isinstance(model_info, dict):
+                continue
+
+            model_name = model_info.get("model")
+            if not model_name:
+                continue
+
+            entry = build_model_entry(
+                "udpipe",
+                model_name,
+                language_code=model_info.get("language_iso"),
+                language_name=model_info.get("language_name"),
+                preferred=model_info.get("preferred", False),
+                features=model_info.get("features"),
+                tasks=model_info.get("tasks"),
+            )
+            for extra_key in (
+                "components",
+                "description",
+                "download_url",
+                "training_data",
+                "techniques",
+            ):
+                if model_info.get(extra_key) is not None:
+                    entry[extra_key] = model_info[extra_key]
+            entry["source"] = source_name
+            entries[model_name] = entry
+
+    if verbose and entries:
+        print(f"[flexipipe] Loaded {len(entries)} curated UDPipe entries from registry.")
+    return entries
+
+
+def fetch_udpipe_models_from_api(
+    *,
+    endpoint: str = DEFAULT_REST_ENDPOINT,
+    verbose: bool = False,
+) -> Dict[str, Dict[str, str]]:
     prepared_models: Dict[str, Dict[str, str]] = {}
     try:
         response = requests.get(
@@ -55,7 +191,7 @@ def get_udpipe_model_entries(
         payload = response.json()
     except Exception as exc:
         if verbose:
-            print(f"[flexipipe] Warning: failed to fetch UDPipe models: {exc}")
+            print(f"[flexipipe] Warning: failed to fetch UDPipe models from API: {exc}")
         payload = {}
 
     models_obj = payload.get("models") if isinstance(payload, dict) else None
@@ -69,62 +205,68 @@ def get_udpipe_model_entries(
     for model_name, model_info in iterable:
         if not model_name:
             continue
+        components: List[str]
+        language_hint: Optional[str] = None
+        if isinstance(model_info, dict):
+            components = model_info.get("components") or model_info.get("available_components") or []
+            language_hint = model_info.get("language") or model_info.get("lang") or model_info.get("abbr")
+        elif isinstance(model_info, list):
+            components = [str(comp) for comp in model_info]
+        else:
+            components = []
+
         try:
-            components: List[str]
-            language_hint: Optional[str] = None
-            if isinstance(model_info, dict):
-                components = model_info.get("components") or model_info.get("available_components") or []
-                language_hint = model_info.get("language") or model_info.get("lang") or model_info.get("abbr")
-            elif isinstance(model_info, list):
-                components = [str(comp) for comp in model_info]
-            else:
-                components = []
-
-            slug = model_name.split("-ud-")[0]
-            slug_parts = slug.split("-")
-            primary_lang = slug_parts[0] if slug_parts else slug
-            lang_candidate = (
-                language_hint
-                or primary_lang
-                or model_name.split("_")[0]
-            )
-            lang_candidate = lang_candidate.replace("_", " ").replace("-", " ").strip()
-
-            lang_metadata = standardize_language_metadata(language_code=None, language_name=lang_candidate)
-            lang_code = lang_metadata.get(LANGUAGE_FIELD_ISO) or primary_lang[:2].lower()
-            lang_display_final = clean_language_name(lang_metadata.get(LANGUAGE_FIELD_NAME) or lang_candidate.title())
-
-            feature_parts: List[str] = []
-            lowered_components = [comp.lower() for comp in components]
-            if "tokenizer" in lowered_components:
-                feature_parts.append("tokenization")
-            if "tagger" in lowered_components:
-                feature_parts.extend(["lemma", "upos", "xpos", "feats"])
-            if "parser" in lowered_components:
-                feature_parts.append("depparse")
-            features = ", ".join(feature_parts) if feature_parts else "tokenization, tagging, parsing"
-
-            entry = build_model_entry(
-                "udpipe",
+            entry = _build_udpipe_entry_from_components(
                 model_name,
-                language_code=lang_code,
-                language_name=lang_display_final,
-                features=features,
                 components=components,
-                preferred=lang_code == "en" and ("ewt" in model_name.lower() or "english" in model_name.lower()),
+                language_hint=language_hint,
             )
             prepared_models[model_name] = entry
         except Exception as exc:
             if verbose:
                 print(f"[flexipipe] Warning: failed to parse UDPipe model '{model_name}': {exc}")
             continue
-
-    if prepared_models:
-        try:
-            write_model_cache_entry(cache_key, prepared_models)
-        except (OSError, PermissionError):
-            pass
     return prepared_models
+
+
+def _build_udpipe_entry_from_components(
+    model_name: str,
+    *,
+    components: Optional[List[str]] = None,
+    language_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    components = components or []
+    slug = model_name.split("-ud-")[0]
+    slug_parts = slug.split("-")
+    primary_lang = slug_parts[0] if slug_parts else slug
+    lang_candidate = language_hint or primary_lang or model_name.split("_")[0]
+    lang_candidate = lang_candidate.replace("_", " ").replace("-", " ").strip()
+
+    lang_metadata = standardize_language_metadata(language_code=None, language_name=lang_candidate)
+    lang_code = lang_metadata.get(LANGUAGE_FIELD_ISO) or primary_lang[:2].lower()
+    lang_display_final = clean_language_name(lang_metadata.get(LANGUAGE_FIELD_NAME) or lang_candidate.title())
+
+    feature_parts: List[str] = []
+    lowered_components = [comp.lower() for comp in components]
+    if "tokenizer" in lowered_components:
+        feature_parts.append("tokenization")
+    if "tagger" in lowered_components:
+        feature_parts.extend(["lemma", "upos", "xpos", "feats"])
+    if "parser" in lowered_components:
+        feature_parts.append("depparse")
+    features = ", ".join(feature_parts) if feature_parts else "tokenization, tagging, parsing"
+
+    preferred = lang_code == "en" and ("ewt" in model_name.lower() or "english" in model_name.lower())
+    entry = build_model_entry(
+        "udpipe",
+        model_name,
+        language_code=lang_code,
+        language_name=lang_display_final,
+        features=features,
+        components=components,
+        preferred=preferred,
+    )
+    return entry
 
 
 def list_udpipe_models_display(
@@ -296,5 +438,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_udpipe_models_display,
     supports_training=False,
     is_rest=True,
+    model_registry_url=DEFAULT_UDPIPE_REGISTRY_URL,
 )
 

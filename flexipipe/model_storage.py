@@ -339,6 +339,39 @@ def write_model_cache_entry(backend: str, data: dict) -> None:
     _write_model_cache(cache)
 
 
+def get_backend_registry_file(backend: str) -> Path:
+    """
+    Return the path where the backend's curated registry JSON should be stored.
+    """
+    backend_dir = get_backend_models_dir(backend, create=True)
+    return backend_dir / "modellist.json"
+
+
+def read_backend_registry_file(backend: str) -> Optional[dict]:
+    """
+    Read the cached registry JSON for a backend if it exists.
+    """
+    registry_path = get_backend_registry_file(backend)
+    if not registry_path.exists():
+        return None
+    try:
+        with registry_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def write_backend_registry_file(backend: str, data: dict) -> Path:
+    """
+    Write registry JSON for a backend into the models directory.
+    """
+    registry_path = get_backend_registry_file(backend)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with registry_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    return registry_path
+
+
 def get_model_cache_timestamp(backend: str) -> Optional[float]:
     """
     Return the timestamp of the cached entry for a backend, if present.
