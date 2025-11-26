@@ -28,10 +28,13 @@ def _detect_fasttext(
         return None
     ensure_fasttext_language_model()
     try:
+        # Get top 5 candidates when verbose to help with debugging
+        top_k = 5 if verbose else 1
         return detect_language_fasttext(
             text,
             min_length=min_length,
             confidence_threshold=confidence_threshold,
+            top_k=top_k,
         )
     except RuntimeError as exc:
         if verbose:

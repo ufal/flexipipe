@@ -1048,6 +1048,15 @@ def _detect_language_from_text(
                 "[flexipipe] Language could not accurately be detected "
                 f"(confidence {confidence:.2%}). Please provide --language."
             )
+            # Show top candidates to help debug
+            candidates = result.get("candidates") or []
+            if candidates:
+                print("Top language candidates:")
+                for idx, candidate in enumerate(candidates[:5], start=1):
+                    iso = candidate.get("language_iso") or candidate.get("label") or "-"
+                    name = candidate.get("language_name") or candidate.get("label") or "-"
+                    conf = candidate.get("confidence", 0.0)
+                    print(f"  {idx}. {name} ({iso}): {conf:.2%}")
         return None
     result.setdefault("detector", detector_name)
     return result
@@ -3013,6 +3022,11 @@ def run_tag(args: argparse.Namespace) -> int:
     if not detection_attempted:
         detection_result = _maybe_detect_language(args, detection_source_text)
         detection_attempted = True
+        # Store detected language in document.meta
+        if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
+            doc.meta["language"] = detection_result["language"]
+        elif getattr(args, "language", None):
+            doc.meta["language"] = args.language
 
     if not auto_selected:
         backend_type = _auto_select_model_for_language(args, backend_type)

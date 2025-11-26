@@ -283,7 +283,11 @@ def create_backend(
         factory_kwargs = dict(kwargs)
         factory_kwargs.setdefault("training", training)
         if model_name is not None:
-            factory_kwargs.setdefault("model_name", model_name)
+            # For REST backends, map model_name to model
+            if info.is_rest:
+                factory_kwargs.setdefault("model", model_name)
+            else:
+                factory_kwargs.setdefault("model_name", model_name)
         if model_path is not None:
             factory_kwargs.setdefault("model_path", model_path)
         if language is not None:
@@ -302,7 +306,8 @@ def create_backend(
         endpoint_url = kwargs.pop("endpoint_url", None)
         if not endpoint_url:
             raise ValueError("UDMorph backend requires endpoint_url. Provide --udmorph-url.")
-        model = kwargs.pop("model", None)
+        # Map model_name to model for REST backends
+        model = kwargs.pop("model", None) or kwargs.pop("model_name", None)
         timeout = kwargs.pop("timeout", 30.0)
         extra_params = kwargs.pop("extra_params", None)
         headers = kwargs.pop("headers", None)
@@ -327,7 +332,8 @@ def create_backend(
         endpoint_url = kwargs.pop("endpoint_url", None)
         if not endpoint_url:
             raise ValueError("NameTag backend requires endpoint_url. Provide --nametag-url.")
-        model = kwargs.pop("model", None)
+        # Map model_name to model for REST backends
+        model = kwargs.pop("model", None) or kwargs.pop("model_name", None)
         language = kwargs.pop("language", None)
         version = kwargs.pop("version", "3")
         timeout = kwargs.pop("timeout", 30.0)

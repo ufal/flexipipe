@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from .doc import Document, Sentence, SubToken, Token, Entity, UD_DOCUMENT_ATTRIBUTES, UD_SENTENCE_ATTRIBUTES
+from .doc import Document, Sentence, SubToken, Token, Entity, Span, UD_DOCUMENT_ATTRIBUTES, UD_PARAGRAPH_ATTRIBUTES, UD_SENTENCE_ATTRIBUTES
 from .doc_utils import collect_span_entities_by_sentence
 
 DEFAULT_GENERATOR = "flexipipe"
@@ -253,7 +253,14 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
 
 def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: bool = False) -> Document:
     """
-    Parse CoNLL-U text into a Document.
+    Parse CoNLL-U text into a Document, respecting UD hierarchy.
+    
+    UD Hierarchy:
+    - Anything before first #newdoc is file-level (Doc level)
+    - Between #newdoc and #newpar (or first #sent_id/#text if #newpar missing) is document-level
+    - Between #newpar and #sent_id/#text is paragraph-level (creates span with label "p")
+    - Below #sent_id/#text is sentence-level
+    - Multiple #newdoc markers create text spans for each document
     
     Args:
         conllu_text: CoNLL-U formatted text
@@ -266,15 +273,35 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
     pending_mwt: dict[int, tuple[int, str]] = {}
     # Map from token id to Token created for MWT range
     mwt_parents: dict[int, Token] = {}
-    sentence_counter = 1  # Start at 1 for s1, s2, etc.
+    sentence_counter = 0  # 0-based for span indexing
     seen_any_token = False
+    
+    # Track UD hierarchy
+    hierarchy_level = "file"  # file, document, paragraph, sentence
+    seen_any_newdoc = False
+    seen_any_newpar = False
+    seen_any_sent_id_or_text = False
+    num_newdoc_markers = 0
+    file_level_attrs: Dict[str, str] = {}  # Attributes before first #newdoc (file-level)
+    current_doc_attrs: Dict[str, str] = {}  # Attributes for current document (between newdoc and newpar/sent)
+    current_par_attrs: Dict[str, str] = {}  # Attributes for current paragraph (between newpar and sent)
+    current_par_start_sent_idx = 0  # Sentence index where current paragraph starts
+    current_text_start_sent_idx = 0  # Sentence index where current text/document starts
+    text_spans: List[Span] = []  # Collect text spans for multiple documents
+    par_spans: List[Span] = []  # Collect paragraph spans
+    
+    # API-specific attributes that can appear at file or document level
+    API_ATTRIBUTES = {"nametag_model", "nametag_model_licence", "udmorph_model", "udmorph_model_licence", 
+                      "ctext_model", "ctext_model_licence", "udpipe_model", "udpipe_model_licence",
+                      "generator", "model"}
+    
     for raw_line in conllu_text.splitlines():
         line = raw_line.rstrip("\n")
         if not line:
+            # Empty line: end current sentence if present
             if current_sentence:
-                # Generate sentid if missing and add_tokids is True
                 if add_tokids and not current_sentence.sent_id:
-                    current_sentence.sent_id = f"s{sentence_counter}"
+                    current_sentence.sent_id = f"s{sentence_counter + 1}"
                     if not current_sentence.id:
                         current_sentence.id = current_sentence.sent_id
                 document.sentences.append(current_sentence)
@@ -283,29 +310,99 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 mwt_parents.clear()
                 sentence_counter += 1
             continue
+        
         if line.startswith("#"):
             key_val = line[1:].strip()
-            if key_val.startswith("newdoc id"):
-                parts = key_val.split("=", 1)
-                if len(parts) == 2:
-                    value = parts[1].strip()
-                    document.id = value
-                    document.set_standard_attr("newdoc_id", value)
-                continue
+            
+            # Handle #newdoc marker
             if key_val.startswith("newdoc"):
-                document.attrs.setdefault("newdoc", key_val)
+                seen_any_newdoc = True
+                num_newdoc_markers += 1
+                hierarchy_level = "document"
+                
+                # Close previous text span if we had one
+                if num_newdoc_markers > 1 and current_text_start_sent_idx < sentence_counter:
+                    text_span = Span(
+                        label="text",
+                        start=current_text_start_sent_idx,
+                        end=sentence_counter,
+                        attrs=dict(current_doc_attrs)
+                    )
+                    text_spans.append(text_span)
+                    current_doc_attrs = {}
+                
+                # Extract newdoc id if present
+                if "id" in key_val and "=" in key_val:
+                    parts = key_val.split("=", 1)
+                    if len(parts) == 2:
+                        value = parts[1].strip()
+                        if num_newdoc_markers == 1:
+                            # First newdoc sets document.id
+                            document.id = value
+                            document.set_standard_attr("newdoc_id", value)
+                        else:
+                            # Subsequent newdocs store id in current_doc_attrs
+                            current_doc_attrs["newdoc_id"] = value
+                
+                # Extract any other attributes from newdoc line (e.g., "# newdoc id = doc1 section = intro")
+                if "=" in key_val:
+                    for part in key_val.split():
+                        if "=" in part and not part.startswith("id="):
+                            attr_parts = part.split("=", 1)
+                            if len(attr_parts) == 2:
+                                attr_key = attr_parts[0].strip()
+                                attr_val = attr_parts[1].strip()
+                                current_doc_attrs[attr_key] = attr_val
+                
+                current_text_start_sent_idx = sentence_counter
                 continue
+            
+            # Handle #newpar marker
+            if key_val.startswith("newpar"):
+                seen_any_newpar = True
+                hierarchy_level = "paragraph"
+                
+                # Close previous paragraph span if we had one
+                if current_par_start_sent_idx < sentence_counter:
+                    par_span = Span(
+                        label="p",
+                        start=current_par_start_sent_idx,
+                        end=sentence_counter,
+                        attrs=dict(current_par_attrs)
+                    )
+                    par_spans.append(par_span)
+                    current_par_attrs = {}
+                
+                # Extract any attributes from newpar line (e.g., "# newpar section = intro")
+                if "=" in key_val:
+                    for part in key_val.split():
+                        if "=" in part:
+                            attr_parts = part.split("=", 1)
+                            if len(attr_parts) == 2:
+                                attr_key = attr_parts[0].strip()
+                                attr_val = attr_parts[1].strip()
+                                current_par_attrs[attr_key] = attr_val
+                
+                current_par_start_sent_idx = sentence_counter
+                continue
+            
+            # Handle attribute lines (# key = value)
             if "=" in key_val:
                 key, value = key_val.split("=", 1)
                 key = key.strip()
                 value = value.strip()
-                # Determine if this is a sentence-level attribute
+                
+                # Check if this is a sentence-level attribute
                 is_sentence_attr = key in UD_SENTENCE_ATTRIBUTES or key in {"sent_id", "text"}
                 
                 if is_sentence_attr:
-                    # Sentence-level attribute - ensure sentence exists
+                    # Sentence-level: only sent_id and text can come before tokens
+                    hierarchy_level = "sentence"
+                    seen_any_sent_id_or_text = True
+                    
                     if not current_sentence:
                         current_sentence = Sentence(id="", sent_id="")
+                    
                     if key == "sent_id":
                         current_sentence.set_standard_attr("sent_id", value)
                         if not current_sentence.id:
@@ -313,21 +410,58 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                         current_sentence.source_id = value
                     elif key == "text":
                         current_sentence.set_standard_attr("text", value)
+                    elif key == "language" or key == "lang":
+                        # Language can be at sentence or document level - if before newdoc, it's document-level
+                        if hierarchy_level == "file" or (not seen_any_newdoc and not seen_any_sent_id_or_text):
+                            # Document-level language - store in meta for use by backends
+                            document.meta["language"] = value
+                            if key in UD_SENTENCE_ATTRIBUTES:
+                                document.set_standard_attr(key, value)
+                        elif key in UD_SENTENCE_ATTRIBUTES:
+                            current_sentence.set_standard_attr(key, value)
+                            # Also store in document.meta if not already set (sentence-level lang can be doc-level default)
+                            if "language" not in document.meta:
+                                document.meta["language"] = value
+                        else:
+                            current_sentence.attrs[key] = value
                     elif key in UD_SENTENCE_ATTRIBUTES:
                         current_sentence.set_standard_attr(key, value)
                     else:
                         current_sentence.attrs[key] = value
-                elif not current_sentence and not seen_any_token:
-                    # Document-level attribute (before any sentence)
-                    if key in UD_DOCUMENT_ATTRIBUTES:
-                        document.set_standard_attr(key, value)
+                else:
+                    # Non-sentence attribute: assign based on hierarchy level
+                    if hierarchy_level == "file" or (not seen_any_newdoc and not seen_any_sent_id_or_text):
+                        # File-level (before first newdoc or sent_id/text)
+                        if key in UD_DOCUMENT_ATTRIBUTES:
+                            document.set_standard_attr(key, value)
+                        elif key in API_ATTRIBUTES:
+                            # API attributes before newdoc are file-level
+                            file_level_attrs[key] = value
+                        else:
+                            file_level_attrs[key] = value
+                    elif hierarchy_level == "document" or (seen_any_newdoc and not seen_any_newpar and not seen_any_sent_id_or_text):
+                        # Document-level (between newdoc and newpar/sent)
+                        if key in UD_DOCUMENT_ATTRIBUTES:
+                            current_doc_attrs[key] = value
+                        elif key in API_ATTRIBUTES:
+                            # API attributes are always document-level
+                            document.attrs[key] = value
+                            current_doc_attrs[key] = value
+                        else:
+                            current_doc_attrs[key] = value
+                    elif hierarchy_level == "paragraph" or (seen_any_newpar and not seen_any_sent_id_or_text):
+                        # Paragraph-level (between newpar and sent)
+                        if key in UD_PARAGRAPH_ATTRIBUTES:
+                            current_par_attrs[key] = value
+                        else:
+                            current_par_attrs[key] = value
                     else:
-                        document.attrs[key] = value
-                elif current_sentence:
-                    # Non-standard sentence-level attribute
-                    current_sentence.attrs[key] = value
-            if not current_sentence:
-                current_sentence = Sentence(id="", sent_id="")
+                        # After sentence started - this shouldn't happen for non-sentence attrs, but handle gracefully
+                        # Some APIs put attributes after sentences, treat as document-level
+                        if key in API_ATTRIBUTES:
+                            document.attrs[key] = value
+                        elif current_sentence:
+                            current_sentence.attrs[key] = value
             continue
         # Token or MWT
         cols = line.split("\t")
@@ -474,14 +608,51 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 space_after=not ("SpaceAfter=No" in misc),
             )
             current_sentence.tokens.append(tok)
+    
     # Flush any last sentence
     if current_sentence:
         # Generate sentid if missing and add_tokids is True
         if add_tokids and not current_sentence.sent_id:
-            current_sentence.sent_id = f"s{sentence_counter}"
+            current_sentence.sent_id = f"s{sentence_counter + 1}"
             if not current_sentence.id:
                 current_sentence.id = current_sentence.sent_id
         document.sentences.append(current_sentence)
+        sentence_counter += 1
+    
+    # Close any open paragraph span
+    if current_par_start_sent_idx < sentence_counter and (current_par_attrs or seen_any_newpar):
+        par_span = Span(
+            label="p",
+            start=current_par_start_sent_idx,
+            end=sentence_counter,
+            attrs=dict(current_par_attrs)
+        )
+        par_spans.append(par_span)
+    
+    # Close any open text span (for multiple documents)
+    if num_newdoc_markers > 1 and current_text_start_sent_idx < sentence_counter:
+        text_span = Span(
+            label="text",
+            start=current_text_start_sent_idx,
+            end=sentence_counter,
+            attrs=dict(current_doc_attrs)
+        )
+        text_spans.append(text_span)
+    elif num_newdoc_markers == 1 and current_doc_attrs:
+        # Single document: merge current_doc_attrs into document.attrs
+        for key, val in current_doc_attrs.items():
+            if key not in document.attrs:
+                document.attrs[key] = val
+    
+    # Store file-level attributes in document.meta so writer can output them before newdoc
+    if file_level_attrs:
+        document.meta["_file_level_attrs"] = file_level_attrs
+    
+    # Add all spans to document
+    for span in text_spans:
+        document.add_span("text", span)
+    for span in par_spans:
+        document.add_span("p", span)
     
     # Merge adjacent non-punctuation tokens with SpaceAfter=No into contractions
     # This handles treebanks that represent contractions as two tokens without a space
@@ -520,45 +691,163 @@ def document_to_conllu(
 ) -> str:
     lines: List[str] = []
 
+    # Separate file-level attributes (before newdoc) from document-level attributes
+    file_level_attrs: Dict[str, str] = {}
+    doc_level_attrs: Dict[str, str] = {}
+    
+    # Get file-level attributes from document.meta (set by parser)
+    parsed_file_level = document.meta.get("_file_level_attrs", {})
+    file_level_attrs.update(parsed_file_level)
+    
+    # File-level attributes: generator and model (if provided as parameters, override parsed)
     if generator:
-        lines.append(f"# generator = {generator}")
-
+        file_level_attrs["generator"] = generator
+    # Only add generic "model" if no specific model attributes exist
+    # This allows tracking all models used (udpipe_model, nametag_model, etc.) without duplication
     if model:
-        lines.append(f"# model = {model}")
-
+        model_keys = [k for k in file_level_attrs.keys() if k.endswith("_model")]
+        if not model_keys:
+            # No specific model attributes, use generic model
+            file_level_attrs["model"] = model
+        # Otherwise, specific models will be output from file_level_attrs
     if model_info:
         for key, value in model_info.items():
-            lines.append(f"# {key} = {value}")
-
-    # Print standard UD document attributes
+            file_level_attrs[key] = value
+    
+    # Get document attributes
     doc_standard_attrs = document.get_standard_attrs()
-    if doc_standard_attrs:
-        # newdoc_id is special - it's printed as "# newdoc id = ..."
-        newdoc_id = doc_standard_attrs.pop("newdoc_id", None) or document.id or ""
-        if newdoc_id:
-            lines.append(f"# newdoc id = {newdoc_id}")
-        else:
-            lines.append("# newdoc")
-        # Print other standard document attributes
-        for attr_name, attr_desc in sorted(UD_DOCUMENT_ATTRIBUTES.items()):
-            if attr_name != "newdoc_id" and attr_name in doc_standard_attrs:
-                lines.append(f"# {attr_name} = {doc_standard_attrs[attr_name]}")
-    else:
-        doc_id = document.id or ""
-        if doc_id:
-            lines.append(f"# newdoc id = {doc_id}")
-        else:
-            lines.append("# newdoc")
-
+    all_doc_attrs = dict(document.attrs)
+    
+    # Document-level attributes: everything in document.attrs (including API attributes)
+    # But exclude file-level attributes
+    for key, value in all_doc_attrs.items():
+        if key not in file_level_attrs:
+            doc_level_attrs[key] = str(value)
+    
+    # Output file-level attributes (before newdoc)
+    # Suppress generic "model" if we have specific model attributes (udpipe_model, nametag_model, etc.)
+    model_keys = [k for k in file_level_attrs.keys() if k.endswith("_model")]
+    suppress_generic_model = len(model_keys) > 0
+    
+    if file_level_attrs:
+        # Sort keys, but group model+licence pairs together
+        sorted_keys = sorted(file_level_attrs.keys())
+        processed_keys = set()
+        
+        for key in sorted_keys:
+            if key in processed_keys:
+                continue
+            # Skip generic "model" if we have specific model attributes
+            if key == "model" and suppress_generic_model:
+                continue
+            # Skip licence keys (they'll be output after their model)
+            if key.endswith("_licence"):
+                continue
+            # Skip language (we'll output it separately at the end)
+            if key == "language":
+                continue
+                
+            lines.append(f"# {key} = {file_level_attrs[key]}")
+            processed_keys.add(key)
+            
+            # Also output corresponding _licence if present (right after the model line)
+            if key.endswith("_model") and f"{key}_licence" in file_level_attrs:
+                lines.append(f"# {key}_licence = {file_level_attrs[f'{key}_licence']}")
+                processed_keys.add(f"{key}_licence")
+    
+    # Output language if present (only once, from file_level_attrs if present, otherwise from document.meta)
+    if "language" in file_level_attrs:
+        lines.append(f"# language = {file_level_attrs['language']}")
+    elif "language" in document.meta:
+        lines.append(f"# language = {document.meta['language']}")
+    
+    # Check if we have multiple documents (text spans)
+    text_spans = sorted(document.spans.get("text", []), key=lambda s: s.start)
+    par_spans = sorted(document.spans.get("p", []), key=lambda s: s.start)
+    
+    # Output document-level attributes and spans
     span_entities = collect_span_entities_by_sentence(document, "ner")
-
-    for idx, sentence in enumerate(document.sentences):
-        if lines:
+    current_text_span_idx = 0
+    current_par_span_idx = 0
+    
+    for sent_idx, sentence in enumerate(document.sentences):
+        # Check if we need to output a newdoc marker
+        if current_text_span_idx < len(text_spans):
+            text_span = text_spans[current_text_span_idx]
+            if sent_idx == text_span.start:
+                # Start of a new document
+                if lines:  # Add empty line before newdoc if we have previous content
+                    lines.append("")
+                # Output newdoc marker
+                newdoc_id = text_span.attrs.get("newdoc_id", "")
+                if newdoc_id:
+                    lines.append(f"# newdoc id = {newdoc_id}")
+                else:
+                    lines.append("# newdoc")
+                # Output document-level attributes from span (standard UD attributes first)
+                for key in sorted(text_span.attrs.keys()):
+                    if key != "newdoc_id" and key in UD_DOCUMENT_ATTRIBUTES:
+                        lines.append(f"# {key} = {text_span.attrs[key]}")
+                # Output non-standard document attributes from span
+                for key in sorted(text_span.attrs.keys()):
+                    if key and key != "newdoc_id" and key not in UD_DOCUMENT_ATTRIBUTES:
+                        lines.append(f"# {key} = {text_span.attrs[key]}")
+                # Also output document-level API attributes if this is the first document
+                if current_text_span_idx == 0:
+                    for key in sorted(doc_level_attrs.keys()):
+                        # Don't duplicate attributes already in the span, skip empty keys
+                        if key and key not in text_span.attrs:
+                            lines.append(f"# {key} = {doc_level_attrs[key]}")
+                if lines:  # Add empty line after doc-level attrs
+                    lines.append("")
+                current_text_span_idx += 1
+        elif sent_idx == 0 and not text_spans:
+            # First sentence, no text spans - output single newdoc
+            if lines:  # Add empty line before newdoc if we have file-level attrs
+                lines.append("")
+            newdoc_id = doc_standard_attrs.get("newdoc_id") or document.id or ""
+            if newdoc_id:
+                lines.append(f"# newdoc id = {newdoc_id}")
+            else:
+                lines.append("# newdoc")
+            # Output standard document attributes
+            for attr_name in sorted(UD_DOCUMENT_ATTRIBUTES.keys()):
+                if attr_name != "newdoc_id" and attr_name in doc_standard_attrs:
+                    lines.append(f"# {attr_name} = {doc_standard_attrs[attr_name]}")
+            # Output document-level API attributes (non-standard)
+            for key in sorted(doc_level_attrs.keys()):
+                if key and key not in doc_standard_attrs:  # Don't duplicate standard attrs, skip empty keys
+                    lines.append(f"# {key} = {doc_level_attrs[key]}")
+            if lines:  # Add empty line after doc-level attrs
+                lines.append("")
+        
+        # Check if we need to output a newpar marker
+        if current_par_span_idx < len(par_spans):
+            par_span = par_spans[current_par_span_idx]
+            if sent_idx == par_span.start:
+                # Start of a new paragraph
+                lines.append("# newpar")
+                # Output paragraph-level attributes
+                for key in sorted(par_span.attrs.keys()):
+                    if key in UD_PARAGRAPH_ATTRIBUTES:
+                        lines.append(f"# {key} = {par_span.attrs[key]}")
+                # Output non-standard paragraph attributes
+                for key in sorted(par_span.attrs.keys()):
+                    if key not in UD_PARAGRAPH_ATTRIBUTES:
+                        lines.append(f"# {key} = {par_span.attrs[key]}")
+                if lines:  # Add empty line after par-level attrs
+                    lines.append("")
+                current_par_span_idx += 1
+        
+        # Output sentence
+        if lines and not lines[-1]:  # Don't add extra empty line if we already have one
+            pass
+        elif lines:
             lines.append("")
         # Optionally create implicit MWTs from SpaceAfter=No sequences
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
-        extra_entities = span_entities.get(idx)
+        extra_entities = span_entities.get(sent_idx)
         lines.extend(_sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs))
 
     if not lines:

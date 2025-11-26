@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import json
 import re
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..backend_spec import BackendSpec
@@ -65,6 +68,9 @@ def list_nametag_models(url: str = "https://lindat.mff.cuni.cz/services/nametag/
 MODEL_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 
 
+DEFAULT_NAMETAG_REGISTRY_URL = "https://raw.githubusercontent.com/ufal/flexipipe-models/main/registries/nametag.json"
+
+
 def get_nametag_model_entries(
     url: Optional[str] = None,
     *,
@@ -74,18 +80,16 @@ def get_nametag_model_entries(
     verbose: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Get NameTag model entries with caching support.
+    Get NameTag model entries from the curated flexipipe-models registry.
     
-    Note: The NameTag API may not have a models endpoint. If not available,
-    we'll return a default set of known models based on the web interface.
+    Falls back to hardcoded multilingual model if registry is unavailable.
     """
-    if url is None:
-        # Try the API endpoint first, but fall back to known models if it doesn't exist
-        api_url = "https://lindat.mff.cuni.cz/services/nametag/api/models"
-    else:
-        api_url = url
-
-    cache_key = f"nametag:{api_url}"
+    from pathlib import Path
+    from ..model_registry import DEFAULT_REGISTRY_BASE_URL
+    
+    registry_url = url or DEFAULT_NAMETAG_REGISTRY_URL
+    cache_key = f"nametag:{registry_url}"
+    
     if use_cache and not refresh_cache:
         cached = read_model_cache_entry(cache_key, max_age_seconds=cache_ttl_seconds)
         if cached and cache_entries_standardized(cached):
@@ -94,15 +98,33 @@ def get_nametag_model_entries(
             return cached
 
     if verbose:
-        print(f"[flexipipe] Fetching NameTag models from {api_url}...")
+        print(f"[flexipipe] Fetching NameTag models from {registry_url}...")
     
-    # Try to fetch from API, but fall back to known models if API doesn't exist
+    # Try to fetch from curated registry
     try:
-        raw_models = list_nametag_models(api_url)
-    except (RuntimeError, requests.RequestException):
-        # API endpoint might not exist, use known models from web interface
+        if registry_url.startswith("file://"):
+            # Local file path
+            file_path = Path(registry_url[7:])
+            with open(file_path, "r", encoding="utf-8") as f:
+                registry_data = json.load(f)
+        else:
+            response = requests.get(registry_url, timeout=10.0)
+            response.raise_for_status()
+            registry_data = response.json()
+        
+        # Extract models from registry structure
+        raw_models = {}
+        sources = registry_data.get("sources", {})
+        for source_type in ["official", "flexipipe", "community"]:
+            if source_type in sources:
+                for model_entry in sources[source_type]:
+                    model_name = model_entry.get("model")
+                    if model_name:
+                        raw_models[model_name] = model_entry
+    except (RuntimeError, requests.RequestException, json.JSONDecodeError, OSError) as exc:
+        # Registry unavailable, fall back to hardcoded multilingual model
         if verbose:
-            print("[flexipipe] NameTag API endpoint not available, using known models.")
+            print(f"[flexipipe] NameTag registry unavailable ({exc}), using fallback multilingual model.")
         raw_models = _get_known_nametag_models()
     
     prepared_models: Dict[str, Dict[str, Any]] = {}
@@ -138,13 +160,19 @@ def get_nametag_model_entries(
 
 def _get_known_nametag_models() -> Dict[str, Dict[str, Any]]:
     """
-    Return a dictionary of known NameTag models based on the web interface.
-    
-    NameTag 3 supports: Cebuano, Chinese, Croatian, Czech, Danish, English,
-    Norwegian Bokmål, Norwegian Nynorsk, Portuguese, Russian, Serbian, Slovak,
-    Swedish, Tagalog, Ukrainian, and also Arabic, Dutch, German, Maghrebi, Spanish.
+    Return fallback multilingual model when registry is unavailable.
     """
-    # Map of language codes to model names (simplified - actual API may differ)
+    return {
+        "nametag3-multilingual-conll-250203": {
+            "model": "nametag3-multilingual-conll-250203",
+            "language_iso": "xx",
+            "language_name": "Multilingual",
+            "features": "ner",
+            "tasks": ["ner"],
+            "preferred": True,
+            "description": "NameTag 3 multilingual model trained on CoNLL data, supports all languages"
+        }
+    }
     known_models = {
         "ceb": {"iso": "ceb", "name": "Cebuano"},
         "zh": {"iso": "zh", "name": "Chinese"},
@@ -224,7 +252,7 @@ class NameTagRESTBackend(BackendManager):
         *,
         model: Optional[str] = None,
         language: Optional[str] = None,
-        version: str = "3",
+        version: Optional[str] = None,
         timeout: float = 30.0,
         batch_size: int = 50,
         extra_params: Optional[Dict[str, str]] = None,
@@ -235,9 +263,17 @@ class NameTagRESTBackend(BackendManager):
         if not endpoint_url:
             raise ValueError("endpoint_url is required for NameTag REST backend")
         self.endpoint_url = endpoint_url
-        self.model = model
+        self.version = version or "3"
+        # If no explicit model provided, default to multilingual model (supports conllu input)
+        if model is None:
+            self.model = "nametag3-multilingual-conll-250203"
+        elif model and ("140408" in model or (not model.startswith("nametag3-") and not model.startswith("nametag2-"))):
+            # Old models (like english-conll-140408) don't support conllu input format
+            # Replace with multilingual model that does support it
+            self.model = "nametag3-multilingual-conll-250203"
+        else:
+            self.model = model
         self.language = language
-        self.version = version
         self.timeout = timeout
         self.batch_size = max(1, int(batch_size))
         self.extra_params = extra_params or {}
@@ -282,26 +318,23 @@ class NameTagRESTBackend(BackendManager):
         start = time.time()
 
         batches = self._split_document(document)
-        aggregated_doc = Document(id=document.id, meta=dict(document.meta))
+        aggregated_doc = Document(
+            id=document.id,
+            meta=dict(document.meta),
+            attrs=dict(document.attrs) if hasattr(document, 'attrs') else {},
+        )
+        # Copy spans if they exist (spans is Dict[str, List[Span]])
+        if hasattr(document, 'spans') and document.spans:
+            if isinstance(document.spans, dict):
+                aggregated_doc.spans = {k: list(v) for k, v in document.spans.items()}
+            else:
+                aggregated_doc.spans = dict(document.spans) if document.spans else {}
         total_tokens = 0
 
         for batch_index, batch_doc in enumerate(batches):
             payload = self._build_payload(batch_doc, use_raw_text, overrides)
             if self.log_requests:
                 print(f"[nametag] POST {self.endpoint_url} (batch {batch_index + 1}/{len(batches)})")
-                if batch_index == 0:
-                    print("[nametag] Example curl command:")
-                    curl_parts = [f"curl -X POST \"{self.endpoint_url}\""]
-                    if self.headers:
-                        for key, value in self.headers.items():
-                            curl_parts.append(f"-H \"{key}: {value}\"")
-                    for key, value in payload.items():
-                        encoded = urllib.parse.quote_plus(str(value))
-                        curl_parts.append(f"-d \"{key}={encoded}\"")
-                    print(" \\\n  ".join(curl_parts))
-                else:
-                    preview = {k: (v if len(str(v)) < 200 else str(v)[:200] + "…") for k, v in payload.items()}
-                    print(f"[nametag] Payload preview: {preview}")
 
             request_start = time.time()
             response = self._post(payload)
@@ -324,6 +357,19 @@ class NameTagRESTBackend(BackendManager):
                 print(f"  tokens={token_forms}")
                 if first_sentence.entities:
                     print(f"  entities={len(first_sentence.entities)}")
+            
+            # Merge attrs and meta from chunk_doc
+            if hasattr(chunk_doc, 'attrs'):
+                for key, value in chunk_doc.attrs.items():
+                    aggregated_doc.attrs[key] = value
+            if chunk_doc.meta:
+                aggregated_doc.meta.update(chunk_doc.meta)
+            # Merge spans (spans is Dict[str, List[Span]])
+            if hasattr(chunk_doc, 'spans') and chunk_doc.spans:
+                for layer, spans_list in chunk_doc.spans.items():
+                    if layer not in aggregated_doc.spans:
+                        aggregated_doc.spans[layer] = []
+                    aggregated_doc.spans[layer].extend(spans_list)
             
             aggregated_doc.sentences.extend(chunk_doc.sentences)
             total_tokens += sum(len(sent.tokens) for sent in chunk_doc.sentences)
@@ -355,33 +401,34 @@ class NameTagRESTBackend(BackendManager):
         document: Document,
         use_raw_text: bool,
         overrides: Optional[Dict[str, object]],
-    ) -> Dict[str, str]:
-        """Build the payload for NameTag REST API request."""
-        payload: Dict[str, str] = dict(self.extra_params)
+    ) -> Dict[str, Any]:
+        """Build the payload for NameTag REST API request (multipart/form-data)."""
+        payload: Dict[str, Any] = dict(self.extra_params)
         
-        # Set model or language
+        # Set model (default to multilingual if only language provided)
         if self.model:
             payload["model"] = self.model
-        elif self.language:
-            payload["language"] = self.language
         
-        # Set version
-        payload["version"] = self.version
+        # Version is optional - only send if explicitly set to something other than "3"
+        if self.version and self.version != "3":
+            payload["version"] = self.version
         
-        # Set input format
+        # Set input format and data
+        # Always use conllu input when we have tokenized data (from piping or CoNLL-U input)
+        # Only use untokenized when explicitly requested with use_raw_text=True
         if use_raw_text:
+            # Raw text mode: send plain text
             text_payload = _document_to_plain_text(document)
-            if not text_payload.strip():
-                payload["data"] = document_to_conllu(document)
-                payload["input"] = "conllu"
-            else:
-                payload["data"] = text_payload
-                payload["input"] = "untokenized"
+            payload["data"] = (None, text_payload, "text/plain")
+            payload["input"] = "untokenized"
         else:
-            payload["data"] = document_to_conllu(document)
+            # Tokenized mode: send CoNLL-U as file-like object (matches working curl command)
+            conllu_data = document_to_conllu(document)
+            payload["data"] = (None, conllu_data, "text/plain")
             payload["input"] = "conllu"
         
         # Set output format - we want CoNLL-U+NE to extract entities (supports overlapping entities)
+        # Note: NameTag API may use different format names, try conllu-ne first, fall back to conllu
         payload["output"] = "conllu-ne"
         
         if overrides:
@@ -390,11 +437,38 @@ class NameTagRESTBackend(BackendManager):
 
         return payload
 
-    def _post(self, payload: Dict[str, str]) -> requests.Response:
+    def _post(self, payload: Dict[str, Any]) -> requests.Response:
+        """Send POST request using multipart/form-data (like curl -F)."""
+        # Separate file fields from regular form fields
+        files = {}
+        data = {}
+        
+        for key, value in payload.items():
+            if isinstance(value, tuple) and len(value) == 3:
+                # File-like field: (filename, content, content_type)
+                files[key] = value
+            else:
+                data[key] = value
+        
+        if self.log_requests:
+            print("[nametag] Example curl command (multipart/form-data):")
+            curl_parts = [f"curl -X POST \"{self.endpoint_url}\""]
+            for key, value in data.items():
+                curl_parts.append(f"-F \"{key}={value}\"")
+            if files:
+                for key, file_tuple in files.items():
+                    curl_parts.append(f"-F \"{key}=<-;type=text/plain\"")
+            print(" \\\n  ".join(curl_parts))
+            if files:
+                for key, file_tuple in files.items():
+                    content_preview = file_tuple[1][:500] + ("…" if len(file_tuple[1]) > 500 else "")
+                    print(f"[nametag] Data content (first 500 chars): {content_preview}")
+        
         try:
             response = self.session.post(
                 self.endpoint_url,
-                data=payload,
+                data=data,
+                files=files if files else None,
                 headers=self.headers,
                 timeout=self.timeout,
             )
@@ -406,33 +480,100 @@ class NameTagRESTBackend(BackendManager):
             raise RuntimeError(f"NameTag REST returned HTTP {exc.response.status_code}{details}") from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"NameTag REST request failed: {exc}") from exc
+    
+    def _document_to_vertical(self, conllu_text: str) -> str:
+        """Convert CoNLL-U text to vertical format (one token per line, empty lines between sentences)."""
+        from ..conllu import conllu_to_document
+        doc = conllu_to_document(conllu_text)
+        lines = []
+        for sent in doc.sentences:
+            for tok in sent.tokens:
+                lines.append(tok.form)
+            lines.append("")  # Empty line between sentences
+        return "\n".join(lines)
 
     def _parse_response(self, response: requests.Response, original_doc: Document) -> Document:
         """
         Parse NameTag REST response and extract entities.
         
         NameTag can return CoNLL-U+NE format (CoNLL-U with NER annotations in MISC field)
-        or XML format. We'll try to parse CoNLL-U first, then fall back to XML.
+        or JSON format with a result field. Also extracts model and license info from response.
         """
         content_type = (response.headers.get("Content-Type") or "").lower()
         text = response.text
+        doc = None
         
         # Try to parse as CoNLL-U+NE first
         if "conllu" in content_type or text.strip().startswith("#") or "\t" in text:
-            return self._parse_conllu_ne(text, original_doc)
-        
-        # Try JSON response
-        if "application/json" in content_type or text.strip().startswith("{"):
+            doc = self._parse_conllu_ne(text, original_doc)
+        # Try JSON response (may contain CoNLL-U in result field)
+        elif "application/json" in content_type or text.strip().startswith("{"):
             try:
                 data = response.json()
+                # Extract model and license from JSON response
+                doc = Document(id=original_doc.id or "nametag", meta=dict(original_doc.meta))
+                if hasattr(original_doc, 'attrs'):
+                    doc.attrs = dict(original_doc.attrs)
+                if hasattr(original_doc, 'spans') and original_doc.spans:
+                    if isinstance(original_doc.spans, list):
+                        doc.spans = original_doc.spans[:]
+                    elif hasattr(original_doc.spans, 'copy'):
+                        doc.spans = original_doc.spans.copy()
+                    else:
+                        doc.spans = list(original_doc.spans) if original_doc.spans else []
+                
+                if "model" in data:
+                    # Add nametag_model as file-level attribute (before newdoc)
+                    if "_file_level_attrs" not in doc.meta:
+                        doc.meta["_file_level_attrs"] = {}
+                    doc.meta["_file_level_attrs"]["nametag_model"] = data["model"]
+                    # Also add to attrs for backward compatibility, but writer will prioritize file_level
+                    doc.attrs["nametag_model"] = data["model"]
+                if "acknowledgements" in data:
+                    doc.meta["_api_acknowledgements"] = data["acknowledgements"]
                 # Look for result field
                 if "result" in data and isinstance(data["result"], str):
-                    return self._parse_conllu_ne(data["result"], original_doc)
-            except ValueError:
+                    result_text = data["result"]
+                    # Check if result is CoNLL-U or XML
+                    if result_text.strip().startswith("#") or "\t" in result_text:
+                        # CoNLL-U format
+                        parsed = self._parse_conllu_ne(result_text, original_doc)
+                    elif "<sentence>" in result_text or "<token>" in result_text:
+                        # XML format
+                        parsed = self._parse_xml_response(result_text, original_doc)
+                    else:
+                        # Try CoNLL-U first, fall back to XML
+                        try:
+                            parsed = self._parse_conllu_ne(result_text, original_doc)
+                        except:
+                            parsed = self._parse_xml_response(result_text, original_doc)
+                    
+                    # Merge sentences, attrs, meta, and spans
+                    doc.sentences = parsed.sentences
+                    if hasattr(parsed, 'attrs'):
+                        doc.attrs.update(parsed.attrs)
+                    if parsed.meta:
+                        # Preserve file-level attributes from parsed document first (before general meta update)
+                        if "_file_level_attrs" in parsed.meta:
+                            if "_file_level_attrs" not in doc.meta:
+                                doc.meta["_file_level_attrs"] = {}
+                            doc.meta["_file_level_attrs"].update(parsed.meta["_file_level_attrs"])
+                        # Then do general meta update (this won't overwrite _file_level_attrs since we already merged it)
+                        doc.meta.update(parsed.meta)
+                    if hasattr(parsed, 'spans') and parsed.spans:
+                        if isinstance(doc.spans, dict) and isinstance(parsed.spans, dict):
+                            doc.spans.update(parsed.spans)
+                        elif isinstance(doc.spans, list) and isinstance(parsed.spans, list):
+                            doc.spans.extend(parsed.spans)
+                        elif not doc.spans:
+                            doc.spans = parsed.spans if isinstance(parsed.spans, (dict, list)) else list(parsed.spans) if parsed.spans else []
+            except (ValueError, KeyError):
                 pass
         
-        # Fall back to XML parsing (if needed in future)
-        raise RuntimeError("NameTag REST response format not recognized. Expected CoNLL-U+NE or JSON.")
+        if doc is None:
+            raise RuntimeError("NameTag REST response format not recognized. Expected CoNLL-U+NE or JSON.")
+        
+        return doc
 
     def _parse_conllu_ne(self, conllu_text: str, original_doc: Document) -> Document:
         """
@@ -441,11 +582,40 @@ class NameTagRESTBackend(BackendManager):
         CoNLL-U+NE format supports two annotation styles:
         - NE=ORG_3: NameTag format where all tokens with the same NE=LABEL_ID belong to the same entity
         - Entity=B-PER, Entity=I-PER: IOB format (B=beginning, I=inside, O=outside)
+        
+        Also preserves document-level attributes (like nametag_model, nametag_model_licence)
+        from CoNLL-U headers, which are extracted by conllu_to_document.
         """
         from ..conllu import conllu_to_document
         
-        # Parse the CoNLL-U
+        # Parse the CoNLL-U (this will extract nametag_* headers into doc.attrs)
         doc = conllu_to_document(conllu_text, doc_id=original_doc.id or "nametag")
+        
+        # Preserve original document's attrs and meta
+        if hasattr(original_doc, 'attrs'):
+            for key, value in original_doc.attrs.items():
+                if key not in doc.attrs:
+                    doc.attrs[key] = value
+        if original_doc.meta:
+            # Save parsed document's file-level attrs before general meta update
+            parsed_file_level = doc.meta.get("_file_level_attrs", {}).copy()
+            # Do general meta update (this might overwrite _file_level_attrs)
+            doc.meta.update(original_doc.meta)
+            # Restore and merge file-level attrs (parsed document takes priority)
+            if "_file_level_attrs" not in doc.meta:
+                doc.meta["_file_level_attrs"] = {}
+            # First add original's file-level attrs
+            if "_file_level_attrs" in original_doc.meta:
+                for key, value in original_doc.meta["_file_level_attrs"].items():
+                    if key not in doc.meta["_file_level_attrs"]:
+                        doc.meta["_file_level_attrs"][key] = value
+            # Then add parsed's file-level attrs (takes priority)
+            doc.meta["_file_level_attrs"].update(parsed_file_level)
+        if hasattr(original_doc, 'spans') and original_doc.spans:
+            if isinstance(original_doc.spans, dict):
+                doc.spans = {k: list(v) for k, v in original_doc.spans.items()}
+            else:
+                doc.spans = dict(original_doc.spans) if original_doc.spans else {}
         
         # Extract entities from MISC field and clean up duplicates
         for sent in doc.sentences:
