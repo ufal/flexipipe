@@ -32,7 +32,8 @@ except ImportError:
 from .model_storage import get_cache_dir, read_model_cache_entry, write_model_cache_entry
 
 # Default remote model registry base URL (can be overridden via config or env var)
-DEFAULT_REGISTRY_BASE_URL = "https://raw.githubusercontent.com/flexipipe/flexipipe-models/main/registries"
+# Note: hosted under the ufal organization by default.
+DEFAULT_REGISTRY_BASE_URL = "https://raw.githubusercontent.com/ufal/flexipipe-models/main/registries"
 
 # Cache settings
 REGISTRY_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
