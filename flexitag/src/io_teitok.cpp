@@ -93,23 +93,23 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
         // Track currently open <name> elements (stack-based approach)
         std::vector<pugi::xml_node> open_name_nodes;
         
-        int token_pos = 0;
+        int prev_token_id = 0;
         for (const auto& token : sentence.tokens) {
-            token_pos++;
+            int token_id = token.id;
             
-            // Close entities that end at the previous token
-            if (token_pos > 1 && entities_by_end.find(token_pos - 1) != entities_by_end.end()) {
-                for (const auto* entity : entities_by_end[token_pos - 1]) {
+            // Close entities that end at the previous token (using token.id, not position)
+            if (prev_token_id > 0 && entities_by_end.find(prev_token_id) != entities_by_end.end()) {
+                for (const auto* entity : entities_by_end[prev_token_id]) {
                     if (!open_name_nodes.empty()) {
                         open_name_nodes.pop_back();
                     }
                 }
             }
             
-            // Open entities that start at this token
+            // Open entities that start at this token (using token.id, not position)
             pugi::xml_node current_parent = s_node;
-            if (entities_by_start.find(token_pos) != entities_by_start.end()) {
-                for (const auto* entity : entities_by_start[token_pos]) {
+            if (entities_by_start.find(token_id) != entities_by_start.end()) {
+                for (const auto* entity : entities_by_start[token_id]) {
                     auto name_node = current_parent.append_child("name");
                     name_node.append_attribute("type") = entity->label.c_str();
                     if (!entity->text.empty()) {
@@ -170,7 +170,7 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
                     // Filter out SpaceAfter=No from MISC field for the last token
                     // (last token should not have SpaceAfter=No in TEI output)
                     std::string misc_value = token.misc;
-                    bool is_last_token = (token_pos == static_cast<int>(sentence.tokens.size()));
+                    bool is_last_token = (&token == &sentence.tokens.back());
                     if (is_last_token) {
                         // Remove SpaceAfter=No from MISC field
                         std::string filtered_misc;
@@ -286,14 +286,16 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
                 space.set_value(" ");
             }
             
-            // Close entities that end at this token
-            if (entities_by_end.find(token_pos) != entities_by_end.end()) {
-                for (const auto* entity : entities_by_end[token_pos]) {
+            // Close entities that end at this token (using token.id, not position)
+            if (entities_by_end.find(token_id) != entities_by_end.end()) {
+                for (const auto* entity : entities_by_end[token_id]) {
                     if (!open_name_nodes.empty()) {
                         open_name_nodes.pop_back();
                     }
                 }
             }
+            
+            prev_token_id = token_id;
         }
     }
 }

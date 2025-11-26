@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .doc import Document, Sentence, SubToken, Token, Entity
 from .doc_utils import collect_span_entities_by_sentence
@@ -795,7 +795,15 @@ def _load_teitok_with_mappings(
     return _sanitize_document(document)
 
 
-def save_teitok(document: Document, path: str, custom_attributes: Optional[List[str]] = None, pretty_print: bool = False) -> None:
+def save_teitok(
+    document: Document,
+    path: str,
+    custom_attributes: Optional[List[str]] = None,
+    pretty_print: bool = False,
+    *,
+    spaceafter_handling: str = "preserve",
+    skip_spaceafter_for_breaking_elements: bool = True,
+) -> None:
     """
     Save a Document to a TEITOK XML file.
     
@@ -806,15 +814,32 @@ def save_teitok(document: Document, path: str, custom_attributes: Optional[List[
                           If None or empty, all attributes in token.attrs will be written.
                           If provided, only attributes in this list will be written.
         pretty_print: If True, pretty-print the XML with indentation (newlines don't add whitespace between tokens)
+        spaceafter_handling: How to handle SpaceAfter=No tokens when pretty_printing:
+            - "preserve" (default): Remove spaces between tokens with SpaceAfter=No and next token
+            - "join": Add join="right" attribute to tokens with SpaceAfter=No
+        skip_spaceafter_for_breaking_elements: If True (default), skip SpaceAfter handling
+            if there's a hard-breaking element (like <p>) between tokens. Only used with
+            spaceafter_handling="preserve".
     """
-    sanitized = _sanitize_document(document)
-    payload = _ensure_serializable(sanitized.to_dict())
-    if custom_attributes is None:
-        custom_attributes = []
-    _save_teitok(payload, path, custom_attributes, pretty_print)  # type: ignore
+    # Use dump_teitok and write to file to ensure consistent pretty-printing logic
+    xml_str = dump_teitok(
+        document,
+        custom_attributes,
+        pretty_print=pretty_print,
+        spaceafter_handling=spaceafter_handling,
+        skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+    )
+    Path(path).write_text(xml_str, encoding="utf-8")
 
 
-def dump_teitok(document: Document, custom_attributes: Optional[List[str]] = None, pretty_print: bool = False) -> str:
+def dump_teitok(
+    document: Document,
+    custom_attributes: Optional[List[str]] = None,
+    pretty_print: bool = False,
+    *,
+    spaceafter_handling: str = "preserve",
+    skip_spaceafter_for_breaking_elements: bool = True,
+) -> str:
     """
     Convert a Document to a TEITOK XML string.
     
@@ -824,6 +849,12 @@ def dump_teitok(document: Document, custom_attributes: Optional[List[str]] = Non
                           If None or empty, all attributes in token.attrs will be written.
                           If provided, only attributes in this list will be written.
         pretty_print: If True, pretty-print the XML with indentation (newlines don't add whitespace between tokens)
+        spaceafter_handling: How to handle SpaceAfter=No tokens when pretty_printing:
+            - "preserve" (default): Remove spaces between tokens with SpaceAfter=No and next token
+            - "join": Add join="right" attribute to tokens with SpaceAfter=No
+        skip_spaceafter_for_breaking_elements: If True (default), skip SpaceAfter handling
+            if there's a hard-breaking element (like <p>) between tokens. Only used with
+            spaceafter_handling="preserve".
     
     Returns:
         XML string representation of the document
@@ -844,7 +875,131 @@ def dump_teitok(document: Document, custom_attributes: Optional[List[str]] = Non
     payload = _ensure_serializable(sanitized.to_dict())
     if custom_attributes is None:
         custom_attributes = []
-    return _dump_teitok(payload, custom_attributes, pretty_print)  # type: ignore
+    xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
+    if pretty_print:
+        xml_str = pretty_print_teitok_xml(
+            xml_str,
+            spaceafter_handling=spaceafter_handling,
+            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+        )
+    return xml_str
+
+
+def pretty_print_teitok_xml(
+    xml_str: str,
+    *,
+    spaceafter_handling: str = "preserve",
+    skip_spaceafter_for_breaking_elements: bool = True,
+) -> str:
+    """
+    Pretty-print TEITOK XML with proper indentation using lxml.
+    
+    Args:
+        xml_str: The XML string to pretty-print
+        spaceafter_handling: How to handle SpaceAfter=No tokens:
+            - "preserve" (default): Remove spaces between tokens with SpaceAfter=No and next token
+            - "join": Add join="right" attribute to tokens with SpaceAfter=No
+        skip_spaceafter_for_breaking_elements: If True (default), skip SpaceAfter handling
+            if there's a hard-breaking element (like <p>) between tokens. Only used with
+            spaceafter_handling="preserve".
+        
+    Returns:
+        Pretty-printed XML string
+    """
+    # Use lxml for proper XML pretty-printing
+    try:
+        from lxml import etree
+    except ImportError:
+        # Fall back to ElementTree - it doesn't support pretty_print
+        return xml_str
+    
+    # Parse the XML
+    parser = etree.XMLParser(remove_blank_text=False)
+    tree = etree.fromstring(xml_str.encode("utf-8"), parser)
+    
+    # Use lxml's indent function for pretty-printing first
+    etree.indent(tree, space="  ")
+    
+    # Handle SpaceAfter=No tokens (after indent to ensure attributes are preserved)
+    # In both modes, we add join="Right" as a marker so we can check for it consistently
+    # (SpaceAfter=No is CoNLL-U specific, but join="Right" is a universal marker)
+    for tok_elem in tree.xpath('.//tok'):
+        misc = tok_elem.get("misc", "")
+        if misc and "SpaceAfter=No" in misc:
+            tok_elem.set("join", "Right")
+    
+    # Generate the pretty-printed XML
+    # Note: encoding="unicode" doesn't support xml_declaration, so we add it manually if needed
+    updated = etree.tostring(tree, encoding="unicode", pretty_print=True)
+    
+    # Post-process SpaceAfter=No handling for preserve approach (string-based)
+    if spaceafter_handling == "preserve":
+        import re
+        
+        # 1. Remove ALL whitespace (including newlines) around <dtok> elements
+        # Pattern: match all whitespace before and after <dtok> tags
+        def clean_dtok_spaces(m):
+            before = m.group(1)
+            tag = m.group(2)
+            after = m.group(3)
+            # Remove all whitespace (spaces, tabs, newlines)
+            return tag
+        
+        updated = re.sub(r'(\s*)(</?dtok[^>]*>)(\s*)', clean_dtok_spaces, updated)
+        
+        # 2. Remove spaces between tokens with SpaceAfter=No and the next token
+        # This includes spaces in the token's tail and any spaces in parent element tails
+        
+        # First, find all tokens with SpaceAfter=No
+        # Pattern: <tok[^>]*misc="[^"]*SpaceAfter=No[^"]*"[^>]*>.*?</tok>
+        # We need to match the entire token element and remove spaces after it until the next <tok>
+        
+        # Strategy: Find tokens with SpaceAfter=No, then remove all whitespace (except newlines for indentation)
+        # between the closing </tok> and the next <tok> or </name> or other closing tag
+        
+        # Pattern to match: </tok> followed by optional whitespace and closing tags, then optional whitespace, then <tok
+        # We want to remove spaces but preserve newlines for indentation
+        
+        # More precise: match </tok> with SpaceAfter=No, then remove spaces (but keep newlines) until next <tok
+        def remove_spaces_after_token(match):
+            """Remove spaces after a token with SpaceAfter=No, preserving newlines for indentation."""
+            token_tag = match.group(0)
+            # The token tag is already matched, now we need to find the closing </tok> and remove spaces after it
+            return token_tag
+        
+        # Find all <tok> elements with SpaceAfter=No in the XML string
+        # We'll use a regex to find the pattern: <tok[^>]*misc="[^"]*SpaceAfter=No[^"]*"[^>]*>...?</tok>
+        # Then remove whitespace (except newlines) between </tok> and the next <tok> or closing tag
+        
+        # Better approach: use regex to find </tok> that follows a token with SpaceAfter=No
+        # Pattern: match </tok> that comes after a token with SpaceAfter=No, then remove spaces before next <tok>
+        
+        # 2. Remove ALL whitespace (including newlines) between tokens with join="Right" and the next token
+        # We only check for join="Right" attribute (not SpaceAfter=No, which is CoNLL-U specific)
+        # This includes spaces in the token's tail and any spaces in parent element tails
+        
+        def remove_all_whitespace_after_join_token(m):
+            """Remove all whitespace (including newlines) after a token with join="Right"."""
+            tok_element = m.group(1)  # The entire <tok>...</tok> element
+            whitespace1 = m.group(2)  # Whitespace after </tok>
+            closing_name = m.group(3) or ''  # Optional </name>
+            whitespace2 = m.group(4) or ''  # Whitespace after </name> (if present)
+            next_tok = m.group(5)  # The next <tok> tag
+            
+            # Remove ALL whitespace (spaces, tabs, newlines) - no whitespace between tokens
+            return tok_element + closing_name + next_tok
+        
+        # Match token with join="Right", then optional whitespace, optional </name>, optional whitespace, then <tok>
+        # Pattern matches tokens that have join="Right" anywhere in the tag
+        # Be careful: match the attribute value exactly to avoid false matches
+        pattern = r'(<tok[^>]*join="Right"[^>]*>.*?</tok>)(\s*)(</name>)?(\s*)(<tok)'
+        updated = re.sub(pattern, remove_all_whitespace_after_join_token, updated, flags=re.DOTALL)
+    
+    # Add XML declaration if not present
+    if not updated.startswith("<?xml"):
+        updated = '<?xml version="1.0" encoding="UTF-8"?>\n' + updated
+    
+    return updated
 
 
 def update_teitok(document: Document, original_path: str, output_path: Optional[str] = None) -> None:

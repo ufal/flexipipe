@@ -201,7 +201,10 @@ def _augment_tei_output(
     note_value: Optional[str],
     change_text: str,
     change_when: str,
+    api_notes: Optional[list[tuple[str, str]]] = None,
     pretty_print: bool = False,
+    spaceafter_handling: str = "preserve",
+    skip_spaceafter_for_breaking_elements: bool = True,
 ) -> str:
     """Inject notesStmt/revisionDesc metadata into TEI output."""
     import xml.etree.ElementTree as ET
@@ -216,15 +219,23 @@ def _augment_tei_output(
         tei_header = ET.Element("teiHeader")
         root.insert(0, tei_header)
 
+    notes_stmt = tei_header.find("notesStmt")
+    if notes_stmt is None:
+        notes_stmt = ET.SubElement(tei_header, "notesStmt")
+    
+    # Add orgfile note if provided
     if note_value:
-        notes_stmt = tei_header.find("notesStmt")
-        if notes_stmt is None:
-            notes_stmt = ET.SubElement(tei_header, "notesStmt")
         for existing in list(notes_stmt):
             if existing.tag == "note" and existing.get("n") == "orgfile":
                 notes_stmt.remove(existing)
         note_elem = ET.SubElement(notes_stmt, "note", {"n": "orgfile"})
         note_elem.text = note_value
+    
+    # Add API response notes if provided
+    if api_notes:
+        for note_type, note_content in api_notes:
+            note_elem = ET.SubElement(notes_stmt, "note", {"n": note_type.lower().replace(" ", "-")})
+            note_elem.text = note_content
 
     revision_desc = tei_header.find("revisionDesc")
     if revision_desc is None:
@@ -236,82 +247,20 @@ def _augment_tei_output(
     )
     change_elem.text = change_text
 
-    # Pretty-print the XML if requested
-    if pretty_print:
-        # Use lxml for pretty-printing if available
-        try:
-            from lxml import etree
-            # Parse the XML
-            parser = etree.XMLParser(remove_blank_text=True)
-            tree = etree.fromstring(ET.tostring(root, encoding="unicode").encode("utf-8"), parser)
-            
-            # Remove tail text from all <tok> elements to prevent spaces between tokens
-            for tok_elem in tree.xpath('.//tok'):
-                tok_elem.tail = None
-            
-            # Pretty-print
-            updated = etree.tostring(tree, encoding="unicode", pretty_print=True, xml_declaration=False)
-            
-            # Post-process: remove spaces from tail text of tokens using regex
-            # The issue: lxml adds tail text like "\n      " (newline + spaces) after </tok>
-            # These spaces become text content between tokens
-            # Solution: use regex to remove spaces from tail text
-            # Pattern: </tok> followed by newline and spaces, then <tok>
-            # We want to keep the newline but remove the spaces from tail text
-            # Since the spaces are both tail text AND <tok> indentation in the string,
-            # we need to parse, modify tree, then output
-            parser2 = etree.XMLParser(remove_blank_text=True)
-            tree2 = etree.fromstring(updated.encode("utf-8"), parser2)
-            for tok_elem in tree2.xpath('.//tok'):
-                # Set tail to just newline (no spaces)
-                if tok_elem.tail and '\n' in tok_elem.tail:
-                    tok_elem.tail = '\n'
-                else:
-                    tok_elem.tail = None
-            
-            # Use lxml's indent() function to add indentation first
-            etree.indent(tree2, space="  ")
-            
-            # After indent(), remove spaces from tail text of tokens but keep newlines
-            for tok_elem in tree2.xpath('.//tok'):
-                if tok_elem.tail:
-                    # Keep only newlines, remove spaces/tabs
-                    new_tail = ''.join(c for c in tok_elem.tail if c in '\n\r')
-                    tok_elem.tail = new_tail if new_tail else None
-            
-            updated = etree.tostring(tree2, encoding="unicode", xml_declaration=False)
-            
-            # Post-process: remove spaces from tail text one more time (they might have been re-added)
-            # Parse again and ensure tok elements have no spaces in tail text
-            parser3 = etree.XMLParser(remove_blank_text=True)
-            tree3 = etree.fromstring(updated.encode("utf-8"), parser3)
-            for tok_elem in tree3.xpath('.//tok'):
-                if tok_elem.tail:
-                    # Remove spaces/tabs, keep only newlines
-                    new_tail = ''.join(c for c in tok_elem.tail if c in '\n\r')
-                    tok_elem.tail = new_tail if new_tail else '\n'  # Ensure there's a newline
-            
-            # Use indent() again to format properly
-            etree.indent(tree3, space="  ")
-            
-            # Remove spaces from tail text again after indent()
-            for tok_elem in tree3.xpath('.//tok'):
-                if tok_elem.tail:
-                    new_tail = ''.join(c for c in tok_elem.tail if c in '\n\r')
-                    tok_elem.tail = new_tail if new_tail else None
-            
-            updated = etree.tostring(tree3, encoding="unicode", xml_declaration=False)
-            
-            if not updated.startswith("<?xml"):
-                updated = '<?xml version="1.0" encoding="UTF-8"?>\n' + updated
-            return updated
-        except ImportError:
-            # Fall back to ElementTree - it doesn't support pretty_print
-            pass
-    
+    # Convert back to string
     updated = ET.tostring(root, encoding="unicode")
     if not updated.startswith("<?xml"):
         updated = '<?xml version="1.0" encoding="UTF-8"?>\n' + updated
+    
+    # Pretty-print the XML if requested
+    if pretty_print:
+        from .teitok import pretty_print_teitok_xml
+        updated = pretty_print_teitok_xml(
+            updated,
+            spaceafter_handling=spaceafter_handling,
+            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+        )
+    
     return updated
 def _parse_tasks_argument(value: Optional[str]) -> set[str]:
     if not value:
@@ -1243,6 +1192,49 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
     return 0
 
 
+class CustomArgumentParser(argparse.ArgumentParser):
+    """Custom ArgumentParser with better error messages for unrecognized arguments."""
+    
+    def error(self, message: str) -> None:
+        # Check if it's an unrecognized arguments error
+        if "unrecognized arguments" in message.lower():
+            # Extract the unrecognized argument
+            import re
+            # Match "unrecognized arguments: --whitespace join" or similar
+            match = re.search(r"unrecognized arguments?:\s*(.+)", message, re.IGNORECASE | re.DOTALL)
+            if match:
+                unrecognized = match.group(1).strip()
+                # Suggest similar arguments
+                suggestions = []
+                unrecognized_lower = unrecognized.lower()
+                if "whitespace" in unrecognized_lower:
+                    suggestions.append("--spaceafter-handling")
+                elif "spaceafter" in unrecognized_lower or "space-after" in unrecognized_lower:
+                    suggestions.append("--spaceafter-handling")
+                elif "join" in unrecognized_lower and "spaceafter" not in message.lower():
+                    suggestions.append("--spaceafter-handling join")
+                
+                if suggestions:
+                    message += f"\n\nDid you mean: {', '.join(suggestions)}?"
+        
+        # Suppress BrokenPipeError when exiting due to argument errors
+        # This happens when commands are piped and the second command exits early
+        import sys
+        try:
+            super().error(message)
+        except SystemExit:
+            # Suppress BrokenPipeError on stdout/stderr when exiting
+            try:
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            try:
+                sys.stderr.flush()
+            except BrokenPipeError:
+                pass
+            raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Get version from package
     try:
@@ -1252,7 +1244,7 @@ def build_parser() -> argparse.ArgumentParser:
         # Fallback: use default
         version = "1.0.0"
     
-    parser = argparse.ArgumentParser(
+    parser = CustomArgumentParser(
         prog="python -m flexipipe",
         description="Flexipipe pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1437,8 +1429,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--pretty-print",
+        "--prettyprint",
         action="store_true",
         help="Pretty-print TEITOK XML output with indentation (newlines don't add whitespace between tokens)",
+    )
+    process_parser.add_argument(
+        "--spaceafter-handling",
+        choices=["preserve", "join"],
+        default="preserve",
+        help="How to handle SpaceAfter=No tokens when pretty-printing: 'preserve' (default) removes spaces, 'join' adds join='right' attribute",
+    )
+    process_parser.add_argument(
+        "--skip-spaceafter-for-breaking-elements",
+        action="store_true",
+        default=True,
+        help="Skip SpaceAfter handling if there's a hard-breaking element (like <p>) between tokens (default: True)",
+    )
+    process_parser.add_argument(
+        "--no-skip-spaceafter-for-breaking-elements",
+        dest="skip_spaceafter_for_breaking_elements",
+        action="store_false",
+        help="Don't skip SpaceAfter handling for breaking elements",
     )
     process_parser.add_argument(
         "--create-implicit-mwt",
@@ -2821,6 +2832,27 @@ def run_tag(args: argparse.Namespace) -> int:
             note_source_path = note_source_path or args.input
         elif read_from_stdin:
             doc.meta.setdefault("source", "stdin")
+            # When piping, extract backend info from CoNLL-U headers
+            # Check for backend-specific model attributes (udpipe_model, nametag_model, etc.)
+            if "_file_level_attrs" in doc.meta:
+                file_attrs = doc.meta["_file_level_attrs"]
+                for key in file_attrs.keys():
+                    if key.endswith("_model"):
+                        backend_name = key.replace("_model", "").lower()
+                        if backend_name in ["udpipe", "nametag", "udmorph", "ctext"]:
+                            if "_backends_used" not in doc.meta:
+                                doc.meta["_backends_used"] = []
+                            if backend_name not in doc.meta["_backends_used"]:
+                                doc.meta["_backends_used"].append(backend_name)
+            # Also check document.attrs for model info
+            for key in doc.attrs.keys():
+                if key.endswith("_model"):
+                    backend_name = key.replace("_model", "").lower()
+                    if backend_name in ["udpipe", "nametag", "udmorph", "ctext"]:
+                        if "_backends_used" not in doc.meta:
+                            doc.meta["_backends_used"] = []
+                        if backend_name not in doc.meta["_backends_used"]:
+                            doc.meta["_backends_used"].append(backend_name)
         detection_source_text = _document_to_plain_text(doc)
     elif input_format == "raw":
         if read_from_stdin:
@@ -3256,6 +3288,11 @@ def run_tag(args: argparse.Namespace) -> int:
                 result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
                 _propagate_sentence_metadata(result.document, doc)
                 
+                # Track backend used
+                if "_backends_used" not in result.document.meta:
+                    result.document.meta["_backends_used"] = []
+                result.document.meta["_backends_used"].append(backend_type_lower)
+                
                 # Determine model string for backend
                 display_backend = backend_type_lower.upper()
                 backend_descriptor = getattr(neural_backend, "model_descriptor", None)
@@ -3522,9 +3559,16 @@ def run_tag(args: argparse.Namespace) -> int:
                 if args.verbose or args.debug:
                     print(f"[flexipipe] Writeback failed: {e}, falling back to regular save", file=sys.stderr)
         tei_tasks = _detect_performed_tasks(output_doc)
-        tasks_summary_str = ",".join(sorted(tei_tasks)) or "segment,tokenize"
+        tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
         pretty_print = getattr(args, "pretty_print", False)
-        tei_output = dump_teitok(output_doc, pretty_print=pretty_print)
+        spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
+        skip_spaceafter_for_breaking = getattr(args, "skip_spaceafter_for_breaking_elements", True)
+        tei_output = dump_teitok(
+            output_doc,
+            pretty_print=pretty_print,
+            spaceafter_handling=spaceafter_handling,
+            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
+        )
         note_candidate = (
             note_source_path
             or output_doc.meta.get("original_input_path")
@@ -3534,14 +3578,61 @@ def run_tag(args: argparse.Namespace) -> int:
         if note_candidate and str(note_candidate) not in ("-", "<inline-data>"):
             note_value = f"{Path(str(note_candidate)).stem}.xml"
         change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        change_source = model_str or (backend_type.upper() if backend_type else "flexipipe")
+        
+        # Collect all backends used (from piping or single backend)
+        backends_used = output_doc.meta.get("_backends_used", [])
+        if backend_type and backend_type.lower() not in backends_used:
+            backends_used.append(backend_type.lower())
+        if not backends_used:
+            backends_used = ["flexipipe"]
+        
+        # Build backend string - show all backends
+        backend_names = [b.upper() for b in backends_used]
+        change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
         change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+        
+        # Collect model/license info and acknowledgements for notes
+        api_notes = []
+        
+        # Extract model and license info from file-level attributes
+        file_level_attrs = output_doc.meta.get("_file_level_attrs", {})
+        model_info_lines = []
+        
+        # Collect all model and license pairs
+        model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+        for model_key in model_keys:
+            model_name = file_level_attrs[model_key]
+            model_info_lines.append(f"# {model_key} = {model_name}")
+            
+            # Add corresponding license if present
+            licence_key = f"{model_key}_licence"
+            if licence_key in file_level_attrs:
+                model_info_lines.append(f"# {licence_key} = {file_level_attrs[licence_key]}")
+        
+        if model_info_lines:
+            # Add acknowledgements if present
+            if "_api_acknowledgements" in output_doc.meta:
+                acknowledgements = output_doc.meta["_api_acknowledgements"]
+                if isinstance(acknowledgements, list):
+                    model_info_lines.append("")
+                    model_info_lines.append("# acknowledgements:")
+                    for ack in acknowledgements:
+                        model_info_lines.append(f"#   {ack}")
+                elif isinstance(acknowledgements, str):
+                    model_info_lines.append("")
+                    model_info_lines.append(f"# acknowledgements: {acknowledgements}")
+            
+            api_notes.append(("Model Information", "\n".join(model_info_lines)))
+        
         tei_output = _augment_tei_output(
             tei_output,
             note_value=note_value,
             change_text=change_text,
             change_when=change_when,
+            api_notes=api_notes if api_notes else None,
             pretty_print=pretty_print,
+            spaceafter_handling=spaceafter_handling,
+            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
         )
         if output_path:
             with open(output_path, "w", encoding="utf-8") as handle:
@@ -4204,12 +4295,33 @@ def _load_document(path: Path, fmt: str, *, args: Optional[argparse.Namespace] =
     raise SystemExit(f"Unsupported input format '{fmt}' for {path}")
 
 
-def _write_document(document: Document, output: str | None, fmt: str, pretty_print: bool = False) -> None:
+def _write_document(
+    document: Document,
+    output: str | None,
+    fmt: str,
+    pretty_print: bool = False,
+    *,
+    spaceafter_handling: str = "preserve",
+    skip_spaceafter_for_breaking_elements: bool = True,
+) -> None:
     if fmt == "teitok":
         if output:
-            save_teitok(document, output, pretty_print=pretty_print)
+            save_teitok(
+                document,
+                output,
+                pretty_print=pretty_print,
+                spaceafter_handling=spaceafter_handling,
+                skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+            )
         else:
-            sys.stdout.write(dump_teitok(document, pretty_print=pretty_print))
+            sys.stdout.write(
+                dump_teitok(
+                    document,
+                    pretty_print=pretty_print,
+                    spaceafter_handling=spaceafter_handling,
+                    skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+                )
+            )
         return
 
     if fmt in ("conllu", "conllu-ne"):
@@ -4249,7 +4361,15 @@ def main(argv: list[str] | None = None) -> int:
     # Handle --version and -V early (before building parser to avoid unnecessary work)
     if "--version" in argv or "-V" in argv:
         parser = build_parser()
-        parser.parse_args(argv)  # This will print version and exit
+        try:
+            parser.parse_args(argv)  # This will print version and exit
+        except SystemExit:
+            # Suppress BrokenPipeError when exiting
+            try:
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            raise
         return 0
 
     if argv and argv[0] == "--detect-language":
@@ -4259,13 +4379,33 @@ def main(argv: list[str] | None = None) -> int:
         argv = ["process"]
     elif argv[0] in ("-h", "--help"):
         parser = build_parser()
-        parser.parse_args(argv)
+        try:
+            parser.parse_args(argv)
+        except SystemExit:
+            # Suppress BrokenPipeError when exiting
+            try:
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            raise
         return 0
     elif argv[0] not in TASK_CHOICES and argv[0].startswith("-"):
         argv = ["process", *argv]
 
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        # Suppress BrokenPipeError when exiting due to argument errors
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            pass
+        try:
+            sys.stderr.flush()
+        except BrokenPipeError:
+            pass
+        raise
     setattr(args, "_backend_explicit", backend_explicit)
 
     if not args.task:

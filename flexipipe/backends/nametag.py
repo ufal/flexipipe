@@ -746,15 +746,31 @@ class NameTagRESTBackend(BackendManager):
                             ))
                             current_entity = None
                 
-                # End any remaining entity
+                # End any remaining entity (only if the last token is part of the entity)
                 if current_entity and sent.tokens:
                     last_token = sent.tokens[-1]
-                    entities.append(Entity(
-                        start=current_entity[0],
-                        end=last_token.id,
-                        label=current_entity[1],
-                        text="",
-                    ))
+                    # Check if the last token has an entity tag that continues the current entity
+                    last_token_entity_tag = token_entity_map.get(last_token.id)
+                    if last_token_entity_tag and (
+                        (last_token_entity_tag.startswith("I-") and last_token_entity_tag[2:] == current_entity[1]) or
+                        (last_token_entity_tag.startswith("B-") and last_token_entity_tag[2:] == current_entity[1])
+                    ):
+                        # Last token is part of the entity
+                        entities.append(Entity(
+                            start=current_entity[0],
+                            end=last_token.id,
+                            label=current_entity[1],
+                            text="",
+                        ))
+                    else:
+                        # Last token is not part of the entity, entity ended at previous token
+                        if last_token.id > current_entity[0]:
+                            entities.append(Entity(
+                                start=current_entity[0],
+                                end=last_token.id - 1,
+                                label=current_entity[1],
+                                text="",
+                            ))
             
             # Fill entity text by extracting from sentence text at token positions
             # This preserves the exact spacing as it appears in the original text
