@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..backend_spec import BackendSpec
+from ..dependency_utils import ensure_extra_installed
 from ..doc import Document, Entity, Sentence, SubToken, Token
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -257,6 +258,12 @@ class FlairBackend(BackendManager):
         setup_backend_environment("flair")
         self._models_dir = get_backend_models_dir("flair", create=True)
 
+        ensure_extra_installed(
+            "flair",
+            module_name="flair",
+            friendly_name="Flair",
+            allow_prompt=verbose,
+        )
         try:
             from flair.models import SequenceTagger
             from flair.data import Sentence as FlairSentence

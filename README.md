@@ -89,6 +89,12 @@ available integrations, models, example texts, and supported tasks.
    
    **Note**: C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build. No manual installation needed.
 
+After installation, run the guided setup to pick defaults:
+
+```bash
+python -m flexipipe config --wizard
+```
+
 ### Optional Extras Behaviour
 
 Flexipipe can install extras automatically the first time you use a backend:
@@ -101,6 +107,12 @@ By default, flexipipe will prompt before installing extras in interactive shells
 
 ```bash
 python -m flexipipe config --set-prompt-install-extras false
+```
+
+Language auto-detection uses a fastText model cached under `~/.flexipipe/cache/fasttext/`. Download or refresh it anytime with:
+
+```bash
+python -m flexipipe config --download-language-model
 ```
 
 ---

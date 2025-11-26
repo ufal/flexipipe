@@ -334,9 +334,17 @@ def _get_fasttext_model_path(explicit: Optional[str] = None) -> Path:
 def _download_fasttext_model(path: Path) -> None:
     tmp_path = path.with_suffix(".tmp")
     print(f"[flexipipe] Downloading fastText language model to {path}...")
-    with urllib.request.urlopen(FASTTEXT_MODEL_URL) as response, open(tmp_path, "wb") as out:
-        out.write(response.read())
-    tmp_path.replace(path)
+    try:
+        with urllib.request.urlopen(FASTTEXT_MODEL_URL) as response, open(tmp_path, "wb") as out:
+            out.write(response.read())
+        tmp_path.replace(path)
+    except Exception as exc:  # pragma: no cover - network errors
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"Failed to download fastText language model: {exc}") from exc
 
 
 def _ensure_fasttext_model(model_path: Optional[Path] = None):
@@ -362,6 +370,22 @@ def _ensure_fasttext_model(model_path: Optional[Path] = None):
         _download_fasttext_model(path)
     _FASTTEXT_MODEL = fasttext.load_model(str(path))
     return _FASTTEXT_MODEL
+
+
+def ensure_fasttext_language_model(force_download: bool = False) -> Path:
+    """
+    Ensure the fastText language model is present locally.
+
+    Returns path to the model file.
+    """
+    path = _get_fasttext_model_path()
+    if force_download and path.exists():
+        try:
+            path.unlink()
+        except (OSError, PermissionError):
+            pass
+    _ensure_fasttext_model(path)
+    return path
 
 
 def get_language_candidates(

@@ -955,16 +955,17 @@ def _detect_language_from_text(
     *,
     explicit: bool = False,
     min_length: int = 10,
+    log_failures: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if not text:
-        if explicit:
+        if explicit or log_failures:
             print("[flexipipe] Language detection skipped: no text available.")
         return None
     snippet = text.strip()
     if len(snippet) > 20000:
         snippet = snippet[:20000]
     if len(snippet) < min_length:
-        if explicit:
+        if explicit or log_failures:
             print("[flexipipe] Language detection skipped: input text too short.")
         return None
     try:
@@ -974,17 +975,20 @@ def _detect_language_from_text(
             confidence_threshold=0.0,
         )
     except RuntimeError as exc:
-        if explicit:
+        if explicit or log_failures:
             print(f"[flexipipe] Language detection unavailable: {exc}")
         return None
     if not result:
+        if log_failures:
+            print("[flexipipe] Language detection produced no candidates.")
         return None
     confidence = float(result.get("confidence") or 0.0)
-    if explicit and confidence < LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:
-        print(
-            "[flexipipe] Language could not accurately be detected "
-            f"(confidence {confidence:.2%}). Please provide --language."
-        )
+    if confidence < LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:
+        if explicit or log_failures:
+            print(
+                "[flexipipe] Language could not accurately be detected "
+                f"(confidence {confidence:.2%}). Please provide --language."
+            )
         return None
     return result
 
@@ -999,7 +1003,13 @@ def _maybe_detect_language(
     need_detection = explicit or not getattr(args, "language", None)
     if not need_detection:
         return None
-    result = _detect_language_from_text(text, explicit=explicit, min_length=min_length)
+    log_failures = explicit or getattr(args, "verbose", False) or getattr(args, "debug", False)
+    result = _detect_language_from_text(
+        text,
+        explicit=explicit,
+        min_length=min_length,
+        log_failures=log_failures,
+    )
     if not result:
         return None
     detected_iso = result.get("language_iso") or result.get("label")
@@ -1706,6 +1716,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--wizard",
         action="store_true",
         help="Run interactive configuration wizard",
+    )
+    config_parser.add_argument(
+        "--download-language-model",
+        action="store_true",
+        help="Download or refresh the fastText language detection model",
     )
     config_parser.add_argument(
         "--show",
@@ -4208,6 +4223,18 @@ def run_config(args: argparse.Namespace) -> int:
     if args.wizard:
         return _run_config_wizard()
 
+    if args.download_language_model:
+        from .language_utils import ensure_fasttext_language_model
+
+        try:
+            path = ensure_fasttext_language_model(force_download=True)
+        except RuntimeError as exc:
+            print(f"[flexipipe] Failed to download fastText model: {exc}", file=sys.stderr)
+            return 1
+        else:
+            print(f"[flexipipe] fastText language model available at {path}")
+            return 0
+
     if args.refresh_all_caches:
         # Refresh all caches at once
         from .cache_manager import refresh_all_caches
@@ -4447,6 +4474,7 @@ def _run_config_wizard() -> int:
         get_prompt_install_extras,
         set_prompt_install_extras,
     )
+    from .language_utils import ensure_fasttext_language_model
 
     print("\n=== Flexipipe Configuration Wizard ===\n")
     current_models_dir = str(get_flexipipe_models_dir(create=False))
@@ -4488,6 +4516,13 @@ def _run_config_wizard() -> int:
         get_prompt_install_extras(),
     )
     set_prompt_install_extras(prompt_install)
+
+    if _prompt_bool("Download fastText language detection model now?", True):
+        try:
+            path = ensure_fasttext_language_model()
+            print(f"[flexipipe] fastText language model ready at {path}")
+        except RuntimeError as exc:
+            print(f"[flexipipe] Failed to prepare language model: {exc}")
 
     print("\n[flexipipe] Wizard complete. Run 'python -m flexipipe config --show' to review settings.\n")
     return 0
