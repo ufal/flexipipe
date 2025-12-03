@@ -2050,6 +2050,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show current configuration",
     )
+    config_parser.add_argument(
+        "--output-format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format for --show (text or json)",
+    )
     
     # train ---------------------------------------------------------------
     train_parser = subparsers.add_parser("train", help="Train a model from training data")
@@ -5171,69 +5177,138 @@ def run_config(args: argparse.Namespace) -> int:
         # Show current configuration
         config = read_config()
         current_models_dir = get_flexipipe_models_dir(create=False)
-        
-        print("Current flexipipe configuration:")
-        print(f"  Config file: {get_config_file()}")
-        print(f"  Models directory: {current_models_dir}")
-        
-        if "FLEXIPIPE_MODELS_DIR" in os.environ:
-            print(f"  (set via FLEXIPIPE_MODELS_DIR environment variable)")
-        elif "models_dir" in config:
-            print(f"  (configured in config file)")
-        else:
-            print(f"  (using default location)")
-        
-        # Show defaults
+
+        # Gather defaults
         default_backend = get_default_backend()
         default_output_format = get_default_output_format()
         default_create_implicit_mwt = get_default_create_implicit_mwt()
         default_writeback = get_default_writeback()
         auto_install_extras = get_auto_install_extras()
         prompt_install_extras = get_prompt_install_extras()
-        
+        language_detector = get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+
+        # Model registry configuration
+        from .model_registry import DEFAULT_REGISTRY_BASE_URL
+
+        local_dir = config.get("model_registry_local_dir") or os.environ.get("FLEXIPIPE_MODEL_REGISTRY_LOCAL_DIR")
+        if local_dir:
+            local_path = Path(local_dir).expanduser().resolve()
+            registry_mode = "local"
+            registry_info = {
+                "mode": "local",
+                "local_dir": str(local_path),
+                "source": "config" if "model_registry_local_dir" in config else "env",
+                "pattern": f"{local_path}/registries/{{backend}}.json",
+            }
+        else:
+            base_url = (
+                config.get("model_registry_base_url")
+                or os.environ.get("FLEXIPIPE_MODEL_REGISTRY_BASE_URL")
+                or DEFAULT_REGISTRY_BASE_URL
+            )
+            if "model_registry_base_url" in config:
+                source = "config"
+            elif "FLEXIPIPE_MODEL_REGISTRY_BASE_URL" in os.environ:
+                source = "env"
+            else:
+                source = "default"
+            registry_mode = "remote"
+            registry_info = {
+                "mode": "remote",
+                "base_url": base_url,
+                "source": source,
+                "pattern": f"{base_url}/{{backend}}.json",
+            }
+
+        backend_specific = {
+            key.replace("model_registry_url_", ""): url
+            for key, url in config.items()
+            if key.startswith("model_registry_url_")
+        }
+
+        # Check models dir source
+        if "FLEXIPIPE_MODELS_DIR" in os.environ:
+            models_dir_source = "env"
+        elif "models_dir" in config:
+            models_dir_source = "config"
+        else:
+            models_dir_source = "default"
+
+        output_format = getattr(args, "output_format", "text") or "text"
+
+        if output_format == "json":
+            import json
+
+            data = {
+                "config_file": str(get_config_file()),
+                "models_dir": str(current_models_dir),
+                "models_dir_source": models_dir_source,
+                "defaults": {
+                    "backend": default_backend or "flexitag",
+                    "output_format": default_output_format or "teitok",
+                    "create_implicit_mwt": bool(default_create_implicit_mwt),
+                    "writeback": bool(default_writeback),
+                    "auto_install_extras": bool(auto_install_extras),
+                    "prompt_install_extras": bool(prompt_install_extras),
+                    "language_detector": language_detector,
+                },
+                "model_registry": {
+                    "mode": registry_mode,
+                    **registry_info,
+                    "backend_specific": backend_specific,
+                },
+                "raw_config": config,
+            }
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return 0
+
+        # Text output (existing behaviour)
+        print("Current flexipipe configuration:")
+        print(f"  Config file: {get_config_file()}")
+        print(f"  Models directory: {current_models_dir}")
+
+        if models_dir_source == "env":
+            print(f"  (set via FLEXIPIPE_MODELS_DIR environment variable)")
+        elif models_dir_source == "config":
+            print(f"  (configured in config file)")
+        else:
+            print(f"  (using default location)")
+
         if default_backend:
             print(f"  Default backend: {default_backend}")
         else:
             print(f"  Default backend: flexitag (not configured)")
-        
+
         if default_output_format:
             print(f"  Default output format: {default_output_format}")
         else:
             print(f"  Default output format: teitok (not configured)")
-        
+
         print(f"  Default create-implicit-mwt: {'enabled' if default_create_implicit_mwt else 'disabled'}")
         print(f"  Default writeback: {'enabled' if default_writeback else 'disabled'}")
         print(f"  Auto-install extras: {'enabled' if auto_install_extras else 'disabled'}")
         print(f"  Prompt before installing extras: {'enabled' if prompt_install_extras else 'disabled'}")
-        print(f"  Language detector: {get_language_detector() or LANGUAGE_DETECTOR_DEFAULT}")
-        
+        print(f"  Language detector: {language_detector}")
+
         # Show model registry configuration
-        from .model_registry import get_registry_url, DEFAULT_REGISTRY_BASE_URL
-        local_dir = config.get("model_registry_local_dir") or os.environ.get("FLEXIPIPE_MODEL_REGISTRY_LOCAL_DIR")
-        if local_dir:
-            local_path = Path(local_dir).expanduser().resolve()
-            if "model_registry_local_dir" in config:
-                print(f"  Model registry local directory: {local_path} (configured in config file)")
-            else:
-                print(f"  Model registry local directory: {local_path} (set via FLEXIPIPE_MODEL_REGISTRY_LOCAL_DIR environment variable)")
-            print(f"    Registry files: {local_path}/registries/{{backend}}.json")
+        if registry_mode == "local":
+            print(f"  Model registry local directory: {registry_info['local_dir']} "
+                  f"({'configured in config file' if registry_info['source'] == 'config' else 'set via FLEXIPIPE_MODEL_REGISTRY_LOCAL_DIR environment variable'})")
+            print(f"    Registry files: {registry_info['pattern']}")
         else:
-            base_url = config.get("model_registry_base_url") or os.environ.get("FLEXIPIPE_MODEL_REGISTRY_BASE_URL") or DEFAULT_REGISTRY_BASE_URL
-            if "model_registry_base_url" in config:
-                print(f"  Model registry base URL: {base_url} (configured in config file)")
-            elif "FLEXIPIPE_MODEL_REGISTRY_BASE_URL" in os.environ:
-                print(f"  Model registry base URL: {base_url} (set via FLEXIPIPE_MODEL_REGISTRY_BASE_URL environment variable)")
-            else:
-                print(f"  Model registry base URL: {base_url} (using default)")
-        
+            source_desc = {
+                "config": "configured in config file",
+                "env": "set via FLEXIPIPE_MODEL_REGISTRY_BASE_URL environment variable",
+                "default": "using default",
+            }[registry_info["source"]]
+            print(f"  Model registry base URL: {registry_info['base_url']} ({source_desc})")
+
         # Show backend-specific URLs
-        backend_specific = {k: v for k, v in config.items() if k.startswith("model_registry_url_")}
         if backend_specific:
             print(f"  Backend-specific registry URLs:")
-            for key, url in backend_specific.items():
-                backend = key.replace("model_registry_url_", "")
+            for backend, url in backend_specific.items():
                 print(f"    {backend}: {url}")
-        
+
         if config:
             print("\nAll configuration values:")
             for key, value in config.items():

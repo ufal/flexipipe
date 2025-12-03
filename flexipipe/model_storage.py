@@ -34,20 +34,78 @@ def get_flexipipe_config_dir(create: bool = True) -> Path:
     """
     Get the flexipipe configuration directory.
     
+    Checks in order:
+    1. FLEXIPIPE_CONFIG_DIR environment variable (highest priority)
+    2. XDG_DATA_HOME environment variable (if set)
+    3. /home/git/.flexipipe/ (if running from TEITOK - detected by Resources/settings.xml in CWD)
+    4. ~/.flexipipe/ (default, falls back to /tmp/flexipipe-{username} if home() fails)
+    
     Args:
         create: If True, create the directory if it doesn't exist. If False, return the path
                 without creating it (useful for read-only operations).
     
     Returns:
-        Path to ~/.flexipipe/ (or $XDG_DATA_HOME/flexipipe/ if XDG_DATA_HOME is set)
+        Path to the flexipipe config directory
     """
-    if "XDG_DATA_HOME" in os.environ:
+    # Check for explicit config directory override (useful for web servers, containers, etc.)
+    if "FLEXIPIPE_CONFIG_DIR" in os.environ:
+        base = Path(os.environ["FLEXIPIPE_CONFIG_DIR"])
+    elif "XDG_DATA_HOME" in os.environ:
         base = Path(os.environ["XDG_DATA_HOME"]) / "flexipipe"
     else:
-        base = Path.home() / ".flexipipe"
+        # Check if we're running from TEITOK (by checking for Resources/settings.xml in CWD)
+        # If so, use /home/git/.flexipipe (created by TEITOK, owned by Apache)
+        cwd = Path.cwd()
+        teitok_detected = False
+        
+        # Check for Resources/settings.xml in current directory or parent directories (up to 3 levels)
+        check_paths = [cwd] + list(cwd.parents)[:3]
+        for check_path in check_paths:
+            settings_xml = check_path / "Resources" / "settings.xml"
+            if settings_xml.exists() and settings_xml.is_file():
+                teitok_detected = True
+                break
+        
+        if teitok_detected:
+            # We're in a TEITOK installation, use /home/git/.flexipipe
+            base = Path("/home/git/.flexipipe")
+        else:
+            # Not in TEITOK, try home directory
+            home_dir = None
+            try:
+                home_dir = Path.home()
+                test_base = home_dir / ".flexipipe"
+                # Test if we can actually write to this directory
+                try:
+                    test_base.mkdir(parents=True, exist_ok=True)
+                    # Test write permissions
+                    test_file = test_base / ".flexipipe-writable-test"
+                    test_file.write_text("test")
+                    test_file.unlink()
+                    base = test_base
+                except (OSError, PermissionError):
+                    # Can't write to home directory, fall back to /tmp
+                    home_dir = None
+            except (RuntimeError, KeyError):
+                # Path.home() failed (e.g., system user without home directory)
+                home_dir = None
+            
+            if home_dir is None:
+                # Fall back to /tmp/flexipipe-{username} or /tmp/flexipipe if username unavailable
+                try:
+                    import getpass
+                    username = getpass.getuser()
+                    base = Path(f"/tmp/flexipipe-{username}")
+                except Exception:
+                    base = Path("/tmp/flexipipe")
     
     if create:
-        base.mkdir(parents=True, exist_ok=True)
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            # If we can't create the directory, return the path anyway
+            # (caller can handle the error if needed)
+            pass
     return base
 
 
@@ -122,10 +180,15 @@ def get_flexipipe_models_dir(create: bool = True) -> Path:
             models_dir.mkdir(parents=True, exist_ok=True)
         return models_dir
     
-    # Default location: always ~/.flexipipe/models/
-    models_dir = Path.home() / ".flexipipe" / "models"
+    # Default location: use the same base as config directory
+    config_base = get_flexipipe_config_dir(create=False)
+    models_dir = config_base / "models"
     if create:
-        models_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            models_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            # If we can't create the directory, return the path anyway
+            pass
     return models_dir
 
 
