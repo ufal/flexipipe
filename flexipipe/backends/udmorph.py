@@ -473,5 +473,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_udmorph_models_display,
     supports_training=False,
     is_rest=True,
+    url="https://lindat.mff.cuni.cz/services/udmorph",
 )
 

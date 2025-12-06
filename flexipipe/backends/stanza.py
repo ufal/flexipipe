@@ -565,5 +565,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_stanza_models,
     supports_training=False,
     is_rest=False,
+    url="https://github.com/stanfordnlp/stanza",
 )
 

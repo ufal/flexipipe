@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from ..backend_spec import BackendSpec
-from ..conllu import conllu_to_document
+from ..conllu import conllu_to_document, document_to_conllu
 from ..doc import Document
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -342,19 +342,101 @@ class UDPipeRESTBackend(BackendManager):
         self._session = session or requests.Session()
         self._log = log_requests
 
-    def _request(self, text: str) -> dict:
-        payload = {"tokenizer": "", "tagger": "", "parser": "", "data": text}
-        if "tokenizer" not in self._extra_params:
-            payload["tokenizer"] = "normalized_spaces"
-        payload.update(self._extra_params)
-        if self._model:
-            payload["model"] = self._model
-        response = self._session.post(
-            self._endpoint,
-            data=payload,
-            headers=self._headers,
-            timeout=self._timeout,
-        )
+    def _request(self, data: str, input_format: str = "plain") -> dict:
+        """
+        Send request to UDPipe REST API.
+        
+        Args:
+            data: The input data (raw text or CoNLL-U format)
+            input_format: Either "plain" for raw text or "conllu" for CoNLL-U format
+        """
+        # For CoNLL-U input, send as form field (not file upload)
+        # Reference: curl -F "data=# sent_id = 1..." -F model=english -F tokenizer= -F tagger= -F parser= ...
+        # The data should be sent as a regular form field, not as a file upload
+        if input_format == "conllu":
+            # Build form data payload
+            form_data = {}
+            form_data["input"] = "conllu"
+            form_data["data"] = data  # Send as regular form field, not file upload
+            # Don't set tokenizer - it should not be set for CoNLL-U input
+            form_data["tagger"] = ""
+            form_data["parser"] = ""
+            
+            # Allow extra_params to override defaults, but don't let it add tokenizer
+            # (tokenizer should not be set for CoNLL-U input)
+            extra_params = dict(self._extra_params) if self._extra_params else {}
+            extra_params.pop("tokenizer", None)  # Remove tokenizer if present
+            form_data.update(extra_params)
+            # Model is required for CoNLL-U input
+            # UDPipe REST API accepts both model names and language codes
+            if self._model:
+                form_data["model"] = self._model
+            else:
+                # If no model is set, we need a model or language
+                raise ValueError(
+                    "UDPipe REST API requires a model name or language code for CoNLL-U input. "
+                    f"Model is currently '{self._model}'. Please specify a model or language."
+                )
+            
+            # Debug logging - always log on error, or if _log is enabled
+            import sys
+            should_log = self._log
+            if not should_log:
+                # Store original data for potential logging on error
+                _original_data = data
+            
+            response = self._session.post(
+                self._endpoint,
+                data=form_data,
+                headers=self._headers,
+                timeout=self._timeout,
+            )
+        else:
+            # For raw text, use regular form data
+            payload = {"tagger": "", "parser": "", "data": data}
+            if "tokenizer" not in self._extra_params:
+                payload["tokenizer"] = "normalized_spaces"
+            
+            # Allow extra_params to override defaults
+            payload.update(self._extra_params)
+            if self._model:
+                payload["model"] = self._model
+            
+            response = self._session.post(
+                self._endpoint,
+                data=payload,
+                headers=self._headers,
+                timeout=self._timeout,
+            )
+        
+        if response.status_code != 200:
+            # Log error details for debugging
+            import sys
+            error_msg = response.text[:500] if response.text else "No error message"
+            print(f"[flexipipe] UDPipe REST API error {response.status_code}: {error_msg}", file=sys.stderr)
+            # If CoNLL-U input, also log the request details
+            if input_format == "conllu":
+                print(f"[flexipipe] UDPipe request details: input=conllu, model={self._model}, data_length={len(data)}", file=sys.stderr)
+                print(f"[flexipipe] UDPipe form_data keys: {list(form_data.keys()) if 'form_data' in locals() else 'N/A'}", file=sys.stderr)
+                # Log first 500 chars of CoNLL-U data for debugging
+                print(f"[flexipipe] CoNLL-U data (first 500 chars):\n{data[:500]}", file=sys.stderr)
+                # Also check if data is valid UTF-8
+                try:
+                    data.encode('utf-8')
+                except UnicodeEncodeError as e:
+                    print(f"[flexipipe] CoNLL-U data encoding error: {e}", file=sys.stderr)
+                # Check for any suspicious characters
+                if '\x00' in data:
+                    print(f"[flexipipe] WARNING: CoNLL-U data contains null bytes", file=sys.stderr)
+                # Log the actual form_data being sent
+                print(f"[flexipipe] Form data types: {[(k, type(v).__name__) for k, v in form_data.items()]}", file=sys.stderr)
+                # Save full CoNLL-U to file for debugging
+                try:
+                    with open('/tmp/flexipipe_udpipe_debug.conllu', 'w', encoding='utf-8') as f:
+                        f.write(data)
+                    print(f"[flexipipe] Saved full CoNLL-U to /tmp/flexipipe_udpipe_debug.conllu for debugging", file=sys.stderr)
+                except Exception as e:
+                    print(f"[flexipipe] Could not save debug file: {e}", file=sys.stderr)
         response.raise_for_status()
         return response.json()
 
@@ -368,14 +450,57 @@ class UDPipeRESTBackend(BackendManager):
         use_raw_text: bool = False,
     ) -> NeuralResult:
         del overrides, preserve_pos_tags, components
-        text = "\n".join(sentence.text or "" for sentence in document.sentences)
-        response = self._request(text)
+        
+        if use_raw_text:
+            # Raw text mode: extract text from sentences and send as plain text
+            text = "\n".join(sentence.text or "" for sentence in document.sentences)
+            response = self._request(text, input_format="plain")
+        else:
+            # Pretokenized mode: send CoNLL-U format to preserve tokenization and TokIds
+            # UDPipe REST API should preserve TokIds in MISC column when input=conllu
+            # Force include TokId in MISC so UDPipe preserves it
+            conllu_text = document_to_conllu(document, include_tokid=True)
+            
+            # UDPipe REST API doesn't accept CoNLL-U with existing dependency relations
+            # Clear HEAD (column 6) and DEPREL (column 7) before sending
+            lines = conllu_text.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                if line.startswith('#') or not line.strip():
+                    cleaned_lines.append(line)
+                else:
+                    parts = line.split('\t')
+                    if len(parts) >= 10:
+                        # Clear HEAD (column 6) and DEPREL (column 7)
+                        parts[6] = '_'
+                        parts[7] = '_'
+                    cleaned_lines.append('\t'.join(parts))
+            conllu_text = '\n'.join(cleaned_lines)
+            
+            # Debug: log document info and CoNLL-U if logging is enabled
+            if self._log:
+                import sys
+                print(f"[flexipipe] Document ID: {document.id}, meta: {document.meta}", file=sys.stderr)
+                print(f"[flexipipe] CoNLL-U length: {len(conllu_text)}", file=sys.stderr)
+                print(f"[flexipipe] Sending CoNLL-U (first 500 chars):\n{conllu_text[:500]}", file=sys.stderr)
+            # Validate CoNLL-U format before sending
+            # Check for common issues that might cause UDPipe to reject it
+            if not conllu_text.strip():
+                raise ValueError("CoNLL-U text is empty")
+            # Ensure it's valid UTF-8
+            try:
+                conllu_text.encode('utf-8')
+            except UnicodeEncodeError as e:
+                raise ValueError(f"CoNLL-U text contains invalid UTF-8: {e}") from e
+            response = self._request(conllu_text, input_format="conllu")
+        
         result_text = response.get("result", "")
         
         if not result_text:
             raise RuntimeError("UDPipe REST response did not contain any result data")
         
         # Parse the CoNLL-U result and return the tagged document
+        # When using CoNLL-U input, TokIds should be preserved in MISC column
         tagged_doc = conllu_to_document(result_text, doc_id=document.id)
         
         # Preserve original metadata
@@ -410,11 +535,21 @@ def _create_udpipe_backend(
     validate_backend_kwargs(kwargs, "UDPipe", allowed_extra=["download_model", "training"])
 
     resolved_model = model or model_name
-    if not resolved_model and language:
-        resolved_model = resolve_model_from_language(language, "udpipe")
+    # If model is "auto" or not set, try to resolve from language
+    # UDPipe REST API accepts both model names and language codes
+    if not resolved_model or resolved_model == "auto":
+        if language:
+            # Try to resolve to a model name first, but if that fails, use language code
+            try:
+                resolved_model = resolve_model_from_language(language, "udpipe")
+            except ValueError:
+                # If no model found, use language code directly (UDPipe accepts language codes)
+                resolved_model = language
+        else:
+            resolved_model = None
     
     if not resolved_model:
-        raise ValueError("UDPipe REST backend requires a model name. Provide --model or --language.")
+        raise ValueError("UDPipe REST backend requires a model name or language code. Provide --model or --language.")
 
     resolved_endpoint = endpoint_url or DEFAULT_REST_ENDPOINT
 
@@ -438,6 +573,7 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_udpipe_models_display,
     supports_training=False,
     is_rest=True,
+    url="https://lindat.mff.cuni.cz/services/udpipe",
     model_registry_url=DEFAULT_UDPIPE_REGISTRY_URL,
 )
 

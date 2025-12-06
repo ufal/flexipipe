@@ -82,10 +82,9 @@ def resolve_model_from_language(
             return model
     
     # No model found
+    from .model_storage import is_running_from_teitok
+    teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend {backend_name}' to see available models."
     raise ValueError(
-        f"No {backend_name} model found for language '{language}'. "
-        f"Provide --model to specify a model name, or use "
-        f"'python -m flexipipe info models --backend {backend_name}' "
-        f"to see available models."
+        f"No {backend_name} model found for language '{language}'.{teitok_msg}"
     )
 

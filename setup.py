@@ -124,6 +124,149 @@ class FlexiBuildExt(build_ext):
                     sources.append(pugixml_source)
                 ext.sources = sources
         super().run()
+        # Try to build flexitag_py extension after building other extensions
+        self._build_flexitag_py()
+
+    def _build_flexitag_py(self):
+        """Build flexitag_py C++ extension using CMake if possible."""
+        import os
+        import subprocess
+        
+        # Check if we're in non-interactive mode (TEITOK installations)
+        noninteractive = os.environ.get("FLEXIPIPE_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
+        quiet_install = os.environ.get("FLEXIPIPE_QUIET_INSTALL", "").lower() in ("1", "true", "yes")
+        is_teitok = noninteractive or quiet_install
+        
+        # Check if flexitag directory exists
+        flexitag_dir = DEPS_BASE / "flexitag"
+        if not flexitag_dir.exists() or not (flexitag_dir / "CMakeLists.txt").exists():
+            if not is_teitok:
+                print("[flexipipe] flexitag directory not found, skipping flexitag_py build")
+            return
+        
+        # Check if CMake is available
+        try:
+            subprocess.run(["cmake", "--version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if not is_teitok:
+                print("[flexipipe] CMake not found, skipping flexitag_py build (Python fallback will be used)")
+            return
+        
+        # Build flexitag_py
+        build_dir = flexitag_dir / "build"
+        build_dir.mkdir(exist_ok=True)
+        
+        try:
+            if not is_teitok:
+                print("[flexipipe] Building flexitag_py C++ extension...")
+            
+            # Configure with CMake
+            cmake_cmd = [
+                "cmake", "..",
+                "-DFLEXITAG_BUILD_PYTHON=ON",
+            ]
+            result = subprocess.run(
+                cmake_cmd,
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if not is_teitok:
+                    print(f"[flexipipe] CMake configuration failed: {result.stderr}")
+                    print("[flexipipe] Continuing without flexitag_py (Python fallback will be used)")
+                return
+            
+            # Build flexitag_py target
+            build_cmd = ["cmake", "--build", ".", "--target", "flexitag_py", "-j"]
+            result = subprocess.run(
+                build_cmd,
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if not is_teitok:
+                    print(f"[flexipipe] flexitag_py build failed: {result.stderr}")
+                    print("[flexipipe] Continuing without flexitag_py (Python fallback will be used)")
+                return
+            
+            # Check if the module was built
+            so_files = list(build_dir.glob("flexitag_py*.so"))
+            if not so_files:
+                # Try .pyd for Windows
+                so_files = list(build_dir.glob("flexitag_py*.pyd"))
+            
+            if so_files:
+                built_module = so_files[0]
+                if not is_teitok:
+                    print(f"[flexipipe] Successfully built flexitag_py: {built_module}")
+                
+                # Copy the built module to the flexipipe package directory so it can be imported
+                # This ensures it works even when flexitag/build is not in the expected location
+                try:
+                    # During build, copy to build directory so it gets included in the wheel/installation
+                    if hasattr(self, 'build_lib') and self.build_lib:
+                        # We're in build mode - copy to build directory
+                        target_dir = Path(self.build_lib) / "flexipipe"
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        target_path = target_dir / built_module.name
+                        shutil.copy2(built_module, target_path)
+                        if not is_teitok:
+                            print(f"[flexipipe] Copied flexitag_py to {target_path}")
+                        
+                        # Also ensure flexitag/build directory structure is preserved in the build
+                        # This allows the module to be found via sys.path manipulation in engine.py/teitok.py
+                        flexitag_target = Path(self.build_lib) / "flexitag" / "build"
+                        flexitag_target.parent.mkdir(parents=True, exist_ok=True)
+                        if not flexitag_target.exists():
+                            flexitag_target.mkdir(parents=True, exist_ok=True)
+                        # Copy the built module to flexitag/build as well
+                        flexitag_module_path = flexitag_target / built_module.name
+                        shutil.copy2(built_module, flexitag_module_path)
+                        
+                        # Also copy the source flexitag directory structure if it exists
+                        # This ensures the build directory is available after installation
+                        if flexitag_dir.exists():
+                            # Copy flexitag source to build_lib (but skip build directory to avoid recursion)
+                            import distutils.dir_util
+                            flexitag_build_target = Path(self.build_lib) / "flexitag"
+                            if not flexitag_build_target.exists():
+                                # Copy flexitag directory but exclude the build subdirectory
+                                distutils.dir_util.copy_tree(
+                                    str(flexitag_dir),
+                                    str(flexitag_build_target),
+                                    preserve_mode=0,
+                                    preserve_times=0,
+                                    update=0,
+                                    verbose=0,
+                                )
+                                # Remove the original build directory if it was copied
+                                copied_build = flexitag_build_target / "build"
+                                if copied_build.exists():
+                                    import shutil
+                                    shutil.rmtree(copied_build)
+                            # Ensure the build directory exists with the module
+                            flexitag_build_target.mkdir(parents=True, exist_ok=True)
+                            flexitag_build_dir = flexitag_build_target / "build"
+                            flexitag_build_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(built_module, flexitag_build_dir / built_module.name)
+                    else:
+                        # Try to find where flexipipe will be installed
+                        # This is a fallback - the module will still be found via sys.path in engine.py
+                        pass
+                except Exception as copy_error:
+                    # If copying fails, the module will still be found via sys.path manipulation
+                    if not is_teitok:
+                        print(f"[flexipipe] Note: Could not copy flexitag_py to package directory: {copy_error}")
+            else:
+                if not is_teitok:
+                    print("[flexipipe] flexitag_py module not found after build")
+        except Exception as e:
+            if not is_teitok:
+                print(f"[flexipipe] Error building flexitag_py: {e}")
+                print("[flexipipe] Continuing without flexitag_py (Python fallback will be used)")
+            # Don't fail the installation if flexitag_py build fails
 
     def _prepare_third_party(self):
         build_temp = Path(self.build_temp or "build")
@@ -295,6 +438,11 @@ setup(
     author_email="your.email@example.com",
     url="https://github.com/yourusername/flexipipe",
     packages=find_packages(),
+    package_data={
+        "flexipipe": ["flexitag_py*.so", "flexitag_py*.pyd"],  # Include built flexitag_py module
+        "": ["flexitag/build/flexitag_py*.so", "flexitag/build/flexitag_py*.pyd"],  # Include from flexitag/build
+    },
+    include_package_data=True,
     python_requires=">=3.8",
     install_requires=BASE_REQUIREMENTS,
     extras_require=EXTRAS,

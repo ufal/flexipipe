@@ -574,5 +574,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_transformers_models,
     supports_training=False,
     is_hidden=False,
+    url="https://huggingface.co/docs/transformers",
 )
 

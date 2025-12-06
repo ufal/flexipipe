@@ -443,10 +443,10 @@ def _create_flexitag_backend(
             raise
         except Exception as e:
             # If model catalog lookup fails for other reasons, provide a helpful error message
+            from ..model_storage import is_running_from_teitok
+            teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend flexitag' to see available models."
             raise ValueError(
-                f"Could not resolve Flexitag model for language '{language}': {e}. "
-                f"Provide --model to specify a model name, or use 'python -m flexipipe info models --backend flexitag' "
-                f"to see available models."
+                f"Could not resolve Flexitag model for language '{language}': {e}.{teitok_msg}"
             ) from e
     
     if params_path:
@@ -478,5 +478,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_flexitag_models,
     supports_training=True,
     is_rest=False,
+    url="https://github.com/flexipipe/flexipipe",  # Built-in backend
 )
 

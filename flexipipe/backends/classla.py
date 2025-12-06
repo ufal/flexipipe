@@ -307,16 +307,30 @@ class ClassLABackend(BackendManager):
                     config_fallback["processors"] = ",".join(processors_list)
                     return self.classla.Pipeline(**config_fallback)
             if self._download:
-                if self._verbose:
-                    print(f"Downloading ClassLA model for {self._language}...")
-                self.classla.download(self._language, type=self._type)
+                import sys
+                print(f"[flexipipe] Downloading ClassLA model for {self._language} (type: {self._type})...", flush=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # Pass verbose=True to classla.download to ensure progress is shown
+                # In non-interactive environments, this helps with output flushing
+                self.classla.download(self._language, type=self._type, verbose=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                print(f"[flexipipe] ClassLA model download completed", flush=True)
                 return self.classla.Pipeline(**config)
             raise
         except self._resources_error as e:
             if self._download:
-                if self._verbose:
-                    print(f"Downloading ClassLA model for {self._language}...")
-                self.classla.download(self._language, type=self._type)
+                import sys
+                print(f"[flexipipe] Downloading ClassLA model for {self._language} (type: {self._type})...", flush=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # Pass verbose=True to classla.download to ensure progress is shown
+                # In non-interactive environments, this helps with output flushing
+                self.classla.download(self._language, type=self._type, verbose=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                print(f"[flexipipe] ClassLA model download completed", flush=True)
                 return self.classla.Pipeline(**config)
             raise RuntimeError(
                 f"ClassLA model not found for language '{self._language}' "
@@ -442,5 +456,6 @@ BACKEND_SPEC = BackendSpec(
     list_models=_list_classla_models,
     supports_training=False,
     is_rest=False,
+    url="https://github.com/clarinsi/classla",
 )
 

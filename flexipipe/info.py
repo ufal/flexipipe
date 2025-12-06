@@ -12,31 +12,89 @@ from .task_registry import TASK_ALIASES, TASK_DEFAULTS, TASK_DESCRIPTIONS, TASK_
 from .language_utils import resolve_language_query, language_matches_entry
 
 
+def _capitalize_backend_name(name: str) -> str:
+    """Return properly capitalized backend name."""
+    # Mapping of backend names to their proper capitalization
+    capitalization_map = {
+        "classla": "ClassLA",
+        "fasttext": "fastText",
+        "flexitag": "Flexitag",
+        "nametag": "NameTag",
+        "spacy": "SpaCy",
+        "stanza": "Stanza",
+        "transformers": "Transformers",
+        "treetagger": "TreeTagger",
+        "udmorph": "UDMorph",
+        "udpipe": "UDPipe",
+        "udpipe1": "UDPipe CLI",
+    }
+    return capitalization_map.get(name.lower(), name.capitalize())
+
+
 def list_backends(args: argparse.Namespace) -> int:
-    """List all available backends."""
+    """List all available backends with their functionality status."""
     output_format = getattr(args, "output_format", "table")
     
     # Get backends from registry (excludes hidden backends by default)
-    from .backend_registry import list_backends
+    from .backend_registry import list_backends, get_backend_status
     backends = list_backends(include_hidden=False)
-    backends_data = [
-        {"backend": name, "description": info.description}
-        for name, info in sorted(backends.items())
-    ]
+    
+    backends_data = []
+    for name, info in sorted(backends.items()):
+        status_info = get_backend_status(name)
+        display_name = _capitalize_backend_name(name)
+        backend_entry = {
+            "backend": name,
+            "name": display_name,  # Properly capitalized name
+            "description": info.description,
+            "url": getattr(info, "url", None) or "",
+            "available": status_info["available"],
+            "status": status_info["status"],
+            "missing": status_info["missing"],
+            "install_hint": status_info["install_hint"],
+        }
+        backends_data.append(backend_entry)
     
     if output_format == "json":
         print(json.dumps({"backends": backends_data}, indent=2, ensure_ascii=False), flush=True)
         return 0
     
-    # Table format
+    # Table format - separate name, description, and URL
     print("Available backends:")
-    print(f"{'Backend':<20} {'Description':<60}")
-    print("=" * 80)
+    print(f"{'Backend':<20} {'Status':<15} {'Description':<45} {'URL':<40}")
+    print("=" * 120)
     
     for backend_info in backends_data:
-        print(f"{backend_info['backend']:<20} {backend_info['description']:<60}")
+        status_str = "✓ Available" if backend_info["available"] else "✗ Missing"
+        if backend_info["missing"]:
+            status_str += f" ({', '.join(backend_info['missing'])})"
+        
+        # Truncate description if too long
+        desc = backend_info["description"]
+        if len(desc) > 45:
+            desc = desc[:42] + "..."
+        
+        # Truncate URL if too long
+        url = backend_info["url"] or ""
+        if len(url) > 40:
+            url = url[:37] + "..."
+        
+        # Use properly capitalized name for display
+        display_name = backend_info["name"]
+        print(f"{display_name:<20} {status_str:<15} {desc:<45} {url:<40}")
     
-    print("\nUse 'flexipipe info models --backend <backend>' to see available models for a specific backend.")
+    # Show missing dependencies summary
+    missing_backends = [b for b in backends_data if not b["available"]]
+    if missing_backends:
+        print("\n" + "=" * 85)
+        print("Installation hints for missing backends:")
+        for backend_info in missing_backends:
+            if backend_info["install_hint"]:
+                print(f"  {backend_info['backend']}: {backend_info['install_hint']}")
+    
+    from .model_storage import is_running_from_teitok
+    if not is_running_from_teitok():
+        print("\nUse 'flexipipe info models --backend <backend>' to see available models for a specific backend.")
     return 0
 
 
@@ -331,6 +389,46 @@ def list_models(args: argparse.Namespace) -> int:
                 backend_start = time.time()
                 print(f"[DEBUG] Checking backend: {backend}...", file=sys.stderr)
             try:
+                # Optimize: Try to read from cache first (even if expired) to avoid slow operations
+                # This makes listing all models much faster - it should only read JSON files
+                # Skip HTTP requests for REST backends and directory scans for local backends
+                if not force_refresh:
+                    from .model_storage import read_model_cache_entry
+                    backend_info = get_backend_info(backend)
+                    is_rest_backend = backend_info and backend_info.is_rest if backend_info else False
+                    
+                    # Determine cache key based on backend type
+                    if is_rest_backend:
+                        # REST backends use cache keys like "udpipe:{url}" or "udmorph:{url}"
+                        url = getattr(args, "endpoint_url", None)
+                        if backend == "udpipe":
+                            cache_key = f"udpipe:{url or 'https://lindat.mff.cuni.cz/services/udpipe/api/models'}"
+                        elif backend == "udmorph":
+                            cache_key = f"udmorph:{url or 'https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list'}"
+                        elif backend == "nametag":
+                            cache_key = f"nametag:{url or 'https://lindat.mff.cuni.cz/services/nametag/api/models'}"
+                        else:
+                            cache_key = f"{backend}:{url or 'default'}"
+                    else:
+                        # Local backends use simple cache keys
+                        if backend == "flexitag":
+                            cache_key = "flexitag:local"
+                        else:
+                            cache_key = backend
+                    
+                    # Check cache with no TTL - use even expired cache to avoid slow operations
+                    cached = read_model_cache_entry(cache_key, max_age_seconds=None)
+                    if cached:
+                        # Use cached data directly - don't call backend function which might be slow
+                        entries_by_backend[backend] = cached
+                        if debug:
+                            backend_time = time.time() - backend_start
+                            backend_timings[backend] = backend_time
+                            print(f"[DEBUG]   {backend}: {backend_time:.3f}s (cached, {len(cached)} models)", file=sys.stderr)
+                        continue
+                    # If no cache, fall through to normal loading (but only if not force_refresh)
+                
+                # Only load normally if cache is missing or force_refresh is True
                 entries = _load_backend_entries(
                     backend,
                     args,
@@ -411,9 +509,21 @@ def list_models(args: argparse.Namespace) -> int:
                 print(json.dumps({"error": entries["error"], "backend": backend_type}, indent=2), flush=True)
                 return 1
             
+            from .model_storage import is_model_installed
             models_data = []
             for model_name, entry in entries.items():
                 if isinstance(entry, dict):
+                    # Check if model is installed (skip REST backends)
+                    installed = None
+                    backend_info = get_backend_info(backend_type)
+                    is_rest_backend = backend_info and backend_info.is_rest if backend_info else False
+                    if not is_rest_backend:
+                        try:
+                            installed = is_model_installed(backend_type, model_name)
+                        except Exception:
+                            # If check fails, leave as None
+                            pass
+                    
                     model_info = {
                         "model": model_name,
                         "language_iso": entry.get(LANGUAGE_FIELD_ISO),
@@ -429,6 +539,9 @@ def list_models(args: argparse.Namespace) -> int:
                         "languages": entry.get("languages"),
                         "package": entry.get("package"),
                     }
+                    # Add installed status if available
+                    if installed is not None:
+                        model_info["installed"] = installed
                     # Remove None values
                     model_info = {k: v for k, v in model_info.items() if v is not None}
                     models_data.append(model_info)
@@ -754,6 +867,7 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
     settings = load_teitok_settings(settings_path=settings_path)
     
     # Prepare output data
+    # Ensure binary switches always have explicit boolean values
     output_data = {
         "settings_path": str(settings_path),
         "attribute_mappings": settings.attribute_mappings,
@@ -764,8 +878,9 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
         "cqp_sattributes_by_level": settings.cqp_sattributes_by_level,
         "explicit_flexipipe_mappings": settings.explicit_flexipipe_mappings,
         "flexipipe_preferences": settings.flexipipe_preferences,
-        "known_tags_only": settings.known_tags_only,
-        "use_raw_text": settings.use_raw_text,
+        "known_tags_only": bool(settings.known_tags_only),
+        "use_raw_text": bool(settings.use_raw_text),
+        "download_model": bool(settings.download_model),
         "xmlfile_defaults": settings.xmlfile_defaults,
         "teiheader_defaults": settings.teiheader_defaults,
     }
@@ -888,6 +1003,8 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
         flexipipe_flags.append("known-tags-only")
     if settings.use_raw_text:
         flexipipe_flags.append("use-raw-text")
+    if settings.download_model:
+        flexipipe_flags.append("download-model")
     if flexipipe_flags:
         print("\nFlexipipe Options:")
         for flag in flexipipe_flags:

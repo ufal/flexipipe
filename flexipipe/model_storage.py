@@ -30,6 +30,46 @@ from pathlib import Path
 from typing import Optional
 
 
+def _can_create_path(path: Path) -> bool:
+    """
+    Check if a path can be created by actually testing creation.
+    
+    Args:
+        path: Path to check
+        
+    Returns:
+        True if the path can be created, False otherwise
+    """
+    try:
+        # Actually try to create the directory (or at least test if we can)
+        # This will fail on macOS for /home/git even though /home exists
+        path.mkdir(parents=True, exist_ok=True)
+        # If it already exists, that's fine too
+        return True
+    except (OSError, PermissionError):
+        # Can't create it (e.g., /home/git on macOS)
+        return False
+
+
+def is_running_from_teitok() -> bool:
+    """
+    Detect if flexipipe is running from a TEITOK installation.
+    
+    Checks for Resources/settings.xml in the current directory or parent directories.
+    
+    Returns:
+        True if TEITOK is detected, False otherwise
+    """
+    cwd = Path.cwd()
+    # Check for Resources/settings.xml in current directory or parent directories (up to 3 levels)
+    check_paths = [cwd] + list(cwd.parents)[:3]
+    for check_path in check_paths:
+        settings_xml = check_path / "Resources" / "settings.xml"
+        if settings_xml.exists() and settings_xml.is_file():
+            return True
+    return False
+
+
 def get_flexipipe_config_dir(create: bool = True) -> Path:
     """
     Get the flexipipe configuration directory.
@@ -55,21 +95,34 @@ def get_flexipipe_config_dir(create: bool = True) -> Path:
     else:
         # Check if we're running from TEITOK (by checking for Resources/settings.xml in CWD)
         # If so, use /home/git/.flexipipe (created by TEITOK, owned by Apache)
-        cwd = Path.cwd()
-        teitok_detected = False
-        
-        # Check for Resources/settings.xml in current directory or parent directories (up to 3 levels)
-        check_paths = [cwd] + list(cwd.parents)[:3]
-        for check_path in check_paths:
-            settings_xml = check_path / "Resources" / "settings.xml"
-            if settings_xml.exists() and settings_xml.is_file():
-                teitok_detected = True
-                break
-        
-        if teitok_detected:
-            # We're in a TEITOK installation, use /home/git/.flexipipe
-            base = Path("/home/git/.flexipipe")
+        # But only if /home/git actually exists (it may not on macOS or other systems)
+        if is_running_from_teitok():
+            # We're in a TEITOK installation, try to use /home/git/.flexipipe
+            # But check if /home/git exists first (it may not on macOS)
+            home_git = Path("/home/git")
+            teitok_base = Path("/home/git/.flexipipe")
+            if home_git.exists():
+                # /home/git exists, check if we can actually use it
+                if create:
+                    # Test if we can create the .flexipipe directory
+                    if _can_create_path(teitok_base):
+                        base = teitok_base
+                    else:
+                        # Can't create it, fall through to normal logic
+                        base = None
+                else:
+                    # Not creating, just return the path
+                    base = teitok_base
+            elif create and _can_create_path(teitok_base):
+                # /home/git doesn't exist but we can create the full path (and create=True)
+                base = teitok_base
+            else:
+                # /home/git doesn't exist and can't be created, fall through to normal logic
+                base = None
         else:
+            base = None
+        
+        if base is None:
             # Not in TEITOK, try home directory
             home_dir = None
             try:
@@ -316,6 +369,17 @@ def set_prompt_install_extras(enabled: bool) -> None:
     write_config({"prompt_install_extras": bool(enabled)})
 
 
+def get_default_download_model() -> bool:
+    """Return whether models should be downloaded automatically by default."""
+    config = read_config()
+    return config.get("default_download_model", False)
+
+
+def set_default_download_model(enabled: bool) -> None:
+    """Set automatic model downloading by default."""
+    write_config({"default_download_model": bool(enabled)})
+
+
 def set_default_create_implicit_mwt(enabled: bool) -> None:
     """
     Set the default create_implicit_mwt setting in the configuration file.
@@ -540,6 +604,98 @@ def get_spacy_model_path(model_name: str) -> Optional[Path]:
     return None
 
 
+def is_model_installed(backend: str, model_name: str) -> bool:
+    """
+    Check if a specific model is installed for a backend.
+    
+    Args:
+        backend: Backend name
+        model_name: Model name or path
+    
+    Returns:
+        True if the model is installed, False otherwise
+    """
+    backend_dir = get_backend_models_dir(backend, create=False)
+    if not backend_dir or not backend_dir.exists():
+        return False
+    
+    if backend == "spacy":
+        # SpaCy models are directories with meta.json
+        model_path = backend_dir / model_name
+        if model_path.exists() and model_path.is_dir() and (model_path / "meta.json").exists():
+            return True
+        # Also check standard spaCy location
+        try:
+            import spacy.util  # type: ignore
+            try:
+                spacy.util.get_package_path(model_name)
+                return True
+            except (OSError, IOError, ImportError):
+                pass
+        except ImportError:
+            pass
+    elif backend == "stanza":
+        # Stanza models: lang/processor/package.pt
+        # Model name format: lang_package (e.g., cs_cac)
+        if "_" in model_name:
+            lang, package = model_name.split("_", 1)
+            lang_dir = backend_dir / lang
+            if lang_dir.exists() and lang_dir.is_dir():
+                for processor_dir in lang_dir.iterdir():
+                    if processor_dir.is_dir():
+                        pt_file = processor_dir / f"{package}.pt"
+                        if pt_file.exists():
+                            return True
+    elif backend == "flair":
+        # Flair models: model_name/*.bin or *.pt
+        model_dir = backend_dir / model_name
+        if model_dir.exists() and model_dir.is_dir():
+            if any(model_dir.glob("*.bin")) or any(model_dir.glob("*.pt")):
+                return True
+    elif backend == "transformers":
+        # Transformers models: model_name/ with .bin or .safetensors
+        # Handle HuggingFace format (org/model)
+        model_dir_name = model_name.replace("/", "_")
+        model_dir = backend_dir / model_dir_name
+        if model_dir.exists() and model_dir.is_dir():
+            if any(model_dir.rglob("*.bin")) or any(model_dir.rglob("*.safetensors")):
+                return True
+    elif backend == "flexitag":
+        # Flexitag models: directories with model_vocab.json
+        # model_name can be a path or just a name
+        model_path = Path(model_name)
+        if model_path.is_absolute():
+            if model_path.exists() and model_path.is_dir() and (model_path / "model_vocab.json").exists():
+                return True
+        else:
+            model_dir = backend_dir / model_name
+            if model_dir.exists() and model_dir.is_dir() and (model_dir / "model_vocab.json").exists():
+                return True
+    elif backend == "fasttext":
+        # fastText models are directories with model.bin
+        model_dir = backend_dir / model_name
+        if model_dir.exists() and model_dir.is_dir() and (model_dir / "model.bin").exists():
+            return True
+    elif backend == "classla":
+        # ClassLA models: lang/processor/variant.pt
+        # Model name format: lang-type (e.g., bg-standard, mk-standard)
+        # Files are named standard.pt or nonstandard.pt (not package.pt)
+        if "-" in model_name:
+            lang_code, variant = model_name.split("-", 1)
+            lang_dir = backend_dir / lang_code
+            if lang_dir.exists() and lang_dir.is_dir():
+                # Check for processor directories (e.g., pos, tokenize, lemma, depparse)
+                # Look for variant.pt files (e.g., standard.pt, nonstandard.pt)
+                variant_file = f"{variant}.pt"
+                for processor_dir in lang_dir.iterdir():
+                    if processor_dir.is_dir():
+                        pt_file = processor_dir / variant_file
+                        if pt_file.exists():
+                            return True
+    
+    return False
+
+
 def list_installed_models(backend: str) -> list[str]:
     """
     List installed models for a backend in the flexipipe directory.
@@ -585,6 +741,11 @@ def list_installed_models(backend: str) -> list[str]:
         for model_dir in backend_dir.iterdir():
             if model_dir.is_dir() and (model_dir / "model_vocab.json").exists():
                 models.append(str(model_dir))
+    elif backend == "fasttext":
+        # fastText models are directories with model.bin
+        for model_dir in backend_dir.iterdir():
+            if model_dir.is_dir() and (model_dir / "model.bin").exists():
+                models.append(model_dir.name)
     
     return sorted(models)
 

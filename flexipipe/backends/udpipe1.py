@@ -706,4 +706,5 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_udpipe1_models_display,
     supports_training=True,
     is_rest=False,
+    url="https://github.com/ufal/udpipe",
 )

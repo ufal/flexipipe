@@ -1164,8 +1164,13 @@ def handle_test(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
         raise SystemExit("--test requires --language (or provide a treebank filename with language prefix).")
     
     backend = getattr(args, 'backend', None)
+    if not backend and getattr(args, 'backends', None):
+        # If --backends was provided, use the first one
+        backends_list = getattr(args, 'backends', [])
+        if backends_list:
+            backend = backends_list[0]
     if not backend:
-        raise SystemExit("--test requires --backend.")
+        raise SystemExit("--test requires --backend (or --backends).")
     
     job = BenchmarkJob(
         language=language,

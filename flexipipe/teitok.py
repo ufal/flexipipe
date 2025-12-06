@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -36,20 +37,50 @@ except ImportError:  # pragma: no cover - handled during runtime
     import os
     import importlib
     
-    # Look for flexitag_py in the flexitag/build directory relative to this file
-    # Resolve __file__ to an absolute path first to handle cases where it might be relative
+    # Look for flexitag_py in multiple locations:
+    # 1. In flexipipe package directory (when installed from wheel)
+    # 2. In flexitag/build directory (development/editable install)
     resolved_file_path = Path(__file__).resolve()
-    flexipipe_dir = resolved_file_path.parent.parent
+    flexipipe_package_dir = resolved_file_path.parent  # flexipipe/ directory
+    flexipipe_dir = resolved_file_path.parent.parent   # parent of flexipipe/
     
+    # Check flexipipe package directory first (for wheel installations)
+    flexitag_py_in_package = list(flexipipe_package_dir.glob("flexitag_py*.so")) + list(flexipipe_package_dir.glob("flexitag_py*.pyd"))
+    
+    # Check flexitag/build directory (for development installations)
     flexitag_build = flexipipe_dir / "flexitag" / "build"
     
-    if flexitag_build.exists():
+    _import_error = None
+    
+    # Try importing from flexipipe package directory first
+    if flexitag_py_in_package:
+        try:
+            # The module is in the same directory as this file, so it should be importable
+            # But we need to make sure the directory is in sys.path
+            package_path_str = str(flexipipe_package_dir.resolve())
+            if package_path_str not in sys.path:
+                sys.path.insert(0, package_path_str)
+            
+            # Remove flexitag_py from sys.modules if it exists (to force re-import)
+            if 'flexitag_py' in sys.modules:
+                del sys.modules['flexitag_py']
+            
+            flexitag_py_module = importlib.import_module('flexitag_py')
+            _load_teitok = flexitag_py_module.load_teitok
+            _save_teitok = flexitag_py_module.save_teitok
+            _dump_teitok = flexitag_py_module.dump_teitok
+            _import_error = None  # Success
+        except (ImportError, AttributeError) as exc:
+            _import_error = exc
+            # Fall through to try flexitag/build directory
+    
+    # Fall back to flexitag/build directory if not found in package
+    if _import_error is not None and flexitag_build.exists():
         build_path_str = str(flexitag_build.resolve())
         if build_path_str not in sys.path:
             sys.path.insert(0, build_path_str)
         
         # Check for Python version mismatch
-        import sys
         python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         so_files = [f for f in os.listdir(build_path_str) if f.startswith('flexitag_py') and f.endswith('.so')]
         version_mismatch = False
@@ -76,26 +107,45 @@ except ImportError:  # pragma: no cover - handled during runtime
             _load_teitok = flexitag_py_module.load_teitok
             _save_teitok = flexitag_py_module.save_teitok
             _dump_teitok = flexitag_py_module.dump_teitok
+            _import_error = None  # Success
         except (ImportError, AttributeError) as exc:
             _import_error = exc
-
-            def _missing_extension(*_: object, **__: object) -> None:
-                error_msg = (
-                    "flexitag_py extension is not available. "
-                    "Build the flexitag project with pybind11 support or ensure it is on PYTHONPATH."
+    
+    # If still not found, set up fallback functions
+    if _import_error is not None:
+        # Check if we have version mismatch info from the flexitag/build check
+        version_mismatch = False
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        so_python_version = None
+        if flexitag_build.exists():
+            build_path_str = str(flexitag_build.resolve())
+            so_files = [f for f in os.listdir(build_path_str) if f.startswith('flexitag_py') and f.endswith('.so')]
+            if so_files:
+                so_file = so_files[0]
+                if f"cpython-{python_version.replace('.', '')}" not in so_file:
+                    version_mismatch = True
+                    import re
+                    match = re.search(r'cpython-(\d)(\d+)', so_file)
+                    if match:
+                        so_python_version = f"{match.group(1)}.{match.group(2)}"
+        
+        def _missing_extension(*_: object, **__: object) -> None:
+            error_msg = (
+                "flexitag_py extension is not available. "
+                "Build the flexitag project with pybind11 support or ensure it is on PYTHONPATH."
+            )
+            if version_mismatch and so_python_version:
+                error_msg += (
+                    f"\n\nPython version mismatch detected: "
+                    f"running Python {python_version} but module is compiled for Python {so_python_version}. "
+                    f"Please rebuild the flexitag module for Python {python_version} by running: "
+                    f"cd flexitag/build && cmake .. && make flexitag_py"
                 )
-                if version_mismatch:
-                    error_msg += (
-                        f"\n\nPython version mismatch detected: "
-                        f"running Python {python_version} but module is compiled for Python {so_python_version}. "
-                        f"Please rebuild the flexitag module for Python {python_version} by running: "
-                        f"cd flexitag/build && cmake .. && make flexitag_py"
-                    )
-                raise RuntimeError(error_msg) from _import_error
+            raise RuntimeError(error_msg) from _import_error
 
-            _load_teitok = _missing_extension  # type: ignore
-            _save_teitok = _missing_extension  # type: ignore
-            _dump_teitok = _missing_extension  # type: ignore
+        _load_teitok = _missing_extension  # type: ignore
+        _save_teitok = _missing_extension  # type: ignore
+        _dump_teitok = _missing_extension  # type: ignore
     else:
         _import_error = ImportError("flexitag_py extension not found")
 
@@ -107,7 +157,185 @@ except ImportError:  # pragma: no cover - handled during runtime
 
         _load_teitok = _missing_extension  # type: ignore
         _save_teitok = _missing_extension  # type: ignore
-        _dump_teitok = _missing_extension  # type: ignore
+        _dump_teitok = None  # Will be set to Python fallback below
+
+# Python fallback for _dump_teitok when C++ extension is not available
+def _dump_teitok_python(payload: Dict[str, Any], custom_attributes: List[str], pretty_print: bool = False) -> str:
+    """
+    Python fallback implementation of dump_teitok.
+    
+    Converts a document dict to TEITOK XML string.
+    
+    Args:
+        payload: Document dict (from Document.to_dict())
+        custom_attributes: List of custom attribute names to include from token.attrs
+        pretty_print: If True, pretty-print the XML (not used in fallback, handled by caller)
+    
+    Returns:
+        XML string representation
+    """
+    from .doc import Document
+    
+    # Reconstruct Document from dict
+    doc = Document.from_dict(payload)
+    
+    # Build XML using ElementTree
+    # Don't set xmlns to avoid namespace prefixes (ns0:, etc.)
+    root = ET.Element("TEI")
+    
+    # Create text element
+    text_elem = ET.SubElement(root, "text")
+    body_elem = ET.SubElement(text_elem, "body")
+    
+    # Process sentences
+    for sent in doc.sentences:
+        s_elem = ET.SubElement(body_elem, "s")
+        if sent.id:
+            s_elem.set("id", str(sent.id))
+        
+        # Process entities (name elements) - group tokens by entity
+        entity_tokens: Dict[int, List[Token]] = {}  # entity index -> tokens
+        for ent in sent.entities:
+            if ent.start not in entity_tokens:
+                entity_tokens[ent.start] = []
+            # Find tokens in this entity range
+            for tok in sent.tokens:
+                if ent.start <= tok.id <= ent.end:
+                    entity_tokens.setdefault(ent.start, []).append(tok)
+        
+        # Process tokens
+        current_entity_start = None
+        name_elem = None
+        for tok in sent.tokens:
+            # Check if this token starts a new entity
+            if tok.id in entity_tokens:
+                if current_entity_start is not None and name_elem is not None:
+                    # Close previous entity
+                    current_entity_start = None
+                    name_elem = None
+                if tok.id in entity_tokens:
+                    # Start new entity
+                    current_entity_start = tok.id
+                    ent = next((e for e in sent.entities if e.start == tok.id), None)
+                    if ent:
+                        name_elem = ET.SubElement(s_elem, "name")
+                        name_elem.set("type", ent.label)
+                        if ent.text:
+                            name_elem.set("text", ent.text)
+                        # Add entity attributes
+                        for key, value in ent.attrs.items():
+                            name_elem.set(key, str(value))
+            
+            # Create tok element (inside name if in entity)
+            parent = name_elem if name_elem is not None else s_elem
+            tok_elem = ET.SubElement(parent, "tok")
+            
+            # Set text content to token form (innerText)
+            if tok.form:
+                tok_elem.text = tok.form
+            
+            # Add standard attributes
+            if tok.form:
+                tok_elem.set("form", tok.form)
+            if tok.lemma:
+                tok_elem.set("lemma", tok.lemma)
+            if tok.xpos:
+                tok_elem.set("xpos", tok.xpos)
+            if tok.upos:
+                tok_elem.set("upos", tok.upos)
+            if tok.feats:
+                tok_elem.set("feats", tok.feats)
+            if tok.reg:
+                tok_elem.set("reg", tok.reg)
+            if tok.expan:
+                tok_elem.set("expan", tok.expan)
+            if tok.mod:
+                tok_elem.set("mod", tok.mod)
+            if tok.trslit:
+                tok_elem.set("trslit", tok.trslit)
+            if tok.ltrslit:
+                tok_elem.set("ltrslit", tok.ltrslit)
+            if tok.tokid:
+                tok_elem.set("tokid", tok.tokid)
+            if tok.id:
+                tok_elem.set("id", str(tok.id))
+            if tok.head:
+                tok_elem.set("head", str(tok.head))
+            if tok.deprel:
+                tok_elem.set("deprel", tok.deprel)
+            if tok.deps:
+                tok_elem.set("deps", tok.deps)
+            if tok.misc:
+                tok_elem.set("misc", tok.misc)
+            
+            # Add custom attributes from token.attrs
+            if tok.attrs:
+                if custom_attributes:
+                    # Only include specified custom attributes
+                    for attr_name in custom_attributes:
+                        if attr_name in tok.attrs:
+                            tok_elem.set(attr_name, str(tok.attrs[attr_name]))
+                else:
+                    # Include all custom attributes
+                    for attr_name, attr_value in tok.attrs.items():
+                        tok_elem.set(attr_name, str(attr_value))
+            
+            # Add subtokens (dtok elements)
+            if tok.subtokens:
+                for st in tok.subtokens:
+                    dtok_elem = ET.SubElement(tok_elem, "dtok")
+                    if st.form:
+                        dtok_elem.set("form", st.form)
+                    if st.lemma:
+                        dtok_elem.set("lemma", st.lemma)
+                    if st.xpos:
+                        dtok_elem.set("xpos", st.xpos)
+                    if st.upos:
+                        dtok_elem.set("upos", st.upos)
+                    if st.feats:
+                        dtok_elem.set("feats", st.feats)
+                    if st.reg:
+                        dtok_elem.set("reg", st.reg)
+                    if st.expan:
+                        dtok_elem.set("expan", st.expan)
+                    # Add subtoken custom attributes
+                    if st.attrs:
+                        if custom_attributes:
+                            for attr_name in custom_attributes:
+                                if attr_name in st.attrs:
+                                    dtok_elem.set(attr_name, str(st.attrs[attr_name]))
+                        else:
+                            for attr_name, attr_value in st.attrs.items():
+                                dtok_elem.set(attr_name, str(attr_value))
+            
+            # Add space after token if space_after is True (matching C++ behavior)
+            # Only add space if space_after is explicitly True (not False or None)
+            if tok.space_after is True:
+                # Add space as tail text on the tok element
+                # This will appear after the closing </tok> tag
+                tok_elem.tail = " "
+            
+            # Check if this token ends the current entity
+            if current_entity_start is not None and name_elem is not None:
+                ent = next((e for e in sent.entities if e.start == current_entity_start), None)
+                if ent and tok.id >= ent.end:
+                    # Close entity
+                    current_entity_start = None
+                    name_elem = None
+    
+    # Convert to string
+    # Don't use indent as it may add namespace prefixes
+    # Serialize without namespace prefixes by not setting xmlns
+    xml_str = ET.tostring(root, encoding="unicode", xml_declaration=True)
+    # Remove any namespace prefixes that might have been added (ns0:, etc.)
+    import re
+    xml_str = re.sub(r'<ns\d+:', '<', xml_str)
+    xml_str = re.sub(r'</ns\d+:', '</', xml_str)
+    return xml_str
+
+# Set Python fallback if C++ extension is not available
+if _dump_teitok is None:
+    _dump_teitok = _dump_teitok_python
 
 
 def load_teitok(
@@ -935,7 +1163,20 @@ def dump_teitok(
     payload = _ensure_serializable(sanitized.to_dict())
     if custom_attributes is None:
         custom_attributes = []
-    xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
+    try:
+        xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
+    except RuntimeError as e:
+        # If the C++ extension is not available, the error message will be informative
+        # The Python fallback should already be set, so this shouldn't happen, but handle gracefully
+        if "flexitag_py extension is not available" in str(e):
+            # This should not happen if fallback is properly set, but just in case
+            raise RuntimeError(
+                "TEITOK output requires the flexitag_py C++ extension, which is not available. "
+                "The Python fallback should have been used automatically. "
+                "Please report this issue. "
+                "To build the C++ extension, see: https://github.com/ufal/flexipipe#building-native-modules"
+            ) from e
+        raise
     if settings:
         xml_str = _remap_teitok_attributes(xml_str, settings)
     if pretty_print:
@@ -1119,12 +1360,265 @@ def pretty_print_teitok_xml(
     return updated
 
 
+def _verify_character_level_alignment(
+    document: Document,
+    xml_root: ET.Element,
+    matched_token_mapping: Dict[Tuple[int, int], ET.Element],
+    from_raw_text: bool = False,
+) -> tuple[bool, str]:
+    """
+    Verify character-level alignment between backend output and original XML.
+    
+    Reconstructs text from both sources and compares character-by-character.
+    This ensures that token splits/merges don't introduce errors.
+    
+    Returns:
+        (is_valid, error_message) tuple
+    """
+    import sys
+    
+    # Reconstruct text from XML tokens (original) - use @text attribute from <s> nodes if available
+    xml_text_parts = []
+    sentence_nodes = []
+    for s_node in xml_root.iter():
+        if s_node.tag.endswith("}s") or s_node.tag == "s":
+            sentence_nodes.append(s_node)
+    
+    # Process sentences in document order
+    for s_node in sentence_nodes:
+        # First try to use sentence text attribute (most accurate)
+        sent_text = s_node.get("text", "")
+        if sent_text:
+            xml_text_parts.append(sent_text)
+            xml_text_parts.append(" ")
+        else:
+            # Fallback: reconstruct from tokens
+            sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+            for tok_node in sent_tok_nodes:
+                # Get form from text content or @form attribute
+                form = (tok_node.text or "").strip() or tok_node.get("form", "")
+                if form:
+                    xml_text_parts.append(form)
+                    # Check SpaceAfter attribute
+                    space_after = tok_node.get("SpaceAfter", "Yes")
+                    if space_after and space_after.lower() != "no":
+                        xml_text_parts.append(" ")
+    
+    xml_text = "".join(xml_text_parts)
+    
+    # Reconstruct text from backend output (document)
+    backend_text_parts = []
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.form:
+                backend_text_parts.append(token.form)
+                # Check SpaceAfter from MISC
+                has_space_after = True
+                if token.misc:
+                    misc_parts = token.misc.split("|")
+                    for part in misc_parts:
+                        if part.strip().startswith("SpaceAfter=No"):
+                            has_space_after = False
+                            break
+                if has_space_after:
+                    backend_text_parts.append(" ")
+    
+    backend_text = "".join(backend_text_parts)
+    
+    # Normalize whitespace for comparison (collapse multiple spaces to single space)
+    import re
+    xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
+    backend_text_normalized = re.sub(r'\s+', ' ', backend_text.strip())
+    
+    # Compare character-by-character
+    if xml_text_normalized == backend_text_normalized:
+        return (True, "")
+    
+    # Find the first difference
+    min_len = min(len(xml_text_normalized), len(backend_text_normalized))
+    diff_pos = min_len
+    for i in range(min_len):
+        if xml_text_normalized[i] != backend_text_normalized[i]:
+            diff_pos = i
+            break
+    
+    # Show context around the difference
+    start = max(0, diff_pos - 20)
+    end = min(len(xml_text_normalized), diff_pos + 20)
+    xml_context = xml_text_normalized[start:end]
+    backend_context = backend_text_normalized[start:end] if diff_pos < len(backend_text_normalized) else ""
+    
+    error_msg = (
+        f"Character-level alignment mismatch at position {diff_pos}. "
+        f"XML text: ...{xml_context}... "
+        f"Backend text: ...{backend_context}... "
+        f"(XML length: {len(xml_text_normalized)}, Backend length: {len(backend_text_normalized)})"
+    )
+    
+    return (False, error_msg)
+
+
+def _verify_character_level_alignment(
+    document: Document,
+    xml_root: ET.Element,
+    matched_token_mapping: Dict[Tuple[int, int], ET.Element],
+    from_raw_text: bool = False,
+) -> tuple[bool, str]:
+    """
+    Verify character-level alignment between backend output and original XML.
+    
+    Reconstructs text from both sources and compares character-by-character.
+    This ensures that token splits/merges don't introduce errors.
+    
+    Returns:
+        (is_valid, error_message) tuple
+    """
+    import sys
+    import re
+    
+    # Reconstruct text from XML tokens (original) - use @text attribute from <s> nodes if available
+    # Match sentences by ID to ensure correct order
+    xml_text_parts = []
+    
+    # Build a mapping of sentence IDs to sentence nodes
+    sentid_to_xml_node = {}
+    for s_node in xml_root.iter():
+        if s_node.tag.endswith("}s") or s_node.tag == "s":
+            sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id") or s_node.get("sent_id")
+            if sent_id:
+                sentid_to_xml_node[sent_id] = s_node
+    
+    # Process sentences in document order (match by sentence ID from document)
+    # In raw text mode, we should compare sentence text directly (from @text attributes)
+    # rather than reconstructing from tokens, since the backend retokenizes and may change spacing
+    for sent_idx, sent in enumerate(document.sentences):
+        sent_id = sent.sent_id or sent.id or sent.source_id
+        s_node = sentid_to_xml_node.get(sent_id) if sent_id else None
+        
+        if s_node:
+            # First try to use sentence text attribute (most accurate, especially in raw text mode)
+            sent_text = s_node.get("text", "")
+            if sent_text:
+                xml_text_parts.append(sent_text)
+                # Add space between sentences (except last one)
+                if sent_idx < len(document.sentences) - 1:
+                    xml_text_parts.append(" ")
+            else:
+                # Fallback: reconstruct from tokens
+                # In raw text mode, spacing may differ due to retokenization, but we still need to reconstruct
+                sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                for tok_idx, tok_node in enumerate(sent_tok_nodes):
+                    # Get form from text content or @form attribute
+                    form = (tok_node.text or "").strip() or tok_node.get("form", "")
+                    if form:
+                        xml_text_parts.append(form)
+                        # Check SpaceAfter attribute
+                        space_after = tok_node.get("SpaceAfter", "Yes")
+                        # Don't add space after last token of last sentence
+                        if space_after and space_after.lower() != "no":
+                            if not (sent_idx == len(document.sentences) - 1 and tok_idx == len(sent_tok_nodes) - 1):
+                                xml_text_parts.append(" ")
+        else:
+            # If no matching XML node, reconstruct from document tokens
+            for token_idx, token in enumerate(sent.tokens):
+                if token.form:
+                    xml_text_parts.append(token.form)
+                    if token.space_after and not (sent_idx == len(document.sentences) - 1 and token_idx == len(sent.tokens) - 1):
+                        xml_text_parts.append(" ")
+    
+    xml_text = "".join(xml_text_parts)
+    
+    # In raw text mode, normalize whitespace more aggressively since backend may change spacing
+    if from_raw_text:
+        # Remove all spaces around punctuation for comparison
+        xml_text_normalized = re.sub(r'\s*([.,!?;:])\s*', r'\1', xml_text)
+        xml_text_normalized = re.sub(r'\s+', ' ', xml_text_normalized.strip())
+    else:
+        xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
+    
+    # Reconstruct text from backend output (document) - use sentence text if available
+    backend_text_parts = []
+    for sent_idx, sent in enumerate(document.sentences):
+        # If sentence has text, use it directly (most accurate)
+        if sent.text:
+            backend_text_parts.append(sent.text)
+            # Add space between sentences (except last one)
+            if sent_idx < len(document.sentences) - 1:
+                backend_text_parts.append(" ")
+        else:
+            # Fallback: reconstruct from tokens
+            for token_idx, token in enumerate(sent.tokens):
+                if token.form:
+                    backend_text_parts.append(token.form)
+                    # Check SpaceAfter from MISC or token.space_after
+                    has_space_after = True
+                    if token.space_after is False:
+                        has_space_after = False
+                    elif token.misc:
+                        misc_parts = token.misc.split("|")
+                        for part in misc_parts:
+                            part_stripped = part.strip()
+                            if part_stripped.startswith("SpaceAfter=No") or part_stripped == "SpaceAfter=No":
+                                has_space_after = False
+                                break
+                    # Don't add space after last token of last sentence
+                    if has_space_after and not (sent_idx == len(document.sentences) - 1 and token_idx == len(sent.tokens) - 1):
+                        backend_text_parts.append(" ")
+    
+    backend_text = "".join(backend_text_parts)
+    
+    # In raw text mode, normalize whitespace more aggressively since backend may change spacing
+    if from_raw_text:
+        backend_text = re.sub(r'\s*([.,!?;:])\s*', r'\1', backend_text)
+    
+    # Normalize whitespace for comparison (collapse multiple spaces to single space, trim)
+    xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
+    backend_text_normalized = re.sub(r'\s+', ' ', backend_text.strip())
+    
+    # Compare character-by-character
+    if xml_text_normalized == backend_text_normalized:
+        return (True, "")
+    
+    # Find the first difference
+    min_len = min(len(xml_text_normalized), len(backend_text_normalized))
+    diff_pos = min_len
+    for i in range(min_len):
+        if xml_text_normalized[i] != backend_text_normalized[i]:
+            diff_pos = i
+            break
+    
+    # Show context around the difference
+    start = max(0, diff_pos - 30)
+    end = min(len(xml_text_normalized), diff_pos + 30)
+    xml_context = xml_text_normalized[start:end]
+    backend_context = backend_text_normalized[start:end] if diff_pos < len(backend_text_normalized) else ""
+    
+    # Show the actual characters at the difference
+    xml_char = xml_text_normalized[diff_pos] if diff_pos < len(xml_text_normalized) else "<EOF>"
+    backend_char = backend_text_normalized[diff_pos] if diff_pos < len(backend_text_normalized) else "<EOF>"
+    
+    xml_char_code = ord(xml_char) if len(xml_char) == 1 else 0
+    backend_char_code = ord(backend_char) if len(backend_char) == 1 else 0
+    
+    error_msg = (
+        f"Character-level alignment mismatch at position {diff_pos}. "
+        f"XML char: '{xml_char}' (U+{xml_char_code:04X}), Backend char: '{backend_char}' (U+{backend_char_code:04X}). "
+        f"XML text: ...{xml_context}... "
+        f"Backend text: ...{backend_context}... "
+        f"(XML length: {len(xml_text_normalized)}, Backend length: {len(backend_text_normalized)})"
+    )
+    
+    return (False, error_msg)
+
+
 def update_teitok(
     document: Document,
     original_path: str,
     output_path: Optional[str] = None,
     *,
     settings: Optional["TeitokSettings"] = None,
+    from_raw_text: bool = False,
+    strict_alignment: bool = True,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
@@ -1138,6 +1632,13 @@ def update_teitok(
         original_path: Path to the original TEITOK XML file
         output_path: Optional output path (defaults to original_path for in-place update)
         settings: Optional TeitokSettings object to control attribute mappings
+        from_raw_text: If True, document was processed from raw text (allows token splitting/merging).
+                      If False, expects 1:1 token alignment (pretokenized mode).
+        strict_alignment: If True, refuse to write if alignment cannot be verified (default: True).
+                         If False, allow partial alignment with warnings.
+    
+    Raises:
+        RuntimeError: If strict_alignment=True and alignment cannot be verified (too many mismatches).
     """
     try:
         from lxml import etree as ET
@@ -1267,6 +1768,35 @@ def update_teitok(
     matched_sentences = 0
     skipped_sentences = 0
     
+    # Helper function to check if a token is likely from a CoNLL-U comment line
+    # These tokens should be skipped during alignment as they don't exist in the XML
+    def is_comment_line_token(token: Token) -> bool:
+        """Check if token looks like it came from a CoNLL-U comment line."""
+        form = token.form or ""
+        # Check for common comment line patterns that UDPipe might tokenize
+        comment_patterns = [
+            "#", "sent_id", "text", "newdoc", "newpar", "generator", "language",
+            "udpipe_model", "udpipe_model_licence", "TokId=", "SpaceAfter=",
+            "http://", "www.w3.org", "namespace", "space", "preserve", "=",
+            "{", "}", "|", "newdoc", "id", "toktest", "newpar"
+        ]
+        # Check if form matches a comment pattern exactly
+        if form in comment_patterns:
+            return True
+        # Check if form looks like a MISC field value (contains = or |)
+        if "=" in form or ("|" in form and not form.startswith("|")):
+            # But allow forms that are actual words (e.g., "awesome-align")
+            # Only flag if it's clearly a comment/metadata pattern
+            if any(pattern in form for pattern in ["TokId", "SpaceAfter", "http", "namespace", "udpipe"]):
+                return True
+        # Check if form looks like a URL or namespace
+        if form.startswith("http://") or form.startswith("www.") or "namespace" in form.lower():
+            return True
+        # Check if form is just punctuation that might be from comment lines
+        if form in ["{", "}", "=", "|", "#"]:
+            return True
+        return False
+    
     # Build list of sentence nodes in order for position-based matching
     sentence_nodes_ordered = []
     for s_node in root.iter():
@@ -1319,34 +1849,459 @@ def update_teitok(
         # Match tokens to XML nodes and build mapping
         # Only get direct <tok> children, not all descendants (performance optimization)
         sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+        
+        # Build form-based index for smart alignment (for raw text mode with splits/joins)
+        # Track which XML nodes have been matched to avoid double-matching
+        matched_xml_nodes: Set[ET.Element] = set()
+        xml_form_to_nodes: Dict[str, List[ET.Element]] = {}
+        
+        def get_full_text_content(elem: ET.Element) -> str:
+            """Get all text content from an element, including text before and after children."""
+            # Get text before first child
+            text_parts = [elem.text or ""]
+            # Get text from children (tail text after each child)
+            for child in elem:
+                if child.tail:
+                    text_parts.append(child.tail)
+            return "".join(text_parts).strip()
+        
+        def is_valid_match(candidate_node: ET.Element, token_form: str, settings: Optional["TeitokSettings"] = None) -> bool:
+            """
+            Verify that a candidate XML node is a valid match for a token form.
+            
+            STRICT MATCHING: Only accepts matches where forms are EXACTLY equal.
+            Returns False if:
+            - Text content is longer than token form (indicates a split token)
+            - Canonical form is longer than token form (indicates a split token)
+            - Text content is shorter than token form (indicates a merge or wrong match)
+            - Canonical form is shorter than token form (indicates a merge or wrong match)
+            - Neither canonical form nor text content EXACTLY matches token form
+            
+            Args:
+                candidate_node: XML token element to check
+                token_form: Token form to match against
+                settings: Optional TeitokSettings object
+            
+            Returns:
+                True if the match is valid, False otherwise
+            """
+            if not token_form:
+                return True  # No form to verify
+            
+            token_form = token_form.strip()
+            if not token_form:
+                return True  # Empty form, accept
+            
+            candidate_text = get_full_text_content(candidate_node).strip()
+            candidate_canonical = gettokform(candidate_node, settings).strip()
+            
+            # CRITICAL: Reject if text content is longer than token form (indicates a split token)
+            # Example: candidate_text="awesome-align" (13 chars) vs token_form="awesome" (7 chars) -> REJECT
+            if candidate_text and len(candidate_text) > len(token_form):
+                return False
+            
+            # CRITICAL: Reject if canonical form is longer than token form (indicates a split token)
+            if candidate_canonical and len(candidate_canonical) > len(token_form):
+                return False
+            
+            # CRITICAL: Reject if text content is shorter than token form (indicates wrong match)
+            # Example: candidate_text="a" vs token_form="awesome" -> REJECT
+            if candidate_text and len(candidate_text) < len(token_form):
+                return False
+            
+            # CRITICAL: Reject if canonical form is shorter than token form (indicates wrong match)
+            if candidate_canonical and len(candidate_canonical) < len(token_form):
+                return False
+            
+            # STRICT: Only accept if canonical form or text content EXACTLY matches token form
+            if candidate_canonical and candidate_canonical == token_form:
+                return True
+            if candidate_text and candidate_text == token_form:
+                return True
+            
+            # If we have a form attribute that EXACTLY matches and no text/canonical, that's OK
+            candidate_form = candidate_node.get("form", "").strip()
+            if candidate_form == token_form and not candidate_text and not candidate_canonical:
+                return True
+            
+            # If neither matches EXACTLY, reject
+            return False
+        
+        def gettokform(elem: ET.Element, settings: Optional["TeitokSettings"] = None, form_attr: Optional[str] = None) -> str:
+            """
+            Get the canonical form of a token element based on TEITOK settings.
+            
+            When forms hierarchy is defined in settings (via <forms> in <pattributes>):
+            - Follows inheritance chain: requested_form -> parent_form -> ... -> base_form (pform) -> innerText
+            - Example: nform inherits from fform, fform from form, form from pform, pform = innerText
+            - If form_attr is None, uses defaultform from settings (default: "form")
+            
+            When forms hierarchy is not defined:
+            - Uses legacy hierarchy: @reg > @expan > @form > innerText (if reg/expan in CQP pattributes)
+            - Otherwise: @form > innerText
+            
+            Args:
+                elem: XML token element (<tok> or <dtok>)
+                settings: Optional TeitokSettings object
+                form_attr: Optional form attribute name to use (e.g., "nform", "fform"). 
+                          If None, uses defaultform from settings or "form"
+            
+            Returns:
+                The canonical form string
+            """
+            # Determine which form attribute to use
+            target_form = form_attr
+            if target_form is None and settings:
+                target_form = settings.default_form
+            if target_form is None:
+                target_form = "form"
+            
+            # Check if forms hierarchy is defined in settings
+            if settings and settings.form_hierarchy:
+                # Use forms hierarchy with inheritance
+                # Build the inheritance chain for the target form
+                inheritance_chain = []
+                current_form = target_form
+                visited = set()  # Prevent infinite loops
+                
+                while current_form and current_form not in visited:
+                    visited.add(current_form)
+                    inheritance_chain.append(current_form)
+                    # Get parent form from hierarchy
+                    parent = settings.form_hierarchy.get(current_form)
+                    if parent:
+                        current_form = parent
+                    else:
+                        # No parent means this is a base form (like pform)
+                        # Base form maps to innerText
+                        break
+                
+                # Try each form in the inheritance chain (most specific first)
+                for form_name in inheritance_chain:
+                    form_val = elem.get(form_name, "")
+                    if form_val and form_val.strip():
+                        return form_val.strip()
+                
+                # If no form attribute found, base form (pform) maps to innerText
+                inner_text = get_full_text_content(elem)
+                if inner_text:
+                    return inner_text
+                return ""
+            
+            # Fallback: legacy hierarchy when forms not defined
+            # Check if reg/expan attributes are defined in CQP pattributes
+            use_legacy_hierarchy = False
+            if settings:
+                if "reg" in settings.defined_token_attributes or "expan" in settings.defined_token_attributes:
+                    use_legacy_hierarchy = True
+            
+            if use_legacy_hierarchy:
+                # Legacy hierarchy: @reg > @expan > @form > innerText
+                # Get reg attributes
+                reg_attrs = ["reg", "nform"]
+                reg_mapping = settings.get_attribute_mapping("reg") if settings else []
+                if reg_mapping:
+                    reg_attrs = reg_mapping + reg_attrs
+                
+                for attr in reg_attrs:
+                    reg_val = elem.get(attr)
+                    if reg_val and reg_val.strip():
+                        return reg_val.strip()
+                
+                # Get expan attributes
+                expan_attrs = ["expan", "fform"]
+                expan_mapping = settings.get_attribute_mapping("expan") if settings else []
+                if expan_mapping:
+                    expan_attrs = expan_mapping + expan_attrs
+                
+                for attr in expan_attrs:
+                    expan_val = elem.get(attr)
+                    if expan_val and expan_val.strip():
+                        return expan_val.strip()
+            
+            # Try @form attribute
+            form_attr_val = elem.get("form", "")
+            if form_attr_val and form_attr_val.strip():
+                return form_attr_val.strip()
+            
+            # Fall back to innerText
+            inner_text = get_full_text_content(elem)
+            if inner_text:
+                return inner_text
+            
+            return ""
+        
+        # Get attribute mappings from settings to know which attributes to check for form matching
+        # Check if reg or expan are used for normalization/expansion
+        reg_attrs = ["reg", "nform"]
+        expan_attrs = ["expan", "fform"]
+        if settings:
+            # Check if settings has reg/expan attribute mappings
+            reg_mapping = settings.get_attribute_mapping("reg")
+            if reg_mapping:
+                reg_attrs = reg_mapping + reg_attrs
+            expan_mapping = settings.get_attribute_mapping("expan")
+            if expan_mapping:
+                expan_attrs = expan_mapping + expan_attrs
+        
+        for node in sent_tok_nodes:
+            # Use gettokform to get the canonical form based on settings hierarchy
+            canonical_form = gettokform(node, settings)
+            
+            # Also collect all possible forms for matching (to handle cases where
+            # different forms might match)
+            full_text = get_full_text_content(node)
+            form_attr = node.get("form", "")
+            
+            # Try reg/nform attributes
+            reg_val = None
+            for attr in reg_attrs:
+                reg_val = node.get(attr)
+                if reg_val:
+                    break
+            
+            # Try expan/fform attributes
+            expan_val = None
+            for attr in expan_attrs:
+                expan_val = node.get(attr)
+                if expan_val:
+                    break
+            
+            # Collect all possible forms for matching
+            possible_forms = []
+            # Add canonical form first (highest priority)
+            if canonical_form:
+                possible_forms.append(canonical_form)
+            # Add other forms for fallback matching
+            if full_text and full_text not in possible_forms:
+                possible_forms.append(full_text)
+            if form_attr and form_attr not in possible_forms:
+                possible_forms.append(form_attr)
+            if reg_val and reg_val not in possible_forms:
+                possible_forms.append(reg_val)
+            if expan_val and expan_val not in possible_forms:
+                possible_forms.append(expan_val)
+            
+            # Store all forms in the mapping dictionary
+            for node_form in possible_forms:
+                if not node_form:
+                    continue
+                node_form_normalized = node_form.strip()
+                if node_form_normalized:
+                    if node_form_normalized not in xml_form_to_nodes:
+                        xml_form_to_nodes[node_form_normalized] = []
+                    xml_form_to_nodes[node_form_normalized].append(node)
+        
+        # Define verification function before first pass
+        def verify_match(candidate_node: ET.Element, token_form: str) -> bool:
+            """
+            Verify that a candidate XML node exactly matches a token form. 
+            Returns False if ANY mismatch - this is the CRITICAL check that prevents incorrect matches.
+            """
+            if not token_form:
+                return False
+            token_form = token_form.strip()
+            if not token_form:
+                return False
+            
+            candidate_text = get_full_text_content(candidate_node).strip()
+            candidate_canonical = gettokform(candidate_node, settings).strip()
+            
+            # CRITICAL: Forms must match EXACTLY - same length AND same content
+            # Reject if lengths don't match (prevents "con" matching "Español")
+            if candidate_text and len(candidate_text) != len(token_form):
+                return False
+            if candidate_canonical and len(candidate_canonical) != len(token_form):
+                return False
+            
+            # Check if candidate text exactly matches
+            if candidate_text == token_form:
+                return True
+            # Check if candidate canonical form exactly matches
+            if candidate_canonical == token_form:
+                return True
+            
+            # NO MATCH - reject
+            return False
+        
+        # First pass: match tokens that have TokIds (from CoNLL-U input)
         for token_idx, token in enumerate(sent.tokens):
             if not token.id:
                 continue
-            
-            # Try to find matching XML node
-            tok_node = None
+            # Skip tokens that look like they came from comment lines
+            if is_comment_line_token(token):
+                skipped_tokens += 1
+                continue
             if token.tokid:
                 tok_node = tokid_to_node.get(token.tokid)
+                if tok_node is not None and tok_node not in matched_xml_nodes:
+                    # VERIFY: Even TokId-based matches must have matching forms
+                    if token.form:
+                        token_form_check = token.form.strip()
+                        if token_form_check:
+                            if not verify_match(tok_node, token_form_check):
+                                # TokId matches but forms don't - skip this match
+                                tok_node = None
+                    
+                    if tok_node is not None:
+                        global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
+                        matched_xml_nodes.add(tok_node)
+                        node_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                        if node_tokid:
+                            token.tokid = node_tokid
+                            global_ord_to_tokid[token.id] = node_tokid
+                        else:
+                            tok_node.set("id", token.tokid)
+                            tokid_to_node[token.tokid] = tok_node
+                            global_ord_to_tokid[token.id] = token.tokid
+        
+        # Second pass: match remaining tokens using form-based alignment with split handling
+        # COMPLETELY REWRITTEN: Simple, strict matching that NEVER accepts incorrect matches
+        matched_backend_token_indices = set()
+        
+        for token_idx, token in enumerate(sent.tokens):
+            if not token.id:
+                continue
+            # Skip if already matched
+            if (sent_idx, token_idx) in global_token_to_tok_node:
+                matched_backend_token_indices.add(token_idx)
+                continue
+            if token_idx in matched_backend_token_indices:
+                continue
+            if is_comment_line_token(token):
+                skipped_tokens += 1
+                continue
             
-            # If not found, try position-based matching
-            if tok_node is None and token_idx < len(sent_tok_nodes):
-                tok_node = sent_tok_nodes[token_idx]
+            if not token.form:
+                continue
             
+            token_form = token.form.strip()
+            if not token_form:
+                continue
+            
+            tok_node = None
+            matched_form = None  # Track which form matched (for verification)
+            unmatched_nodes = [n for n in sent_tok_nodes if n not in matched_xml_nodes]
+            
+            # Strategy 1: Try sequences of tokens (for split tokens like "awesome-align" -> "awesome", "-", "align")
+            # Try combining current token with following tokens until we find an exact match
+            max_lookahead = min(10 if from_raw_text else 5, len(sent.tokens) - token_idx - 1)
+            
+            for lookahead in range(max_lookahead + 1):
+                if token_idx + lookahead >= len(sent.tokens):
+                    continue
+                # Skip if any token in sequence is already matched
+                if any(token_idx + i in matched_backend_token_indices for i in range(lookahead + 1)):
+                    continue
+                
+                # Build combined form
+                combined_forms = [sent.tokens[token_idx + i].form for i in range(lookahead + 1)]
+                combined_no_space = "".join(combined_forms)
+                combined_with_hyphen = "-".join(combined_forms)
+                
+                # Try to find exact match in unmatched XML nodes
+                for candidate in unmatched_nodes:
+                    candidate_text = get_full_text_content(candidate).strip()
+                    candidate_canonical = gettokform(candidate, settings).strip()
+                    
+                    # Check exact match with combined_no_space
+                    if candidate_text == combined_no_space or candidate_canonical == combined_no_space:
+                        # CRITICAL VERIFICATION: Forms must match EXACTLY
+                        if verify_match(candidate, combined_no_space):
+                            # DOUBLE-CHECK: Verify again after assignment
+                            if candidate_text == combined_no_space or candidate_canonical == combined_no_space:
+                                tok_node = candidate
+                                matched_form = combined_no_space
+                                matched_xml_nodes.add(candidate)
+                                global_token_to_tok_node[(sent_idx, token_idx)] = candidate
+                                matched_backend_token_indices.add(token_idx)
+                                # Mark remaining tokens in sequence as matched to same node (will become dtok)
+                                for i in range(1, lookahead + 1):
+                                    if token_idx + i < len(sent.tokens):
+                                        global_token_to_tok_node[(sent_idx, token_idx + i)] = candidate
+                                        matched_backend_token_indices.add(token_idx + i)
+                                break
+                    # Check exact match with combined_with_hyphen
+                    elif candidate_text == combined_with_hyphen or candidate_canonical == combined_with_hyphen:
+                        # CRITICAL VERIFICATION: Forms must match EXACTLY
+                        if verify_match(candidate, combined_with_hyphen):
+                            # DOUBLE-CHECK: Verify again after assignment
+                            if candidate_text == combined_with_hyphen or candidate_canonical == combined_with_hyphen:
+                                tok_node = candidate
+                                matched_form = combined_with_hyphen
+                                matched_xml_nodes.add(candidate)
+                                global_token_to_tok_node[(sent_idx, token_idx)] = candidate
+                                matched_backend_token_indices.add(token_idx)
+                                for i in range(1, lookahead + 1):
+                                    if token_idx + i < len(sent.tokens):
+                                        global_token_to_tok_node[(sent_idx, token_idx + i)] = candidate
+                                        matched_backend_token_indices.add(token_idx + i)
+                                break
+                
+                if tok_node:
+                    break
+            
+            # Strategy 2: Try exact single-token match (only if sequence matching failed)
+            if tok_node is None:
+                for candidate in unmatched_nodes:
+                    if verify_match(candidate, token_form):
+                        tok_node = candidate
+                        matched_form = token_form
+                        matched_xml_nodes.add(candidate)
+                        global_token_to_tok_node[(sent_idx, token_idx)] = candidate
+                        matched_backend_token_indices.add(token_idx)
+                        break
+            
+            # FINAL VERIFICATION: Reject ANY match that doesn't exactly match
+            # This is the absolute last check - if forms don't match, reject the match
+            # CRITICAL: This check MUST run for EVERY match, no exceptions
+            if tok_node is not None and token.form:
+                token_form_check = token.form.strip()
+                if token_form_check:  # Only verify if we have a form
+                    candidate_text = get_full_text_content(tok_node).strip()
+                    candidate_canonical = gettokform(tok_node, settings).strip()
+                    
+                    # Determine expected form
+                    expected_form = matched_form if matched_form else token_form_check
+                    
+                    # CRITICAL: Forms must match EXACTLY - no exceptions
+                    # Reject if lengths don't match
+                    if candidate_text and len(candidate_text) != len(expected_form):
+                        # Match failed verification - reject it
+                        tok_node = None
+                        matched_form = None
+                        # Remove from mappings
+                        if (sent_idx, token_idx) in global_token_to_tok_node:
+                            matched_xml_nodes.discard(global_token_to_tok_node[(sent_idx, token_idx)])
+                            del global_token_to_tok_node[(sent_idx, token_idx)]
+                        matched_backend_token_indices.discard(token_idx)
+                    elif candidate_canonical and len(candidate_canonical) != len(expected_form):
+                        # Match failed verification - reject it
+                        tok_node = None
+                        matched_form = None
+                        # Remove from mappings
+                        if (sent_idx, token_idx) in global_token_to_tok_node:
+                            matched_xml_nodes.discard(global_token_to_tok_node[(sent_idx, token_idx)])
+                            del global_token_to_tok_node[(sent_idx, token_idx)]
+                        matched_backend_token_indices.discard(token_idx)
+                    # Reject if content doesn't match exactly
+                    elif candidate_text != expected_form and candidate_canonical != expected_form:
+                        # Match failed verification - reject it
+                        tok_node = None
+                        matched_form = None
+                        # Remove from mappings
+                        if (sent_idx, token_idx) in global_token_to_tok_node:
+                            matched_xml_nodes.discard(global_token_to_tok_node[(sent_idx, token_idx)])
+                            del global_token_to_tok_node[(sent_idx, token_idx)]
+                        matched_backend_token_indices.discard(token_idx)
+            
+            # Only assign tokid if we have a valid match
             if tok_node is not None:
-                global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
-                # Get tokid from XML node (prefer id over xml:id)
                 node_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
                 if node_tokid:
-                    # Update token's tokid to match XML
                     token.tokid = node_tokid
                     global_ord_to_tokid[token.id] = node_tokid
-                elif token.tokid:
-                    # Token has tokid but XML doesn't - assign it to XML
-                    tok_node.set("id", token.tokid)
-                    tokid_to_node[token.tokid] = tok_node
-                    global_ord_to_tokid[token.id] = token.tokid
-                elif token.id:
-                    # Generate tokid using continuous numbering
+                elif not token.tokid:
                     new_tokid = f"w-{global_tokid_counter}"
                     global_tokid_counter += 1
                     token.tokid = new_tokid
@@ -1354,7 +2309,7 @@ def update_teitok(
                     tokid_to_node[new_tokid] = tok_node
                     global_ord_to_tokid[token.id] = new_tokid
             elif token.id:
-                # Token has no matching XML node yet - still assign tokid for mapping
+                # Token has no matching XML node - still assign tokid for mapping
                 if not token.tokid:
                     new_tokid = f"w-{global_tokid_counter}"
                     global_tokid_counter += 1
@@ -1408,6 +2363,10 @@ def update_teitok(
             s_node.set("corr", sent.corr)
         
         # Update tokens using pre-built mapping
+        # Track which XML nodes have been updated and which backend tokens are part of splits
+        updated_xml_nodes = set()
+        # Track which backend tokens are part of a split sequence (will become dtok elements)
+        split_token_indices = set()
         for token_idx, token in enumerate(sent.tokens):
             tok_node = global_token_to_tok_node.get((sent_idx, token_idx))
             if tok_node is None:
@@ -1417,7 +2376,31 @@ def update_teitok(
                 sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s{sent_idx+1}"
                 print(f"[flexipipe] update_teitok: Token mismatch - sent {sent_idx+1} (id={sent_id_str}), token {token_idx+1} (ord={token.id}, tokid={token.tokid}, form='{token.form}') has no matching XML node", file=sys.stderr)
                 continue
+            
+            # Check if this backend token is part of a split sequence (will be handled as dtok)
+            # This can happen in both raw text mode and pretokenized mode when backends split tokens
+            tokens_for_this_node = [(s, t) for (s, t), node in global_token_to_tok_node.items() 
+                                   if node == tok_node and s == sent_idx]
+            if len(tokens_for_this_node) > 1:
+                # Multiple backend tokens map to this XML node - this is a split
+                sorted_tokens = sorted(tokens_for_this_node, key=lambda x: x[1])
+                # The first token updates the main <tok> element
+                # The remaining tokens become <dtok> elements
+                if token_idx != sorted_tokens[0][1]:
+                    # This is not the first token in the sequence - it will be a dtok
+                    split_token_indices.add(token_idx)
+                    continue  # Skip updating this token directly, it will be handled as dtok
+            
+            # When multiple backend tokens map to the same XML node (token splits),
+            # only update the XML node once (using the first token in the sequence)
+            # Check if this XML node has already been updated
+            if tok_node in updated_xml_nodes:
+                # This XML node was already updated by a previous token in the sequence
+                # Skip updating it again to avoid overwriting attributes
+                continue
+            
             matched_tokens += 1
+            updated_xml_nodes.add(tok_node)
             
             # Update token attributes
             def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
@@ -1447,18 +2430,52 @@ def update_teitok(
             inner_text = (tok_node.text or "").strip()
             # Check if element has children (if so, form might differ from inner text)
             has_children = len(tok_node) > 0
-            # Only write @form if it's different from inner text or if there are children
-            if token.form:
-                if has_children or token.form != inner_text:
-                    tok_node.set("form", token.form)
-                elif tok_node.get("form") and token.form == inner_text:
-                    # Remove @form if it matches inner text and there are no children
-                    tok_node.attrib.pop("form", None)
             
-            # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
-            ord_val = token.attrs.get("ord") or (str(token.id) if token.id else "")
-            if ord_val:
-                _set_attr(tok_node, "ord", ord_val)
+            # When multiple backend tokens map to the same XML node (token splits),
+            # we need to create <dtok> elements for the split tokens
+            # This can happen in both raw text mode and pretokenized mode when backends split tokens
+            # Check if this XML node is mapped to multiple backend tokens
+            tokens_for_this_node = [(s, t) for (s, t), node in global_token_to_tok_node.items() 
+                                   if node == tok_node and s == sent_idx]
+            split_tokens = []
+            if len(tokens_for_this_node) > 1:
+                # Multiple backend tokens map to this XML node - this is a split
+                sorted_tokens = sorted(tokens_for_this_node, key=lambda x: x[1])  # Sort by token index
+                # The first token updates the main <tok> element
+                # The remaining tokens become <dtok> elements
+                split_tokens = [sent.tokens[t] for s, t in sorted_tokens[1:] if s == sent_idx and t < len(sent.tokens)]
+                # Combine forms for the main token text content
+                combined_form = "".join(sent.tokens[t].form for s, t in sorted_tokens if s == sent_idx and t < len(sent.tokens))
+                # Try hyphenated version too (for cases like "awesome-align")
+                combined_form_hyphen = "-".join(sent.tokens[t].form for s, t in sorted_tokens if s == sent_idx and t < len(sent.tokens))
+                # Use the form that matches the original XML text, or the hyphenated version
+                if inner_text and combined_form_hyphen == inner_text:
+                    combined_form = combined_form_hyphen
+                elif inner_text and combined_form == inner_text:
+                    pass  # Already correct
+                # Update text content with combined form
+                if combined_form and combined_form != inner_text:
+                    tok_node.text = combined_form
+                    inner_text = combined_form
+            
+            # For split tokens, skip setting attributes on parent <tok> - they go on <dtok> elements
+            # Check if this is a split token before setting any attributes
+            is_split = len(tokens_for_this_node) > 1
+            
+            if not is_split:
+                # Not a split token - set attributes normally on <tok>
+                # Only write @form if it's different from inner text or if there are children
+                if token.form:
+                    if has_children or token.form != inner_text:
+                        tok_node.set("form", token.form)
+                    elif tok_node.get("form") and token.form == inner_text:
+                        # Remove @form if it matches inner text and there are no children
+                        tok_node.attrib.pop("form", None)
+                
+                # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
+                ord_val = token.attrs.get("ord") or (str(token.id) if token.id else "")
+                if ord_val:
+                    _set_attr(tok_node, "ord", ord_val)
             
             # Ensure tokid is preserved in the XML
             # Prefer id over xml:id when writing (unless source explicitly had xml:id and not id)
@@ -1486,6 +2503,110 @@ def update_teitok(
                     if current_tokid and current_tokid in tokid_to_node and current_tokid != token.tokid:
                         del tokid_to_node[current_tokid]
                     tokid_to_node[token.tokid] = tok_node
+            
+            # Handle split tokens: create <dtok> elements for ALL tokens in the split (including the first one)
+            # This applies to both raw text mode and pretokenized mode when backends split tokens
+            # When tokens are split, ALL annotations go on <dtok> elements, not on the parent <tok>
+            if split_tokens:
+                # Get all tokens in the split sequence (including the first one)
+                all_split_tokens = [sent.tokens[t] for s, t in sorted_tokens if s == sent_idx and t < len(sent.tokens)]
+                
+                # Get existing dtok nodes (but don't count MWT dtok nodes if any)
+                dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                base_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id") or token.tokid
+                
+                # Create or update dtok elements for ALL tokens in the split
+                # Start after any existing MWT dtok elements
+                existing_mwt_dtok_count = len([c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")])
+                for idx, split_token in enumerate(all_split_tokens):
+                    dtok_idx = existing_mwt_dtok_count + idx
+                    if dtok_idx < len(dtok_nodes):
+                        dtok_node = dtok_nodes[dtok_idx]
+                    else:
+                        # Create new dtok element
+                        dtok_node = ET.Element("dtok")
+                        tok_node.append(dtok_node)
+                    
+                    # Set dtok ID (w-13.1, w-13.2, w-13.3, etc.)
+                    dtok_tokid = f"{base_tokid}.{idx+1}"
+                    dtok_node.set("id", dtok_tokid)
+                    
+                    # Update dtok attributes from split token using _set_attr for proper mapping
+                    # Check both direct fields and attrs dict (backends may store in either)
+                    lemma_val = split_token.lemma or split_token.attrs.get("lemma", "")
+                    xpos_val = split_token.xpos or split_token.attrs.get("xpos", "")
+                    upos_val = split_token.upos or split_token.attrs.get("upos", "")
+                    feats_val = split_token.feats or split_token.attrs.get("feats", "")
+                    deprel_val = split_token.deprel or split_token.attrs.get("deprel", "")
+                    misc_val = split_token.misc or split_token.attrs.get("misc", "")
+                    
+                    # Use _set_attr to respect TEITOK attribute mappings (e.g., xpos -> pos)
+                    if split_token.form:
+                        dtok_node.set("form", split_token.form)
+                    _set_attr(dtok_node, "lemma", lemma_val, default_empty=True)
+                    _set_attr(dtok_node, "xpos", xpos_val)
+                    _set_attr(dtok_node, "upos", upos_val)
+                    _set_attr(dtok_node, "feats", feats_val)
+                    _set_attr(dtok_node, "reg", split_token.reg)
+                    _set_attr(dtok_node, "expan", split_token.expan)
+                    _set_attr(dtok_node, "mod", split_token.mod)
+                    _set_attr(dtok_node, "trslit", split_token.trslit)
+                    _set_attr(dtok_node, "ltrslit", split_token.ltrslit)
+                    
+                    # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
+                    ord_val = split_token.attrs.get("ord") or (str(split_token.id) if split_token.id else "")
+                    if ord_val:
+                        _set_attr(dtok_node, "ord", ord_val)
+                    
+                    # Handle head value - convert from ord to tokid
+                    head_int = split_token.head
+                    if head_int == 0 and "head" in split_token.attrs:
+                        head_attr = split_token.attrs["head"]
+                        if isinstance(head_attr, int):
+                            head_int = head_attr
+                        elif isinstance(head_attr, str):
+                            try:
+                                head_int = int(head_attr)
+                            except (ValueError, TypeError):
+                                head_int = 0
+                    
+                    if head_int > 0:
+                        head_tokid = global_ord_to_tokid.get(head_int)
+                        if not head_tokid:
+                            head_token = ord_to_token.get(head_int)
+                            if head_token and head_token.tokid:
+                                head_tokid = head_token.tokid
+                                global_ord_to_tokid[head_int] = head_tokid
+                        if head_tokid:
+                            _set_attr(dtok_node, "head", head_tokid)
+                        else:
+                            # Last resort: use ord if tokid not found (shouldn't happen)
+                            _set_attr(dtok_node, "head", str(head_int))
+                    else:
+                        _set_attr(dtok_node, "head", "", default_empty=True)
+                    
+                    if deprel_val:
+                        _set_attr(dtok_node, "deprel", deprel_val)
+                    else:
+                        _set_attr(dtok_node, "deprel", "", default_empty=True)
+                    
+                    if misc_val:
+                        _set_attr(dtok_node, "misc", misc_val)
+                
+                # For split tokens, remove all attributes from parent <tok> except id
+                # The parent <tok> should only have id and text content - all annotations go on <dtok>
+                parent_id = tok_node.get("id")
+                parent_xml_id = tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                # Clear all attributes
+                tok_node.attrib.clear()
+                # Restore only the id attribute(s)
+                if parent_id:
+                    tok_node.set("id", parent_id)
+                if parent_xml_id and not parent_id:
+                    tok_node.set("{http://www.w3.org/XML/1998/namespace}id", parent_xml_id)
+                
+                # Skip the rest of the attribute setting for this token
+                continue
             
             # For MWT tokens, update the <tok> element but annotations go on <dtok>
             if token.is_mwt and token.subtokens:
@@ -1672,20 +2793,84 @@ def update_teitok(
                 if misc_val:
                     _set_attr(tok_node, "misc", misc_val)
     
-    # Debug: print summary if there were issues
-    if skipped_tokens > 0 or skipped_sentences > 0:
-        import sys
-        total_sentences = matched_sentences + skipped_sentences
-        total_tokens = matched_tokens + skipped_tokens
+    # Verify alignment before writing
+    import sys
+    total_sentences = matched_sentences + skipped_sentences
+    total_tokens = matched_tokens + skipped_tokens
+    
+    # Calculate alignment quality metrics
+    sentence_match_rate = matched_sentences / total_sentences if total_sentences > 0 else 0.0
+    token_match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
+    
+    # Determine if alignment is acceptable
+    # For pretokenized mode (from_raw_text=False), we require near-perfect alignment (1:1 mapping)
+    # For raw text mode (from_raw_text=True), we allow some flexibility but still need reasonable alignment
+    if from_raw_text:
+        # Raw text mode: allow some token splitting/merging, but still need >80% alignment
+        min_sentence_rate = 0.95  # 95% of sentences must match
+        min_token_rate = 0.80  # 80% of tokens must match (allows for splitting/merging)
+        mode_str = "raw text"
+    else:
+        # Pretokenized mode: require near-perfect 1:1 alignment
+        min_sentence_rate = 0.99  # 99% of sentences must match
+        min_token_rate = 0.99  # 99% of tokens must match (1:1 mapping expected)
+        mode_str = "pretokenized"
+    
+    alignment_acceptable = (
+        sentence_match_rate >= min_sentence_rate and
+        token_match_rate >= min_token_rate
+    )
+    
+    # Print alignment summary
+    if skipped_tokens > 0 or skipped_sentences > 0 or not alignment_acceptable:
         if skipped_sentences > 0:
             # Show what IDs we have vs what we're looking for
             doc_sent_ids = [f"{s.sent_id or s.id or s.source_id or 'NO_ID'}" for s in sanitized.sentences]
             xml_sent_ids = list(sentid_to_node.keys())
-            print(f"[flexipipe] update_teitok: matched {matched_sentences}/{total_sentences} sentences, {skipped_sentences} skipped", file=sys.stderr)
+            print(f"[flexipipe] update_teitok: matched {matched_sentences}/{total_sentences} sentences ({sentence_match_rate*100:.1f}%), {skipped_sentences} skipped", file=sys.stderr)
             print(f"[flexipipe] Document sentence IDs: {doc_sent_ids}", file=sys.stderr)
             print(f"[flexipipe] XML sentence IDs: {xml_sent_ids}", file=sys.stderr)
         if skipped_tokens > 0:
-            print(f"[flexipipe] update_teitok: matched {matched_tokens}/{total_tokens} tokens, {skipped_tokens} skipped (ID mismatch)", file=sys.stderr)
+            print(f"[flexipipe] update_teitok: matched {matched_tokens}/{total_tokens} tokens ({token_match_rate*100:.1f}%), {skipped_tokens} skipped (mode: {mode_str})", file=sys.stderr)
+    
+    # Perform character-level alignment verification
+    char_alignment_valid, char_error_msg = _verify_character_level_alignment(
+        sanitized, root, global_token_to_tok_node, from_raw_text
+    )
+    
+    # Refuse to write if alignment is unacceptable and strict_alignment is enabled
+    if strict_alignment and not alignment_acceptable:
+        error_msg = (
+            f"Token alignment verification failed (mode: {mode_str}). "
+            f"Matched {matched_sentences}/{total_sentences} sentences ({sentence_match_rate*100:.1f}%, required: {min_sentence_rate*100:.1f}%) "
+            f"and {matched_tokens}/{total_tokens} tokens ({token_match_rate*100:.1f}%, required: {min_token_rate*100:.1f}%). "
+            f"Refusing to write to prevent incorrect annotations. "
+            f"This may indicate tokenization mismatch between backend output and original XML. "
+            f"Check if --use-raw-text is set correctly, or if the backend is retokenizing when it shouldn't."
+        )
+        if not char_alignment_valid:
+            error_msg += f"\nCharacter-level alignment check also failed: {char_error_msg}"
+        raise RuntimeError(error_msg)
+    
+    # Even if token alignment passes, check character-level alignment
+    if strict_alignment and not char_alignment_valid:
+        error_msg = (
+            f"Character-level alignment verification failed (mode: {mode_str}). "
+            f"Token alignment passed ({matched_tokens}/{total_tokens} tokens, {token_match_rate*100:.1f}%), "
+            f"but character-level comparison revealed a mismatch. "
+            f"{char_error_msg} "
+            f"Refusing to write to prevent incorrect annotations."
+        )
+        raise RuntimeError(error_msg)
+    elif not alignment_acceptable:
+        # Non-strict mode: warn but continue
+        print(
+            f"[flexipipe] WARNING: Token alignment is below threshold (mode: {mode_str}). "
+            f"Matched {matched_sentences}/{total_sentences} sentences ({sentence_match_rate*100:.1f}%) "
+            f"and {matched_tokens}/{total_tokens} tokens ({token_match_rate*100:.1f}%). "
+            f"Proceeding with partial update, but results may be incorrect.",
+            file=sys.stderr
+        )
     
     # Write updated XML
     if preserve_comments:

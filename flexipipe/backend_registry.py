@@ -8,6 +8,7 @@ allowing for dynamic discovery and uniform access patterns.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 import pkgutil
 from importlib import metadata
@@ -18,6 +19,145 @@ from .doc import Document
 from .backend_spec import BackendSpec
 
 logger = logging.getLogger(__name__)
+
+
+def get_backend_status(backend_name: str) -> Dict[str, Any]:
+    """
+    Get detailed status information about a backend, including what's missing.
+    
+    Args:
+        backend_name: Name of the backend to check
+        
+    Returns:
+        Dictionary with keys:
+        - available: bool - whether the backend is fully functional
+        - status: str - "available", "missing_module", "missing_binary", "unknown"
+        - missing: List[str] - list of missing dependencies/requirements
+        - install_hint: str - suggested pip install command
+    """
+    backend_key = backend_name.lower()
+    info = get_backend_info(backend_key)
+    if not info:
+        return {
+            "available": False,
+            "status": "unknown",
+            "missing": [f"Backend '{backend_name}' is not registered"],
+            "install_hint": "",
+        }
+    
+    missing = []
+    status = "available"
+    
+    # REST backends only need requests
+    if info.is_rest:
+        try:
+            if importlib.util.find_spec("requests") is None:
+                missing.append("requests module")
+                status = "missing_module"
+                return {
+                    "available": False,
+                    "status": status,
+                    "missing": missing,
+                    "install_hint": "pip install requests",
+                }
+        except (ImportError, ModuleNotFoundError, ValueError):
+            missing.append("requests module")
+            status = "missing_module"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": "pip install requests",
+            }
+        return {
+            "available": True,
+            "status": "available",
+            "missing": [],
+            "install_hint": "",
+        }
+    
+    # Map backend names to their required Python modules and install hints
+    # Since flexipipe is typically installed via git, we suggest direct module installation
+    # which works regardless of how flexipipe was installed
+    # For git installations with extras, users can use: pip install "git+https://github.com/ufal/flexipipe.git[stanza]"
+    # but direct installation is simpler and always works
+    required_modules = {
+        "stanza": ("stanza", "pip install stanza"),
+        "spacy": ("spacy", "pip install spacy"),
+        "flair": ("flair", "pip install flair"),
+        "transformers": ("transformers", "pip install transformers"),
+        "classla": ("classla", "pip install classla"),
+    }
+    
+    # CLI backends that need binaries
+    cli_backends = {
+        "udpipe1": ("udpipe binary", "Install UDPipe and ensure 'udpipe' is on PATH"),
+        "treetagger": ("tree-tagger binary", "Install TreeTagger and ensure 'tree-tagger' is on PATH"),
+    }
+    
+    # Check for Python module requirements
+    if backend_key in required_modules:
+        module_name, install_hint = required_modules[backend_key]
+        try:
+            if importlib.util.find_spec(module_name) is None:
+                missing.append(f"{module_name} module")
+                status = "missing_module"
+                return {
+                    "available": False,
+                    "status": status,
+                    "missing": missing,
+                    "install_hint": install_hint,
+                }
+        except (ImportError, ModuleNotFoundError, ValueError):
+            missing.append(f"{module_name} module")
+            status = "missing_module"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": install_hint,
+            }
+    
+    # Check for CLI binary requirements
+    if backend_key in cli_backends:
+        binary_name, install_hint = cli_backends[backend_key]
+        import shutil
+        # Check if binary is on PATH
+        binary_cmd = backend_key.replace("1", "")  # udpipe1 -> udpipe
+        if backend_key == "treetagger":
+            binary_cmd = "tree-tagger"
+        if shutil.which(binary_cmd) is None:
+            missing.append(binary_name)
+            status = "missing_binary"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": install_hint,
+            }
+    
+    # For backends without specific requirements (flexitag, etc.)
+    # They're assumed available but may fail at runtime with specific errors
+    return {
+        "available": True,
+        "status": "available",
+        "missing": [],
+        "install_hint": "",
+    }
+
+
+def is_backend_available(backend_name: str) -> bool:
+    """
+    Check if a backend is available (its required modules can be imported).
+    
+    Args:
+        backend_name: Name of the backend to check
+        
+    Returns:
+        True if the backend is available, False otherwise
+    """
+    status = get_backend_status(backend_name)
+    return status["available"]
 
 
 class Backend(Protocol):
@@ -67,6 +207,7 @@ class BackendInfo:
         is_rest: bool = False,
         is_hidden: bool = False,
         factory: Optional[Callable[..., Backend]] = None,
+        url: Optional[str] = None,
     ):
         self.name = name
         self.backend_class = backend_class
@@ -79,6 +220,7 @@ class BackendInfo:
         self.is_rest = is_rest
         self.is_hidden = is_hidden
         self.factory = factory
+        self.url = url
         self.model_registry_url: Optional[str] = None
 
 
@@ -104,6 +246,7 @@ def register_backend_spec(spec: BackendSpec) -> None:
         is_rest=spec.is_rest,
         is_hidden=spec.is_hidden,
         factory=spec.factory,
+        url=spec.url,
     )
     info.model_registry_url = spec.model_registry_url
     register_backend(info)
@@ -304,7 +447,15 @@ def create_backend(
             factory_kwargs.setdefault("model_path", model_path)
         if language is not None:
             factory_kwargs.setdefault("language", language)
-        return info.factory(**factory_kwargs)
+        try:
+            return info.factory(**factory_kwargs)
+        except ImportError as e:
+            # Handle missing module gracefully
+            module_name = str(e).split("'")[1] if "'" in str(e) else "unknown"
+            raise RuntimeError(
+                f"Backend '{backend_type}' requires the '{module_name}' module, but it is not installed. "
+                f"Please install it with: pip install {module_name}"
+            ) from e
     
     if not info.backend_class:
         raise ValueError(f"Backend '{backend_type}' does not have a backend class registered")

@@ -700,6 +700,7 @@ def document_to_conllu(
     create_implicit_mwt: bool = False,
     entity_format: str = "iob",  # "iob" for Entity=B-PER format, "ne" for NE=ORG_3 format
     custom_misc_attrs: Optional[Dict[str, str]] = None,  # Map attr key -> MISC tag name (e.g., {"myattr": "MyTag"})
+    include_tokid: bool = False,  # Force include TokId in MISC (even auto-generated ones)
 ) -> str:
     lines: List[str] = []
 
@@ -732,8 +733,13 @@ def document_to_conllu(
     
     # Document-level attributes: everything in document.attrs (including API attributes)
     # But exclude file-level attributes
+    # Also exclude XML namespace attributes that might cause parsing issues
     for key, value in all_doc_attrs.items():
         if key not in file_level_attrs:
+            # Skip XML namespace attributes (e.g., {http://www.w3.org/XML/1998/namespace}space)
+            # These can cause parsing issues in CoNLL-U comment lines
+            if key.startswith("{") and "namespace" in key:
+                continue
             doc_level_attrs[key] = str(value)
     
     # Output file-level attributes (before newdoc)
@@ -862,7 +868,7 @@ def document_to_conllu(
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
         extra_entities = span_entities.get(sent_idx)
-        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs)
+        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid)
         lines.extend(sentence_lines)
         # Add exactly one empty line after each sentence (required by CoNLL-U format)
         lines.append("")
@@ -887,7 +893,7 @@ def document_to_conllu(
     return result
 
 
-def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None) -> List[str]:
+def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False) -> List[str]:
     lines: List[str] = []
     # Print standard UD sentence attributes
     sent_standard_attrs = sentence.get_standard_attrs()
@@ -1000,13 +1006,14 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
             
             end_id = current_id + len(token.subtokens) - 1
             form = _escape(token.form)
-            misc_range = _format_misc_for_range(space_after_range, token=token)
+            # For MWT range, include TokId if requested (for UDPipe preservation)
+            misc_range = _format_misc_for_range(space_after_range, token=token, include_tokid=include_tokid)
             # MWT range line
             lines.append(f"{current_id}-{end_id}\t{form}\t_\t_\t_\t_\t_\t_\t_\t{misc_range}")
             # Subtokens: no SpaceAfter in MISC (they are not orthographic)
             for sub in token.subtokens:
                 entity_label = token_entity_labels.get(current_id, "")
-                lines.append(_format_token_line(current_id, sub, force_no_space=True, entity_label=entity_label, include_tokid=False, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
+                lines.append(_format_token_line(current_id, sub, force_no_space=True, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
                 current_id += 1
         else:
             # Normal token: derive space from sentence_text or use explicit value
@@ -1033,7 +1040,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
                 space_after_tok = None
             
             entity_label = token_entity_labels.get(current_id, "")
-            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=False, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
+            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
             current_id += 1
 
     return lines
@@ -1188,13 +1195,14 @@ def _format_misc(
     return "|".join(entries) if entries else "_"
 
 
-def _format_misc_for_range(space_after: Optional[bool], token: Optional[Token] = None) -> str:
+def _format_misc_for_range(space_after: Optional[bool], token: Optional[Token] = None, include_tokid: bool = False) -> str:
     """
     Format MISC field for MWT range line.
     
     Args:
         space_after: Whether there's a space after the range
         token: Optional token to extract TokId from
+        include_tokid: Force include TokId even if auto-generated
     """
     entries: List[str] = []
     
@@ -1202,15 +1210,15 @@ def _format_misc_for_range(space_after: Optional[bool], token: Optional[Token] =
     if space_after is not None and not space_after:
         entries.append("SpaceAfter=No")
     
-    # Add TokId if token has one (and it's not auto-generated)
+    # Add TokId if token has one
     if token:
         tokid = getattr(token, "tokid", "")
         if tokid and tokid != "_":
             # Check if tokid matches the auto-generated pattern s{num}-t{num}
             import re
             is_auto_generated = bool(re.match(r'^s\d+-t\d+$', tokid))
-            # Include if it's not auto-generated (came from input)
-            if not is_auto_generated:
+            # Include if explicitly requested, or if it's not auto-generated (came from input)
+            if include_tokid or not is_auto_generated:
                 entries.append(f"TokId={tokid}")
     
     if not entries:

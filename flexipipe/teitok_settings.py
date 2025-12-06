@@ -88,7 +88,10 @@ class TeitokSettings:
         self.flexipipe_preferences: Dict[str, Dict[str, str]] = {}
         self.known_tags_only: bool = False
         self.use_raw_text: bool = False
+        self.download_model: bool = False
         self.defined_token_attributes: Set[str] = set()
+        self.form_hierarchy: Dict[str, Optional[str]] = {}  # form_name -> parent_form_name (None for base)
+        self.default_form: str = "form"  # Default form attribute name
     
     @classmethod
     def load(cls, settings_path: Path) -> TeitokSettings:
@@ -283,6 +286,34 @@ class TeitokSettings:
         for key, value in xmlfiles_elem.attrib.items():
             if key != "language":
                 self.xmlfile_defaults[key] = value
+                # Check for defaultform attribute
+                if key == "defaultform":
+                    self.default_form = value
+        
+        # Parse forms hierarchy from <pattributes><forms>
+        pattributes_elem = xmlfiles_elem.find("pattributes")
+        if pattributes_elem is not None:
+            forms_elem = pattributes_elem.find("forms")
+            if forms_elem is not None:
+                # Build form hierarchy: form_name -> parent_form_name
+                # Base form (pform) has no parent (None)
+                form_items = {}
+                for item_elem in forms_elem.findall("item"):
+                    form_key = item_elem.get("key")
+                    if form_key:
+                        inherit_from = item_elem.get("inherit")
+                        form_items[form_key] = inherit_from
+                
+                # Build hierarchy: resolve inheritance chain
+                # pform is the base (no inherit attribute, or explicitly set to None)
+                # For each form, trace back to find the base
+                self.form_hierarchy = {}
+                for form_name, inherit_from in form_items.items():
+                    if inherit_from:
+                        self.form_hierarchy[form_name] = inherit_from
+                    else:
+                        # No inherit means this is a base form (like pform)
+                        self.form_hierarchy[form_name] = None
         
         # Parse child elements as defaults
         for child in xmlfiles_elem:
@@ -355,6 +386,27 @@ class TeitokSettings:
                 text_value = (raw_text_elem.text or raw_text_elem.get("value") or "").strip().lower()
                 if text_value in TRUTHY_VALUES:
                     self.use_raw_text = True
+        
+        # download-model
+        download_model_value = (
+            flexipipe_elem.get("download-model")
+            or flexipipe_elem.get("download_model")
+            or flexipipe_elem.get("downloadModel")
+        )
+        if download_model_value:
+            if download_model_value.strip().lower() in TRUTHY_VALUES:
+                self.download_model = True
+        else:
+            download_model_elem = (
+                flexipipe_elem.find("download-model")
+                or flexipipe_elem.find("download_model")
+                or flexipipe_elem.find("./options/download-model")
+                or flexipipe_elem.find("./options/download_model")
+            )
+            if download_model_elem is not None:
+                text_value = (download_model_elem.text or download_model_elem.get("value") or "").strip().lower()
+                if text_value in TRUTHY_VALUES:
+                    self.download_model = True
         
         def _store_pref(lang_key: Optional[str], backend: Optional[str], model: Optional[str]) -> None:
             if not lang_key:

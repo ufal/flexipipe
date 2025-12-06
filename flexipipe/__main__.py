@@ -646,10 +646,23 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
     
     if output_format == "json":
         import json
+        from .model_storage import is_model_installed
+        from .backend_registry import get_backend_info
         models_data = []
         backends_seen: set[str] = set()
         for backend, model_name, entry in matches:
             backends_seen.add(backend)
+            # Check if model is installed (skip REST backends)
+            installed = None
+            backend_info = get_backend_info(backend)
+            is_rest_backend = backend_info and backend_info.is_rest if backend_info else False
+            if not is_rest_backend:
+                try:
+                    installed = is_model_installed(backend, model_name)
+                except Exception:
+                    # If check fails, leave as None
+                    pass
+            
             model_info = {
                 "backend": backend,
                 "model": model_name,
@@ -661,6 +674,9 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
                 "description": entry.get("description"),
                 "package": entry.get("package"),
             }
+            # Add installed status if available
+            if installed is not None:
+                model_info["installed"] = installed
             # Remove None values
             model_info = {k: v for k, v in model_info.items() if v is not None}
             models_data.append(model_info)
@@ -682,14 +698,29 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
         print(f"\nModels matching language '{language}':")
     else:
         print(f"\nAll available models:")
-    print(f"{'Backend':<10} {'Model':<35} {'ISO':<6} {'Language':<20} {'Details'}")
-    print("=" * 120)
+    print(f"{'Backend':<10} {'Model':<35} {'ISO':<6} {'Language':<20} {'Installed':<10} {'Details'}")
+    print("=" * 130)
 
+    from .model_storage import is_model_installed
+    from .backend_registry import get_backend_info
     backends_seen: set[str] = set()
     for backend, model_name, entry in matches:
         backends_seen.add(backend)
         iso = (entry.get(LANGUAGE_FIELD_ISO) or "-")[:6]
         lang_name = entry.get(LANGUAGE_FIELD_NAME) or entry.get("language_display") or "-"
+        
+        # Check if model is installed (skip REST backends)
+        installed_str = "-"
+        backend_info = get_backend_info(backend)
+        is_rest_backend = backend_info and backend_info.is_rest if backend_info else False
+        if not is_rest_backend:
+            try:
+                installed = is_model_installed(backend, model_name)
+                installed_str = "✓ Yes" if installed else "✗ No"
+            except Exception:
+                # If check fails, leave as "-"
+                pass
+        
         details_parts: list[str] = []
         
         # Show preferred flag if available
@@ -713,7 +744,7 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
         if package:
             details_parts.append(f"package={package}")
         details_str = "; ".join(details_parts) if details_parts else ""
-        print(f"{backend:<10} {model_name:<35} {iso:<6} {lang_name:<20} {details_str}")
+        print(f"{backend:<10} {model_name:<35} {iso:<6} {lang_name:<20} {installed_str:<10} {details_str}")
 
     if used_fuzzy:
         print("\nNote: matches were found using fuzzy language matching.")
@@ -787,12 +818,19 @@ def _auto_select_model_for_language(
     language = getattr(args, "language", None)
     if not language:
         return backend_type
+    # If both backend and model are already set (e.g., from settings.xml), don't override
+    if getattr(args, "model", None) and backend_type and backend_locked:
+        return backend_type
     if getattr(args, "model", None):
         return backend_type
     if getattr(args, "params", None) and (not backend_type or backend_type.lower() == "flexitag"):
         return backend_type
     if backend_type and backend_type.lower() == "spacy" and backend_locked:
         return backend_type
+    # If backend is locked but no model found yet, only search in that backend
+    if backend_locked and backend_type:
+        # Don't search other backends, but we still need to find a model for the locked backend
+        pass
 
     requested_backend = None
     if backend_type:
@@ -809,6 +847,10 @@ def _auto_select_model_for_language(
         backend_priority = _get_language_backend_priority()
         remaining = [b for b in backend_priority if b not in search_order and b not in excluded]
     combined_order = search_order + remaining
+    
+    # If backend is locked and we have a model, skip all the registry fetching
+    if backend_locked and backend_type and getattr(args, "model", None):
+        return backend_type
 
     def _load_backend_entries_for_order(
         order: Collection[str],
@@ -834,6 +876,33 @@ def _auto_select_model_for_language(
         return entries_map
 
     def ensure_entries(order: list[str]) -> dict[str, dict]:
+        # If backend is locked and we only have one backend in order, only fetch for that one
+        if backend_locked and len(order) == 1:
+            backend = order[0]
+            entries_map: dict[str, dict] = {}
+            # Try unified catalog first
+            try:
+                from .model_catalog import build_unified_catalog
+                catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                for entry in catalog.values():
+                    if entry.get("backend") == backend:
+                        model_name = entry.get("model")
+                        if model_name:
+                            entries_map.setdefault(backend, {})
+                            entries_map[backend][model_name] = entry
+            except Exception:
+                pass
+            
+            # Only fetch for this specific backend if needed
+            if backend not in entries_map or not entries_map.get(backend):
+                entries_map.update(_load_backend_entries_for_order([backend], refresh=False))
+                if not entries_map.get(backend):
+                    entries_map.update(_load_backend_entries_for_order([backend], refresh=True))
+            else:
+                entries_map.setdefault(backend, {})
+            return entries_map
+        
+        # Original logic for multiple backends
         entries_map: dict[str, dict] = {}
         # Try unified catalog first
         try:
@@ -884,6 +953,16 @@ def _auto_select_model_for_language(
 
         matches.sort(key=sort_key)
         for backend, model_name, entry in matches:
+            # If backend is locked, only check the requested backend (skip availability check for others)
+            if backend_locked and requested_backend and backend != requested_backend:
+                continue
+            # Skip backends that aren't available (missing required modules)
+            from .backend_registry import is_backend_available
+            if not is_backend_available(backend):
+                if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                    print(f"[flexipipe] Skipping backend '{backend}' (required module not available)", file=sys.stderr)
+                continue
+            # Skip spacy if model isn't available (unless backend is locked)
             if backend == "spacy" and not backend_locked and not _spacy_model_available(model_name):
                 continue
             return backend, entry
@@ -913,11 +992,14 @@ def _auto_select_model_for_language(
     if backend_locked and requested_backend and chosen_backend != requested_backend:
             return backend_type
 
+    # Prefer ISO code over language name (language names may include incorrect treebank names like "English (EWT)")
     entry_language = (
-        entry.get("language_name")
-        or entry.get("language_iso")
+        entry.get("language_iso")
+        or entry.get("language_name")
         or language
     )
+    # For display, use ISO code if available, otherwise use language name
+    display_language = entry.get("language_iso") or entry_language
 
     def _log_selection(selected_backend: str, selected_model: Optional[str]) -> None:
         if not getattr(args, "verbose", False):
@@ -925,7 +1007,7 @@ def _auto_select_model_for_language(
         message = f"[flexipipe] Auto-selected backend '{selected_backend}'"
         if selected_model:
             message += f" model '{selected_model}'"
-        message += f" for language '{entry_language}'."
+        message += f" for language '{display_language}'."
         print(message)
 
     if chosen_backend == "spacy":
@@ -1006,8 +1088,9 @@ def _document_to_plain_text(document: Document) -> str:
 
 
 def _print_detected_language(result: Dict[str, Any]) -> None:
-    name = result.get("language_name") or result.get("label") or "unknown"
+    # Always prefer ISO code - language names may be incorrect (e.g., include treebank names like "English (EWT)")
     iso = result.get("language_iso") or result.get("label") or "unknown"
+    name = result.get("language_name") or result.get("label") or "unknown"
     confidence = result.get("confidence")
     conf_str = f"{confidence:.2%}" if confidence is not None else "n/a"
     detector = result.get("detector")
@@ -1015,7 +1098,11 @@ def _print_detected_language(result: Dict[str, Any]) -> None:
         from .model_storage import get_language_detector as _get_detector
 
         detector = _get_detector() or LANGUAGE_DETECTOR_DEFAULT
-    print(f"[flexipipe] Detected language ({detector}): {name} ({iso}, confidence {conf_str})")
+    # Show ISO code first (primary identifier), then name in parentheses only if different
+    if name != iso and name != "unknown":
+        print(f"[flexipipe] Detected language ({detector}): {iso} ({name}, confidence {conf_str})")
+    else:
+        print(f"[flexipipe] Detected language ({detector}): {iso}, confidence {conf_str}")
 
 
 def _detect_language_from_text(
@@ -2036,6 +2123,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt before installing optional extras when auto-install is disabled (true or false)",
     )
     config_parser.add_argument(
+        "--set-default-download-model",
+        type=_str_to_bool,
+        metavar="true|false",
+        help="Set whether to automatically download missing models by default (true or false)",
+    )
+    config_parser.add_argument(
         "--wizard",
         action="store_true",
         help="Run interactive configuration wizard",
@@ -2058,7 +2151,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     
     # train ---------------------------------------------------------------
-    train_parser = subparsers.add_parser("train", help="Train a model from training data")
+    train_parser = subparsers.add_parser("train", help="Train a model from training data", parents=[parent_parser])
     add_logging_args(train_parser)
     train_parser.add_argument(
         "--backend",
@@ -2100,8 +2193,81 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--finetune",
         choices=["none", "accuracy", "speed", "balanced"],
-        default="balanced",
-        help="Run a lightweight grid search over tagger settings (accuracy, speed, balanced, or none; default: balanced, for flexitag backend)",
+        default="none",
+        help="Run a lightweight grid search over tagger settings (accuracy, speed, balanced, or none; default: none). Available for flexitag and fastText backends.",
+    )
+    train_parser.add_argument(
+        "--finetune-max-evals",
+        type=int,
+        default=50,
+        help="Maximum number of hyperparameter evaluations during finetuning (default: 50, for fastText backend)",
+    )
+    # fastText-specific hyperparameters
+    train_parser.add_argument(
+        "--epoch",
+        type=int,
+        default=30,
+        help="Number of training epochs (default: 30, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.5,
+        help="Learning rate (default: 0.5, for fastText backend). Note: fastText uses higher learning rates (0.1-1.0) than deep neural networks because it's based on word2vec/skip-gram architecture. Typical range: 0.1-0.7. Lower values (0.01-0.1) may work for fine-tuning.",
+    )
+    train_parser.add_argument(
+        "--word-ngrams",
+        type=int,
+        default=3,
+        help="Word n-gram order (default: 3, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--minn",
+        type=int,
+        default=3,
+        help="Minimum character n-gram length (default: 3, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--maxn",
+        type=int,
+        default=6,
+        help="Maximum character n-gram length (default: 6, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--dim",
+        type=int,
+        default=200,
+        help="Dimension of word vectors (default: 200, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--context-window",
+        type=int,
+        default=2,
+        help="Context window size for token-level predictions (default: 2, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--min-count",
+        type=int,
+        default=1,
+        help="Minimum word count threshold (default: 1, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--min-count-label",
+        type=int,
+        default=1,
+        help="Minimum label count threshold (default: 1, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--lr-warmup",
+        type=int,
+        default=0,
+        help="Number of warmup epochs with lower learning rate (default: 0, disabled, for fastText backend)",
+    )
+    train_parser.add_argument(
+        "--lr-warmup-ratio",
+        type=float,
+        default=0.1,
+        help="Learning rate ratio during warmup (default: 0.1, i.e., 10%% of full lr, for fastText backend)",
     )
     train_parser.add_argument(
         "--nlpform",
@@ -2320,10 +2486,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="List of backend names to benchmark (e.g., flexitag spacy stanza), or 'all' for all available",
     )
     benchmark_parser.add_argument(
+        "--backend",
+        help="Backend name for --test command (alternative to --backends). Example: --backend spacy",
+    )
+    benchmark_parser.add_argument(
         "--models",
         action="append",
         metavar="BACKEND=MODEL",
         help="Backend-to-model mapping (repeatable). Example: --models spacy=es_core_news_sm",
+    )
+    benchmark_parser.add_argument(
+        "--model",
+        help="Model name for --test command (alternative to --models BACKEND=MODEL). Example: --model en_core_news_sm",
     )
     benchmark_parser.add_argument(
         "--treebank",
@@ -2968,7 +3142,7 @@ def _prepare_spacy_model_if_needed(args: argparse.Namespace) -> None:
 
 def run_tag(args: argparse.Namespace) -> int:
     # Apply defaults from config if not specified
-    from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback
+    from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model
     
     backend_type = args.backend
     if backend_type:
@@ -3437,7 +3611,9 @@ def run_tag(args: argparse.Namespace) -> int:
             # Store detected language in document.meta
             if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
                 doc.meta["language"] = detection_result["language"]
-                args.language = detection_result.get("language") or detection_result.get("language_iso")
+                # Prefer language_iso for settings.xml matching (e.g., "en" instead of "English (EWT)")
+                detected_lang = detection_result.get("language_iso") or detection_result.get("language")
+                args.language = detected_lang
         else:
             detection_attempted = True
         
@@ -3445,29 +3621,65 @@ def run_tag(args: argparse.Namespace) -> int:
         if getattr(args, "language", None):
             doc.meta["language"] = args.language
 
+    # Apply settings.xml preferences BEFORE auto-selection, but only if not overridden by CLI
+    # Priority: CLI arguments > settings.xml > auto-selection
     if teitok_settings_obj and getattr(args, "language", None):
+        # Try to get preference using the language as-is, and also try extracting ISO code
+        from .language_utils import resolve_language_query
+        lang_query = resolve_language_query(args.language)
+        lang_iso = lang_query.get("raw_normalized") or lang_query.get("iso", set())
+        if isinstance(lang_iso, set) and lang_iso:
+            lang_iso = next(iter(lang_iso))
+        
+        # Try both the full language string and the ISO code
         pref = teitok_settings_obj.get_flexipipe_preference(args.language)
+        if not pref and lang_iso and lang_iso != args.language:
+            pref = teitok_settings_obj.get_flexipipe_preference(lang_iso)
+        
+        if args.verbose or args.debug:
+            print(f"[flexipipe] Checking settings.xml preferences for language '{args.language}' (ISO: {lang_iso}): {pref}", file=sys.stderr)
         if pref:
             pref_backend = pref.get("backend")
             pref_model = pref.get("model")
+            # Only apply settings.xml backend if not explicitly set via CLI
             if pref_backend and not getattr(args, "_backend_explicit", False):
                 args.backend = pref_backend
                 backend_type = pref_backend
                 setattr(args, "_backend_explicit", True)
+                setattr(args, "_settings_xml_backend_set", True)
                 if args.verbose or args.debug:
-                    print(f"[flexipipe] Using preferred backend '{pref_backend}' for language '{args.language}'", file=sys.stderr)
+                    print(f"[flexipipe] Using preferred backend '{pref_backend}' for language '{args.language}' from settings.xml", file=sys.stderr)
+            elif pref_backend and (args.verbose or args.debug):
+                print(f"[flexipipe] Settings.xml specifies backend '{pref_backend}' but CLI argument overrides it", file=sys.stderr)
+            # Only apply settings.xml model if not explicitly set via CLI
             if pref_model and not getattr(args, "model", None):
                 args.model = pref_model
                 if args.verbose or args.debug:
-                    print(f"[flexipipe] Using preferred model '{pref_model}' for language '{args.language}'", file=sys.stderr)
+                    print(f"[flexipipe] Using preferred model '{pref_model}' for language '{args.language}' from settings.xml", file=sys.stderr)
+        elif (args.verbose or args.debug) and teitok_settings_obj:
+            print(f"[flexipipe] No settings.xml preferences found for language '{args.language}'", file=sys.stderr)
 
     if args.test:
         args.writeback = True
 
-    if not auto_selected:
+    # Only auto-select if backend and model aren't already set (e.g., from settings.xml)
+    # Skip auto-selection if:
+    # 1. Backend is explicitly set (from CLI or settings.xml) - always skip if backend is set
+    # 2. Settings.xml set a backend (even if model isn't set yet)
+    backend_explicit = getattr(args, "_backend_explicit", False)
+    model_set = bool(getattr(args, "model", None))
+    settings_xml_backend_set = getattr(args, "_settings_xml_backend_set", False)
+    # Skip auto-selection if backend is explicitly set (CLI or settings.xml)
+    skip_auto_select = backend_explicit or settings_xml_backend_set
+    
+    if not auto_selected and not skip_auto_select:
         backend_type = _auto_select_model_for_language(args, backend_type)
         args.backend = backend_type
         auto_selected = True
+    elif skip_auto_select and (args.verbose or args.debug):
+        print(f"[flexipipe] Skipping auto-selection (backend explicitly set: {backend_explicit}, model set: {model_set}, settings.xml backend: {settings_xml_backend_set})", file=sys.stderr)
+        if backend_type:
+            print(f"[flexipipe] Using backend: {backend_type}", file=sys.stderr)
 
     # Apply normalization strategy for NLP components if requested
     if getattr(args, "nlpform", "form") != "form":
@@ -3511,12 +3723,21 @@ def run_tag(args: argparse.Namespace) -> int:
         backend_kwargs: dict[str, object] = {}
 
         while True:
-            backend_type = getattr(args, "backend", backend_type)
+            # Always use args.backend if set (from CLI, settings.xml, or auto-selection)
+            # This ensures settings.xml preferences are respected
+            backend_type = args.backend or backend_type
             backend_kwargs = {}
 
             if backend_type and backend_type != "flexitag":
                 backend_type_lower = backend_type.lower()
-                backend_kwargs["download_model"] = bool(getattr(args, "download_model", False))
+                # Precedence: CLI > TEITOK settings > config default
+                download_model_explicit = hasattr(args, "download_model") and args.download_model is not None
+                if download_model_explicit:
+                    backend_kwargs["download_model"] = bool(args.download_model)
+                elif teitok_settings_obj and teitok_settings_obj.download_model:
+                    backend_kwargs["download_model"] = True
+                else:
+                    backend_kwargs["download_model"] = get_default_download_model()
                 if backend_type_lower == "stanza":
                     backend_kwargs["enable_wsd"] = bool(getattr(args, "stanza_wsd", False))
                     backend_kwargs["enable_sentiment"] = bool(getattr(args, "stanza_sentiment", False))
@@ -3550,7 +3771,14 @@ def run_tag(args: argparse.Namespace) -> int:
                         backend_kwargs["type"] = classla_type_parsed
                     if classla_model:
                         backend_kwargs["model_name"] = classla_model
-                    backend_kwargs["download_model"] = bool(getattr(args, "download_model", False))
+                    # Precedence: CLI > TEITOK settings > config default
+                    download_model_explicit = hasattr(args, "download_model") and args.download_model is not None
+                    if download_model_explicit:
+                        backend_kwargs["download_model"] = bool(args.download_model)
+                    elif teitok_settings_obj and teitok_settings_obj.download_model:
+                        backend_kwargs["download_model"] = True
+                    else:
+                        backend_kwargs["download_model"] = get_default_download_model()
                 elif backend_type_lower == "transformers":
                     if not getattr(args, "model", None):
                         print("[flexipipe] Transformers backend requires --model to specify a HuggingFace model.", file=sys.stderr)
@@ -3584,7 +3812,6 @@ def run_tag(args: argparse.Namespace) -> int:
 
             try:
                 _prepare_spacy_model_if_needed(args)
-                break
             except SystemExit as exc:
                 backend_type_lower = backend_type.lower() if backend_type else None
                 backend_locked = bool(getattr(args, "_backend_explicit", False))
@@ -3614,44 +3841,43 @@ def run_tag(args: argparse.Namespace) -> int:
                         continue
                 raise
 
-        if backend_type and backend_type != "flexitag":
-            # Check if we need flexitag fallback (use_neural_primary means neural is primary, flexitag is fallback)
-            needs_flexitag_fallback = getattr(args, 'use_neural_primary', False)
-            if not needs_flexitag_fallback:
-                # Neural backend only, no flexitag fallback
-                from .backend_registry import create_backend
-                
-                # Resolve flexitag model path if needed for fallback (from --model, not --params)
-                flexitag_model_path = None
-                
-                # Extract Stanza-specific args if present
-                stanza_lang = backend_kwargs.pop("language", None)
-                stanza_pkg = backend_kwargs.pop("package", None)
-                stanza_model = backend_kwargs.pop("model_name", None)
-                
-                # Build create_backend arguments
-                create_kwargs = dict(backend_kwargs)
-                model_name = getattr(args, "model", None)
-                language = getattr(args, "language", None)
-                
-                if backend_type_lower == "stanza":
-                    create_kwargs["package"] = stanza_pkg
-                    create_kwargs["language"] = stanza_lang
-                    create_kwargs["model_name"] = stanza_model
-                elif backend_type_lower == "udpipe1":
-                    # For udpipe1, pass model directly (not model_name or model_path)
-                    if model_name:
-                        create_kwargs["model"] = model_name
-                    create_kwargs.pop("model_name", None)
-                    create_kwargs.pop("model_path", None)
-                else:
-                    create_kwargs["model_name"] = model_name
-                    if backend_type_lower == "flair":
-                        create_kwargs["language"] = language or "en"
+            if backend_type and backend_type != "flexitag":
+                # Check if we need flexitag fallback (use_neural_primary means neural is primary, flexitag is fallback)
+                needs_flexitag_fallback = getattr(args, 'use_neural_primary', False)
+                if not needs_flexitag_fallback:
+                    # Neural backend only, no flexitag fallback
+                    from .backend_registry import create_backend
+                    
+                    # Resolve flexitag model path if needed for fallback (from --model, not --params)
+                    flexitag_model_path = None
+                    
+                    # Extract Stanza-specific args if present
+                    stanza_lang = backend_kwargs.pop("language", None)
+                    stanza_pkg = backend_kwargs.pop("package", None)
+                    stanza_model = backend_kwargs.pop("model_name", None)
+                    
+                    # Build create_backend arguments
+                    create_kwargs = dict(backend_kwargs)
+                    model_name = getattr(args, "model", None)
+                    language = getattr(args, "language", None)
+                    
+                    if backend_type_lower == "stanza":
+                        create_kwargs["package"] = stanza_pkg
+                        create_kwargs["language"] = stanza_lang
+                        create_kwargs["model_name"] = stanza_model
+                    elif backend_type_lower == "udpipe1":
+                        # For udpipe1, pass model directly (not model_name or model_path)
+                        if model_name:
+                            create_kwargs["model"] = model_name
+                        create_kwargs.pop("model_name", None)
+                        create_kwargs.pop("model_path", None)
                     else:
-                        create_kwargs["language"] = language if not model_name else None
-                
-                try:
+                        create_kwargs["model_name"] = model_name
+                        if backend_type_lower == "flair":
+                            create_kwargs["language"] = language or "en"
+                        else:
+                            create_kwargs["language"] = language if not model_name else None
+                    
                     # Only pass verbose to backends that support it (stanza, flair, udpipe1)
                     backend_kwargs_final = dict(create_kwargs)
                     if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy"):
@@ -3662,147 +3888,159 @@ def run_tag(args: argparse.Namespace) -> int:
                     if backend_type_lower != "udpipe1":
                         model_path_arg = model_name if model_name and Path(model_name).exists() else None
                     
-                    neural_backend = create_backend(
-                        backend_type,
-                        training=False,
-                        model_path=model_path_arg,
-                        **backend_kwargs_final,
-                    )
-                    if backend_type_lower == "spacy" and not getattr(args, "model", None):
-                        auto_model = getattr(neural_backend, "auto_model", None)
-                        if auto_model:
-                            setattr(args, "model", auto_model)
-                            model_name = auto_model
-                except (ValueError, FileNotFoundError, RuntimeError) as e:
-                    print(f"[flexipipe] {e}", file=sys.stderr)
-                    return 1
-                # For raw text input, use raw text mode to let backend do its own tokenization
-                # For other formats (conllu, teitok), use tokenized mode to preserve existing tokenization
-                # Exception: if text was extracted from TEITOK XML with --tokenize, treat as raw text
-                # Or if --use-raw-text is explicitly set (CLI flag), force raw text mode
-                # Or if use_raw_text is set in TEITOK settings.xml, use that (unless CLI flag overrides)
-                is_extracted_text = doc.meta.get("original_input_path") is not None
-                use_raw_text = (
-                    getattr(args, "use_raw_text", False) or  # CLI flag (highest priority)
-                    (teitok_settings_obj and teitok_settings_obj.use_raw_text) or  # Settings.xml
-                    (input_format == "raw" and not getattr(args, "pretokenize", False)) or
-                    (is_extracted_text and not getattr(args, "pretokenize", False))
-                )
-                if backend_type_lower == "udmorph":
-                    use_raw_text = True
-                try:
                     if args.verbose or args.debug:
-                        components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
-                        print(f"[flexipipe] Running backend '{backend_type}' with components: {components_str}", file=sys.stderr)
-                    neural_result = neural_backend.tag(
-                        doc,
-                        use_raw_text=use_raw_text,
-                        components=neural_components,
-                    )
-                    if args.verbose or args.debug:
-                        sent_count = len(neural_result.document.sentences)
-                        tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
-                        print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
-                except (ValueError, FileNotFoundError, RuntimeError) as e:
-                    print(f"[flexipipe] {e}", file=sys.stderr)
-                    return 1
-                from .engine import FlexitagResult
-                result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
-                _propagate_sentence_metadata(result.document, doc)
-                _propagate_token_ids(result.document, doc)
-                
-                # Track backend used
-                if "_backends_used" not in result.document.meta:
-                    result.document.meta["_backends_used"] = []
-                result.document.meta["_backends_used"].append(backend_type_lower)
-                
-                # Determine model string for backend
-                display_backend = backend_type_lower.upper()
-                backend_descriptor = getattr(neural_backend, "model_descriptor", None)
-                if backend_type_lower == "spacy":
-                    if model_name and Path(model_name).exists():
-                        model_display = Path(model_name).name
-                    elif model_name:
-                        model_display = model_name
-                    elif language:
-                        model_display = f"{language} (blank)"
-                    else:
-                        model_display = backend_descriptor or "unknown"
-                elif backend_type_lower == "nametag":
-                    # For NameTag, if a specific model/language is set, show it; otherwise just show the version
-                    backend_model = getattr(neural_backend, "model", None)
-                    backend_language = getattr(neural_backend, "language", None)
-                    if backend_model:
-                        model_str = f"{display_backend}: {backend_model}"
-                    elif backend_language:
-                        model_str = f"{display_backend}: {backend_language}"
-                    else:
-                        # No specific model - just show the version (e.g., "NameTag3")
-                        model_str = backend_descriptor or f"NameTag{getattr(neural_backend, 'version', '3')}"
-                else:
-                    model_display = model_name or backend_descriptor or "unknown"
-                    model_str = f"{display_backend}: {model_display}"
-            else:
-                # Use pipeline with non-flexitag backend
-                from .pipeline import FlexiPipeline, PipelineConfig
-                from .backend_registry import create_backend
-                
-                model_name = getattr(args, "model", None)
-                language = getattr(args, "language", None)
-                
-                try:
-                    # Only pass verbose to backends that support it (stanza, flair)
-                    create_kwargs = dict(backend_kwargs)
-                    if backend_type.lower() in ("stanza", "flair"):
-                        create_kwargs["verbose"] = args.verbose or args.debug
+                        print(f"[flexipipe] Creating backend: {backend_type} (model: {model_name or 'auto'})", file=sys.stderr)
                     
-                    neural_backend = create_backend(
-                        backend_type,
-                        training=False,
-                        model_name=model_name,
-                        model_path=model_name if model_name and Path(model_name).exists() else None,
-                        language=language if not model_name else None,
-                        **create_kwargs,
-                    )
+                    try:
+                        neural_backend = create_backend(
+                            backend_type,
+                            training=False,
+                            model_path=model_path_arg,
+                            **backend_kwargs_final,
+                        )
+                    except (ImportError, RuntimeError) as exc:
+                        # Backend not available (missing module) - try to find an alternative
+                        backend_locked = bool(getattr(args, "_backend_explicit", False))
+                        if not backend_locked:
+                            # Only fallback if backend wasn't explicitly requested
+                            error_msg = str(exc)
+                            if "requires the" in error_msg and "module" in error_msg:
+                                # Missing module - try alternative backend
+                                excluded_backends.add(backend_type_lower)
+                                fallback_backend = _auto_select_model_for_language(
+                                    args,
+                                    None,
+                                    exclude_backends=excluded_backends,
+                                )
+                                if fallback_backend and fallback_backend.lower() not in excluded_backends:
+                                    print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                                    print(
+                                        f"[flexipipe] Falling back to backend '{fallback_backend}' "
+                                        f"because '{backend_type}' is not available.",
+                                        file=sys.stderr
+                                    )
+                                    backend_type = fallback_backend
+                                    backend_type_lower = backend_type.lower()
+                                    args.backend = fallback_backend
+                                    # Retry with fallback backend
+                                    continue
+                        # If backend was explicitly requested or no fallback found, raise the error
+                        raise
+                    except (ValueError, FileNotFoundError, RuntimeError) as e:
+                        error_msg = str(e)
+                        # Check if language detection was attempted and failed
+                        if detection_attempted and detection_result is None and not getattr(args, "language", None):
+                            # Language detection failed - enhance the error message
+                            if "requires" in error_msg and ("model" in error_msg or "language" in error_msg):
+                                print(
+                                    "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
+                                    "Please provide --language or --model explicitly.",
+                                    file=sys.stderr
+                                )
+                        print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                        return 1
+                    
                     if backend_type_lower == "spacy" and not getattr(args, "model", None):
                         auto_model = getattr(neural_backend, "auto_model", None)
                         if auto_model:
                             setattr(args, "model", auto_model)
                             model_name = auto_model
-                except (ValueError, RuntimeError) as e:
-                    # Print clean error message for missing models
-                    print(f"[flexipipe] {e}", file=sys.stderr)
-                    return 1
-                
-                # use_neural_primary removed - neural backend only
-                # This code path should not be reached anymore, but kept for safety
-                raise RuntimeError("Hybrid neural/flexitag mode no longer supported. Use neural backend only.")
-                pipeline = FlexiPipeline(config)
-                result = pipeline.process(doc)
-                _propagate_sentence_metadata(result.document, doc)
-                _propagate_token_ids(result.document, doc)
-                
-                # Determine model string for hybrid pipeline
-                backend_type_lower = backend_type.lower()
-                display_backend = backend_type_lower.upper()
-                backend_descriptor = getattr(neural_backend, "model_descriptor", None)
-                if backend_type_lower == "spacy":
-                    if model_name and Path(model_name).exists():
-                        neural_model_name = Path(model_name).name
-                    elif model_name:
-                        neural_model_name = model_name
-                    elif language:
-                        neural_model_name = f"{language} (blank)"
-                    else:
-                        neural_model_name = backend_descriptor or "unknown"
+                    # Successfully created backend - break out of loop
+                    break
                 else:
-                    neural_model_name = model_name or backend_descriptor or "unknown"
-                flexitag_model_name = Path(flexitag_model_path).name if flexitag_model_path else None
-                if flexitag_model_name:
-                    model_str = f"{display_backend}: {neural_model_name}, FLEXITAG: {flexitag_model_name}"
+                    # Needs flexitag fallback - break to continue with flexitag setup
+                    break
+            else:
+                # No backend needed or flexitag - break out of loop
+                break
+
+        # After loop, continue with backend usage (neural_backend should be set if we got here)
+        if backend_type and backend_type != "flexitag":
+            # For raw text input, use raw text mode to let backend do its own tokenization
+            # For other formats (conllu, teitok), use tokenized mode to preserve existing tokenization
+            # Exception: if text was extracted from TEITOK XML with --tokenize, treat as raw text
+            # Or if --use-raw-text is explicitly set (CLI flag), force raw text mode
+            # Or if use_raw_text is set in TEITOK settings.xml, use that (unless CLI flag overrides)
+            # CRITICAL: For TEITOK files with existing tokens, we MUST use pretokenized mode
+            # to preserve tokenization and prevent misalignment with XML nodes
+            is_extracted_text = doc.meta.get("original_input_path") is not None
+            has_existing_tokens = (
+                input_format == "teitok" and not is_extracted_text and
+                any(sent.tokens for sent in doc.sentences)
+            )
+            # CLI flag has highest priority, but if TEITOK file has tokens, warn if trying to use raw text
+            use_raw_text_cli = getattr(args, "use_raw_text", False)
+            if use_raw_text_cli and has_existing_tokens:
+                print(
+                    "[flexipipe] WARNING: --use-raw-text is set but TEITOK file has existing tokens. "
+                    "The backend will retokenize the text, which may cause token misalignment with existing XML tokens. "
+                    "The character-level alignment check will verify correctness before writing.",
+                    file=sys.stderr
+                )
+            use_raw_text = (
+                use_raw_text_cli or  # CLI flag (highest priority, but warned above if problematic)
+                (teitok_settings_obj and teitok_settings_obj.use_raw_text and not has_existing_tokens) or  # Settings.xml (only if no existing tokens)
+                (input_format == "raw" and not getattr(args, "pretokenize", False)) or
+                (is_extracted_text and not getattr(args, "pretokenize", False))
+            )
+            if backend_type_lower == "udmorph":
+                use_raw_text = True
+            try:
+                if args.verbose or args.debug:
+                    components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
+                    mode_str = "raw text" if use_raw_text else "pretokenized"
+                    print(f"[flexipipe] Running backend '{backend_type}' with components: {components_str} (mode: {mode_str})", file=sys.stderr)
+                neural_result = neural_backend.tag(
+                    doc,
+                    use_raw_text=use_raw_text,
+                    components=neural_components,
+                )
+                # Store whether this was processed from raw text for alignment verification
+                neural_result.document.meta["_processed_from_raw_text"] = use_raw_text
+                if args.verbose or args.debug:
+                    sent_count = len(neural_result.document.sentences)
+                    tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
+                    print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
+            except (ValueError, FileNotFoundError, RuntimeError) as e:
+                print(f"[flexipipe] {e}", file=sys.stderr)
+                return 1
+            from .engine import FlexitagResult
+            result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
+            _propagate_sentence_metadata(result.document, doc)
+            _propagate_token_ids(result.document, doc)
+            
+            # Track backend used
+            if "_backends_used" not in result.document.meta:
+                result.document.meta["_backends_used"] = []
+            result.document.meta["_backends_used"].append(backend_type_lower)
+            
+            # Determine model string for backend
+            display_backend = backend_type_lower.upper()
+            backend_descriptor = getattr(neural_backend, "model_descriptor", None)
+            if backend_type_lower == "spacy":
+                if model_name and Path(model_name).exists():
+                    model_display = Path(model_name).name
+                elif model_name:
+                    model_display = model_name
+                elif language:
+                    model_display = f"{language} (blank)"
                 else:
-                    model_str = f"{display_backend}: {neural_model_name}"
-        elif needs_backend and backend_type == "flexitag":
+                    model_display = backend_descriptor or "unknown"
+            elif backend_type_lower == "nametag":
+                # For NameTag, if a specific model/language is set, show it; otherwise just show the version
+                backend_model = getattr(neural_backend, "model", None)
+                backend_language = getattr(neural_backend, "language", None)
+                if backend_model:
+                    model_str = f"{display_backend}: {backend_model}"
+                elif backend_language:
+                    model_str = f"{display_backend}: {backend_language}"
+                else:
+                    # No specific model - just show the version (e.g., "NameTag3")
+                    model_str = backend_descriptor or f"NameTag{getattr(neural_backend, 'version', '3')}"
+            else:
+                model_display = model_name or backend_descriptor or "unknown"
+                model_str = f"{display_backend}: {model_display}"
+        elif backend_type == "flexitag":
             # Use flexitag only
             from .backend_registry import create_backend
             
@@ -3819,7 +4057,21 @@ def run_tag(args: argparse.Namespace) -> int:
                     debug=args.debug,
                 )
             except (ValueError, RuntimeError) as e:
-                print(f"[flexipipe] {e}", file=sys.stderr)
+                error_msg = str(e)
+                # Check if language detection was attempted and failed
+                if detection_attempted and detection_result is None and not getattr(args, "language", None):
+                    # Language detection failed - enhance the error message
+                    if "requires a model" in error_msg or "Provide --model or --language" in error_msg:
+                        print(
+                            "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
+                            "Please provide --language or --model explicitly.",
+                            file=sys.stderr
+                        )
+                        print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                    else:
+                        print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                else:
+                    print(f"[flexipipe] {error_msg}", file=sys.stderr)
                 return 1
             
             neural_result = flexitag_backend.tag(doc)
@@ -3832,7 +4084,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 model_str = f"FLEXITAG: {args.model}"
             else:
                 model_str = "FLEXITAG: unknown"
-        elif needs_backend and not backend_type:
+        elif not backend_type:
             # Backend needed but not specified
             print("Error: Backend required for requested tasks but none specified. Use --backend to specify a backend.", file=sys.stderr)
             return 1
@@ -4038,11 +4290,16 @@ def run_tag(args: argparse.Namespace) -> int:
                         target = str(target_writeback_path) if not output_path else output_path
                         print(f"[flexipipe] Inserted tokens into TEITOK file: {target}")
                 else:
+                    # Determine if this was processed from raw text
+                    # Check if use_raw_text was used (stored in document metadata)
+                    processed_from_raw = output_doc.meta.get("_processed_from_raw_text", False)
                     update_teitok(
                         output_doc,
                         str(target_writeback_path),
                         output_path if output_path else None,
                         settings=teitok_settings_obj,
+                        from_raw_text=processed_from_raw,
+                        strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
                     )
                     if args.verbose or args.debug:
                         target = str(target_writeback_path) if not output_path else output_path
@@ -4269,6 +4526,10 @@ def _required_annotations_for_backend(
         if xpos_attr:
             required.insert(0, "xpos")
         return required
+    if backend_key == "fasttext":
+        # fastText needs UPOS, XPOS, and FEATS for training
+        required = ["upos", "xpos"]
+        return required
     if backend_key in ("spacy", "transformers"):
         required = ["xpos", "upos", "lemma", "head", "deprel"]
     else:
@@ -4329,14 +4590,14 @@ def run_train(args: argparse.Namespace) -> int:
             output_dir = (get_backend_models_dir("flexitag") / safe_label).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         
-    model_path = train_ud_treebank(
+        model_path = train_ud_treebank(
             ud_root=train_data_path,
             output_dir=output_dir,
-        model_name=args.name,
-        include_dev=args.include_dev,
-        verbose=args.verbose or args.debug,
-        finetune=args.finetune,
-        tag_attribute=args.tagpos,
+            model_name=args.name,
+            include_dev=args.include_dev,
+            verbose=args.verbose or args.debug,
+            finetune=args.finetune,
+            tag_attribute=args.tagpos,
             language_code=language_code,
             ud_folder=ud_folder,
             nlpform=nlpform_mode,
@@ -4344,21 +4605,21 @@ def run_train(args: argparse.Namespace) -> int:
             reg_attr=reg_attr,
             expan_attr=expan_attr,
             lemma_attr=lemma_attr,
-    )
-    if not (args.verbose or args.debug):
-        print(f"[flexipipe] created model at {model_path}")
-        try:
-            with model_path.open("r", encoding="utf-8") as handle:
-                metadata = json.load(handle).get("metadata", {})
-            tag_selection = metadata.get("tag_selection", {})
-            chosen_attr = tag_selection.get("chosen")
-            if chosen_attr:
-                note = "auto-selected" if tag_selection.get("auto") else "user-selected"
-                print(f"[flexipipe] tag attribute: {chosen_attr} ({note})")
-        except Exception:
-            pass
+        )
+        if not (args.verbose or args.debug):
+            print(f"[flexipipe] created model at {model_path}")
+            try:
+                with model_path.open("r", encoding="utf-8") as handle:
+                    metadata = json.load(handle).get("metadata", {})
+                tag_selection = metadata.get("tag_selection", {})
+                chosen_attr = tag_selection.get("chosen")
+                if chosen_attr:
+                    note = "auto-selected" if tag_selection.get("auto") else "user-selected"
+                    print(f"[flexipipe] tag attribute: {chosen_attr} ({note})")
+            except Exception:
+                pass
         _cleanup_nlpform_paths()
-    return 0
+        return 0
     
     if backend_type in ("spacy", "transformers", "udpipe1"):
         # Neural backend training
@@ -4548,9 +4809,200 @@ def run_train(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
     
+    elif backend_type == "fasttext":
+        # fastText training (follows same pattern as spacy/transformers)
+        from .backend_registry import create_backend
+        from .train import _prepare_teitok_corpus, _find_ud_splits
+        
+        if not args.train_data:
+            raise SystemExit("--train-data is required for fasttext backend")
+        
+        train_path = Path(args.train_data)
+        dev_path = Path(args.dev_data) if args.dev_data else None
+        
+        # Check if this is a TEITOK corpus directory (no pre-split files)
+        splits = _find_ud_splits(train_path)
+        teitok_temp_dir = None
+        if not splits:
+            # This is a TEITOK corpus - prepare it
+            ud_folder = getattr(args, "ud_folder", None)
+            if ud_folder:
+                teitok_temp_path = Path(ud_folder).expanduser().resolve()
+                teitok_temp_path.mkdir(parents=True, exist_ok=True)
+                teitok_temp_dir = str(teitok_temp_path)
+            else:
+                import tempfile
+                teitok_temp_dir = tempfile.mkdtemp(prefix="flexipipe-teitok-")
+                teitok_temp_path = Path(teitok_temp_dir)
+            
+            required_annotations = _required_annotations_for_backend(backend_type, xpos_attr)
+            
+            try:
+                prepared_splits = _prepare_teitok_corpus(
+                    teitok_dir=train_path,
+                    output_dir=teitok_temp_path,
+                    required_annotations=required_annotations,
+                    backend_type=backend_type,
+                    train_ratio=0.8,
+                    dev_ratio=0.1,
+                    test_ratio=0.1,
+                    seed=42,
+                    verbose=args.verbose or args.debug,
+                    xpos_attr=xpos_attr,
+                    reg_attr=reg_attr,
+                    expan_attr=expan_attr,
+                    lemma_attr=lemma_attr,
+                )
+                # Update paths to point to prepared CoNLL-U files
+                train_path = prepared_splits["train"]
+                if "dev" in prepared_splits:
+                    dev_path = prepared_splits["dev"]
+                elif not dev_path:
+                    # Use dev from prepared splits if available
+                    pass
+                
+                # If ud_folder is provided, print where the files are kept
+                if ud_folder:
+                    print(f"[flexipipe] CoNLL-U files saved to: {teitok_temp_dir}")
+                    if "test" in prepared_splits:
+                        print(f"[flexipipe] Test file available at: {prepared_splits['test']}")
+                    
+                    # Print token distribution summary
+                    split_counts = prepared_splits.get("_token_counts", {})
+                    if split_counts:
+                        total_tokens = sum(split_counts.values())
+                        if total_tokens > 0:
+                            parts = []
+                            for split_name in ["train", "dev", "test"]:
+                                if split_name in split_counts:
+                                    count = split_counts[split_name]
+                                    pct = (count / total_tokens) * 100
+                                    parts.append(f"{split_name} = {count:,} tokens ({pct:.1f}%)")
+                            print(f"[flexipipe] Created gold standard distribution: {', '.join(parts)}")
+                    # Remove the token counts from the result dict
+                    prepared_splits.pop("_token_counts", None)
+            except Exception as e:
+                import shutil
+                # Only clean up if it's a temporary directory (not ud_folder)
+                if teitok_temp_dir and not ud_folder:
+                    shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+                raise SystemExit(f"Failed to prepare TEITOK corpus: {e}")
+        else:
+            # Found pre-split CoNLL-U files
+            train_path = splits["train"]
+            if not dev_path and "dev" in splits:
+                dev_path = splits["dev"]
+        
+        output_dir_arg = Path(args.output_dir).expanduser() if args.output_dir else None
+        from .model_storage import get_backend_models_dir
+        storage_root = get_backend_models_dir("fasttext")
+        label = args.name or args.language or "fasttext-model"
+        safe_label = label.replace("/", "_") or f"fasttext-model-{datetime.now():%Y%m%d%H%M%S}"
+        if output_dir_arg is None:
+            output_dir = (storage_root / safe_label).resolve()
+        else:
+            resolved = output_dir_arg.resolve()
+            try:
+                same_as_root = resolved.exists() and resolved.samefile(storage_root)
+            except FileNotFoundError:
+                same_as_root = False
+            if not output_dir_arg.is_absolute():
+                output_dir = (storage_root / output_dir_arg).resolve()
+            elif same_as_root:
+                output_dir = (storage_root / safe_label).resolve()
+            else:
+                output_dir = resolved
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Backend creation kwargs (only what the backend constructor accepts)
+        backend_kwargs = {
+            "context_window": getattr(args, "context_window", 2),
+            "debug": args.verbose or args.debug,
+        }
+        
+        # Training kwargs (passed to train() method)
+        train_kwargs = {
+            "language": args.language,
+            "language_name": getattr(args, "language_name", None),
+            "context_window": getattr(args, "context_window", 2),
+            "epoch": getattr(args, "epoch", 30),
+            "lr": getattr(args, "lr", 0.5),
+            "wordNgrams": getattr(args, "word_ngrams", 3),
+            "minn": getattr(args, "minn", 3),
+            "maxn": getattr(args, "maxn", 6),
+            "dim": getattr(args, "dim", 200),
+            "thread": getattr(args, "thread", 8),
+            "minCount": getattr(args, "min_count", 1),
+            "minCountLabel": getattr(args, "min_count_label", 1),
+            "neg": getattr(args, "neg", 5),
+            "bucket": getattr(args, "bucket", 2000000),
+            "t": getattr(args, "t", 0.0001),
+            "finetune": getattr(args, "finetune", "none"),
+            "finetune_max_evals": getattr(args, "finetune_max_evals", 50),
+            "lrWarmup": getattr(args, "lr_warmup", 0),
+            "lrWarmupRatio": getattr(args, "lr_warmup_ratio", 0.1),
+        }
+        
+        train_path = _maybe_prepare_nlpform_path(train_path)
+        dev_path = _maybe_prepare_nlpform_path(dev_path) if dev_path else None
+        
+        try:
+            backend = create_backend(backend_type, training=True, **backend_kwargs)
+        except Exception as e:
+            import shutil
+            if teitok_temp_dir and not getattr(args, "ud_folder", None):
+                shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+            _cleanup_nlpform_paths()
+            raise SystemExit(f"Failed to create {backend_type} backend: {e}")
+        
+        if not backend.supports_training:
+            import shutil
+            if teitok_temp_dir and not getattr(args, "ud_folder", None):
+                shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+            _cleanup_nlpform_paths()
+            raise SystemExit(f"{backend_type} backend does not support training")
+        
+        try:
+            model_path = backend.train(
+                train_data=train_path,
+                output_dir=output_dir,
+                dev_data=dev_path,
+                verbose=args.verbose or args.debug,
+                **train_kwargs,
+            )
+            print(f"[flexipipe] trained {backend_type} model at {model_path}")
+            
+            # Refresh model cache so the newly trained model is immediately discoverable
+            try:
+                from .backends.fasttext import get_fasttext_model_entries
+                get_fasttext_model_entries(refresh_cache=True, verbose=args.verbose or args.debug)
+            except Exception:
+                pass  # Cache refresh is best-effort
+            
+            import shutil
+            ud_folder = getattr(args, "ud_folder", None)
+            if teitok_temp_dir and not ud_folder:
+                shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+            _cleanup_nlpform_paths()
+            return 0
+        except NotImplementedError as e:
+            import shutil
+            ud_folder = getattr(args, "ud_folder", None)
+            if teitok_temp_dir and not ud_folder:
+                shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+            _cleanup_nlpform_paths()
+            raise SystemExit(f"{backend_type} backend training is not yet implemented: {e}")
+        except Exception as e:
+            import shutil
+            ud_folder = getattr(args, "ud_folder", None)
+            if teitok_temp_dir and not ud_folder:
+                shutil.rmtree(teitok_temp_dir, ignore_errors=True)
+            _cleanup_nlpform_paths()
+            raise SystemExit(f"Training failed: {e}")
+    
     else:
         _cleanup_nlpform_paths()
-        raise SystemExit(f"Unknown backend: {backend_type}. Supported backends for training: flexitag, spacy, transformers")
+        raise SystemExit(f"Unknown backend: {backend_type}. Supported backends for training: flexitag, spacy, transformers, fasttext")
 
 
 def run_convert(args: argparse.Namespace) -> int:
@@ -5001,6 +5453,23 @@ def main(argv: list[str] | None = None) -> int:
         raise
     setattr(args, "_backend_explicit", backend_explicit)
 
+    # Auto-set --output-format json when running from TEITOK (if not explicitly set)
+    # This makes it easier for TEITOK to parse flexipipe output programmatically
+    from .model_storage import is_running_from_teitok
+    if is_running_from_teitok():
+        # Check if --output-format was explicitly provided in command line
+        output_format_explicit = any(
+            arg == "--output-format" or arg.startswith("--output-format=") 
+            for arg in argv
+        )
+        # Only auto-set if not explicitly provided and command supports it
+        if not output_format_explicit and hasattr(args, "output_format"):
+            # Commands that support --output-format: info, config --show, benchmark --show
+            if args.task in ("info", "config", "benchmark"):
+                args.output_format = "json"
+                if args.verbose or args.debug:
+                    print("[flexipipe] Auto-set --output-format json (TEITOK detected)", file=sys.stderr)
+
     if not args.task:
         parser.error("No task specified. Use one of: " + ", ".join(TASK_CHOICES))
 
@@ -5045,6 +5514,8 @@ def run_config(args: argparse.Namespace) -> int:
         get_auto_install_extras,
         set_prompt_install_extras,
         get_prompt_install_extras,
+        set_default_download_model,
+        get_default_download_model,
         set_language_detector,
         get_language_detector,
     )
@@ -5172,6 +5643,13 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"[flexipipe] Prompting before installing extras set to: {status}")
         print(f"[flexipipe] Configuration saved to: {get_config_file()}")
         return 0
+
+    if args.set_default_download_model is not None:
+        set_default_download_model(args.set_default_download_model)
+        status = "enabled" if args.set_default_download_model else "disabled"
+        print(f"[flexipipe] Automatic model downloading set to: {status}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
     
     if args.show:
         # Show current configuration
@@ -5185,6 +5663,7 @@ def run_config(args: argparse.Namespace) -> int:
         default_writeback = get_default_writeback()
         auto_install_extras = get_auto_install_extras()
         prompt_install_extras = get_prompt_install_extras()
+        default_download_model = get_default_download_model()
         language_detector = get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
 
         # Model registry configuration
@@ -5250,6 +5729,7 @@ def run_config(args: argparse.Namespace) -> int:
                     "writeback": bool(default_writeback),
                     "auto_install_extras": bool(auto_install_extras),
                     "prompt_install_extras": bool(prompt_install_extras),
+                    "download_model": bool(default_download_model),
                     "language_detector": language_detector,
                 },
                 "model_registry": {
@@ -5288,6 +5768,7 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"  Default writeback: {'enabled' if default_writeback else 'disabled'}")
         print(f"  Auto-install extras: {'enabled' if auto_install_extras else 'disabled'}")
         print(f"  Prompt before installing extras: {'enabled' if prompt_install_extras else 'disabled'}")
+        print(f"  Auto-download models: {'enabled' if default_download_model else 'disabled'}")
         print(f"  Language detector: {language_detector}")
 
         # Show model registry configuration

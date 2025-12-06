@@ -161,6 +161,7 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_spacy_models,
     supports_training=True,
     is_rest=False,
+    url="https://spacy.io",
 )
 
 

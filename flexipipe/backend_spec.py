@@ -23,6 +23,8 @@ class BackendSpec:
     supports_training: bool = False
     is_rest: bool = False
     is_hidden: bool = False
+    url: Optional[str] = None
+    """URL to the backend's homepage or project repository."""
     model_registry_url: Optional[str] = None
     """Optional URL to a backend-specific model registry JSON file.
     

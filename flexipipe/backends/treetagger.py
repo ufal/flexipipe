@@ -188,10 +188,11 @@ def _select_treetagger_entry(
             lang_display = (entry.get(LANGUAGE_FIELD_NAME) or "").lower()
             if lang_norm in {iso, lang_display}:
                 return candidate_name, entry
+    from ..model_storage import is_running_from_teitok
+    teitok_msg = "" if is_running_from_teitok() else " Run 'python -m flexipipe info models --backend treetagger' for the list of models."
     raise ValueError(
         "TreeTagger backend requires --treetagger-model (matching the curated registry) "
-        "or a language code (--language) that can be mapped to a curated entry. "
-        "Run 'python -m flexipipe info models --backend treetagger' for the list of models."
+        "or a language code (--language) that can be mapped to a curated entry." + teitok_msg
     )
 
 
@@ -499,6 +500,7 @@ BACKEND_SPEC = BackendSpec(
     list_models=list_treetagger_models,
     supports_training=False,
     is_rest=False,
+    url="https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/",
     model_registry_url=DEFAULT_TREETAGGER_REGISTRY_URL,
 )
 
