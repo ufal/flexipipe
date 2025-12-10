@@ -375,6 +375,9 @@ python -m flexipipe info examples
 
 # List all supported tasks
 python -m flexipipe info tasks
+
+# List all supported languages
+python -m flexipipe info languages
 ```
 
 ## Format Conversion
