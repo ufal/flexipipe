@@ -497,16 +497,73 @@ class UDPipeRESTBackend(BackendManager):
     ) -> NeuralResult:
         del overrides, preserve_pos_tags, components
         
-        if use_raw_text:
+        # Default behavior: use raw_text mode for NLP processing, even if document has tokens
+        # This allows the NLP model to do its own tokenization, which is usually better
+        # Results will be mapped back to the original pretokenized Doc via parse_conllu_from_backend
+        # Only use pretokenized mode if explicitly forced (via document.meta["_force_pretokenized"])
+        has_sentence_text = any(sent.text for sent in document.sentences)
+        force_pretokenized = document.meta.get("_force_pretokenized", False)
+        
+        # Use raw_text if:
+        # 1. use_raw_text is explicitly True, OR
+        # 2. We have sentence text and not forced to use pretokenized
+        # This ensures we use raw_text by default, which is better for NLP models
+        should_use_raw_text = use_raw_text or (has_sentence_text and not force_pretokenized)
+        
+        if should_use_raw_text:
             # Raw text mode: extract text from sentences and send as plain text
-            text = "\n".join(sentence.text or "" for sentence in document.sentences)
+            # This allows UDPipe to do its own tokenization, which is usually better
+            # If normalization was applied, reconstruct text using effective forms (reg attribute)
+            normalization_applied = document.meta.get("_normalization_applied", False)
+            
+            if normalization_applied and any(sent.tokens for sent in document.sentences):
+                # Normalization was applied: reconstruct text using effective forms (reg attribute)
+                # This ensures the backend processes the corrected forms, not the original misspellings
+                from ..doc_utils import get_effective_form
+                # When normalization is applied, always use reg if available (regardless of config)
+                text_parts = []
+                for sentence in document.sentences:
+                    if sentence.tokens:
+                        sent_parts = []
+                        for i, token in enumerate(sentence.tokens):
+                            # Use reg attribute if available (normalization sets this)
+                            reg = getattr(token, "reg", "") or token.attrs.get("reg", "")
+                            if reg and reg != "_" and reg != "":
+                                effective_form = reg
+                            else:
+                                effective_form = token.form
+                            # Always add the token form (even if empty, though that shouldn't happen)
+                            if effective_form:
+                                sent_parts.append(effective_form)
+                            # Add space after token if space_after is True
+                            # Don't add space if space_after is False or None (for last token, punctuation, etc.)
+                            # But preserve the token itself even if it's punctuation
+                            if token.space_after is True:
+                                sent_parts.append(" ")
+                        # Join all parts - this preserves all tokens including trailing punctuation
+                        # Don't strip - we want to preserve the exact text structure
+                        reconstructed = "".join(sent_parts)
+                        text_parts.append(reconstructed)
+                    elif sentence.text:
+                        text_parts.append(sentence.text)
+                text = "\n".join(text_parts)
+            else:
+                # No normalization: use sentence text as-is
+                text = "\n".join(sentence.text or "" for sentence in document.sentences)
+                if not text.strip():
+                    # Fallback: if no sentence text, try to reconstruct from tokens
+                    from ..conllu import _reconstruct_sentence_text
+                    text = "\n".join(_reconstruct_sentence_text(sent.tokens) or "" for sent in document.sentences if sent.tokens)
             response = self._request(text, input_format="plain")
         else:
             # Pretokenized mode: send CoNLL-U format to preserve tokenization and TokIds
             # UDPipe REST API should preserve TokIds in MISC column when input=conllu
             # Force include TokId in MISC so UDPipe preserves it
             # Include SpaceAfter=No in MISC to accurately represent spacing and prevent incorrect MWT creation
-            conllu_text = document_to_conllu(document, include_tokid=True, suppress_space_after_in_misc=False)
+            # Check if normalization was applied and use_reg_for_nlp is enabled - use effective forms
+            from ..model_storage import get_use_reg_for_nlp
+            use_effective_form = get_use_reg_for_nlp() and document.meta.get("_normalization_applied", False)
+            conllu_text = document_to_conllu(document, include_tokid=True, suppress_space_after_in_misc=False, use_effective_form=use_effective_form)
             
             # UDPipe REST API doesn't accept CoNLL-U with existing dependency relations
             # Clear HEAD (column 6) and DEPREL (column 7) before sending
@@ -597,17 +654,25 @@ def _create_udpipe_backend(
     
     validate_backend_kwargs(kwargs, "UDPipe", allowed_extra=["download_model", "training"])
 
-    resolved_model = model or model_name
-    # If model is "auto" or not set, try to resolve from language
+    # Resolve model using central function
     # UDPipe REST API accepts both model names and language codes
-    if not resolved_model or resolved_model == "auto":
+    initial_model = model or model_name
+    if initial_model == "auto":
+        initial_model = None
+    
+    try:
+        resolved_model = resolve_model_from_language(
+            language=language,
+            backend_name="udpipe",
+            model_name=initial_model,
+            preferred_only=True,
+            use_cache=True,
+        )
+    except ValueError:
+        # If no model found and language provided, use language code directly
+        # (UDPipe REST API accepts language codes as model identifiers)
         if language:
-            # Try to resolve to a model name first, but if that fails, use language code
-            try:
-                resolved_model = resolve_model_from_language(language, "udpipe")
-            except ValueError:
-                # If no model found, use language code directly (UDPipe accepts language codes)
-                resolved_model = language
+            resolved_model = language
         else:
             resolved_model = None
     

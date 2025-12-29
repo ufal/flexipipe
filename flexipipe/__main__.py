@@ -1922,6 +1922,23 @@ class CustomArgumentParser(argparse.ArgumentParser):
     """Custom ArgumentParser with better error messages for unrecognized arguments."""
     
     def error(self, message: str) -> None:
+        # Handle --udpipe1 shorthand for --backend udpipe1
+        if "ambiguous option: --udpipe1" in message.lower():
+            # User used --udpipe1 shorthand, convert it to --backend udpipe1
+            import sys
+            if '--udpipe1' in sys.argv:
+                idx = sys.argv.index('--udpipe1')
+                # Replace --udpipe1 with --backend udpipe1
+                sys.argv[idx:idx+1] = ['--backend', 'udpipe1']
+                # Retry parsing by calling parse_args again
+                try:
+                    # This will re-parse with the corrected arguments
+                    self.parse_args()
+                    return
+                except Exception:
+                    # If retry fails, fall through to original error
+                    pass
+        
         # Check if it's an unrecognized arguments error
         if "unrecognized arguments" in message.lower():
             # Extract the unrecognized argument
@@ -2091,7 +2108,40 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--pretokenize",
         action="store_true",
-        help="Segment and tokenize raw input locally before sending to the backend",
+        help="[DEPRECATED] Use --tokenizer instead. Segment and tokenize raw input before sending to the backend.",
+    )
+    process_parser.add_argument(
+        "--segmenter",
+        help="Use specified backend for sentence segmentation. Format: 'backend[:model]' (e.g., 'udpipe:yo', 'spacy', 'stanza', 'sentencepiece'). "
+             "Options: udpipe, spacy, stanza, classla, flexitag (language-independent), sentencepiece (multilingual, for unknown languages). "
+             "If not specified, auto-detects if segmentation is needed and uses preferred tool for the language. "
+             "Use empty string (--segmenter '') to disable auto-detection.",
+    )
+    process_parser.add_argument(
+        "--segmenter-language",
+        help="Language code for the segmenter backend (if different from main --language).",
+    )
+    process_parser.add_argument(
+        "--tokenizer",
+        help="Use specified backend for tokenization. Format: 'backend[:model]' (e.g., 'udpipe:yo', 'flexitag', 'sentencepiece'). "
+             "Options: udpipe, spacy, stanza, classla, flexitag (language-independent), sentencepiece (multilingual, for unknown languages). "
+             "If not specified, auto-detects if tokenization is needed and uses preferred tool for the language. "
+             "Use empty string (--tokenizer '') to disable auto-detection.",
+    )
+    process_parser.add_argument(
+        "--tokenizer-language",
+        help="Language code for the tokenizer backend (if different from main --language).",
+    )
+    process_parser.add_argument(
+        "--normalizer",
+        help="Use specified backend for orthographic normalization (spelling correction). Format: 'backend[:model]' (e.g., 'hunspell', 'hunspell:en_US'). "
+             "Options: hunspell (Hunspell-based spelling correction). "
+             "If not specified, auto-detects if normalization is needed and uses preferred tool for the language. "
+             "Use empty string (--normalizer '') to disable auto-detection.",
+    )
+    process_parser.add_argument(
+        "--normalizer-language",
+        help="Language code for the normalizer backend (if different from main --language).",
     )
     process_parser.add_argument(
         "--use-raw-text",
@@ -2694,6 +2744,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set the default language detector backend (e.g., fasttext, none)",
     )
     config_parser.add_argument(
+        "--set-default-tokenizer",
+        type=str,
+        metavar="TOKENIZER",
+        help="Set the default tokenizer (e.g., 'flexitag', 'sentencepiece', 'udpipe:yo', or empty string to disable)",
+    )
+    config_parser.add_argument(
+        "--set-default-segmenter",
+        type=str,
+        metavar="SEGMENTER",
+        help="Set the default segmenter (e.g., 'flexitag', 'sentencepiece', 'udpipe:yo', or empty string to disable)",
+    )
+    config_parser.add_argument(
+        "--set-default-normalizer",
+        type=str,
+        metavar="NORMALIZER",
+        help="Set the default normalizer (e.g., 'hunspell', 'hunspell:en_US', or empty string to disable)",
+    )
+    config_parser.add_argument(
+        "--set-use-reg-for-nlp",
+        type=_str_to_bool,
+        metavar="true|false",
+        help="Set whether to use reg attribute instead of form for NLP processing when reg exists (true or false). When true, backends will use token.reg if available, otherwise token.form.",
+    )
+    config_parser.add_argument(
         "--set-default-create-implicit-mwt",
         type=_str_to_bool,
         metavar="true|false",
@@ -2821,6 +2895,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Learning rate (default: 0.5, for fastText backend). Note: fastText uses higher learning rates (0.1-1.0) than deep neural networks because it's based on word2vec/skip-gram architecture. Typical range: 0.1-0.7. Lower values (0.01-0.1) may work for fine-tuning.",
     )
     train_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing model if it already exists (empties the output directory)",
+    )
+    train_parser.add_argument(
         "--word-ngrams",
         type=int,
         default=3,
@@ -2883,7 +2962,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Neural backend arguments
     train_parser.add_argument(
         "--model",
-        help="Base model name for neural backends (e.g., 'en_core_web_sm' for SpaCy, 'bert-base-uncased' for Transformers)",
+        help="Base model name for neural backends (e.g., 'en_core_web_sm' for SpaCy, 'bert-base-uncased' for Transformers). Note: For training, use --name to specify the name of the model being created.",
     )
     train_parser.add_argument(
         "--language",
@@ -2931,6 +3010,43 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "NFC", "NFD"],
         default=None,
         help="Normalize training data to specified Unicode form (NFC, NFD, or none). Default: use config setting.",
+    )
+    train_parser.add_argument(
+        "--unimorph-vocab",
+        type=Path,
+        help="Path to UniMorph vocabulary file (tab-separated: lemma\\tform\\tfeatures). For ClassLA backend.",
+    )
+    train_parser.add_argument(
+        "--tagset-file",
+        type=Path,
+        help="Path to tagset.xml file for XPOS mapping (used with --unimorph-vocab). For ClassLA backend.",
+    )
+    train_parser.add_argument(
+        "--wordvec-pretrain-file",
+        type=Path,
+        dest="wordvec_pretrain_file",
+        help="Path to pretrain word embeddings file (.pt format). Bypasses automatic download. For ClassLA backend.",
+    )
+    train_parser.add_argument(
+        "--max-steps",
+        type=int,
+        dest="max_steps",
+        default=None,
+        help="Maximum number of training steps/iterations. For fastText, this maps to --epoch. For ClassLA/Stanza, this is max_steps (default: 50000). For SpaCy, this sets training.iterations in config.",
+    )
+    train_parser.add_argument(
+        "--patience",
+        type=int,
+        dest="patience",
+        default=None,
+        help="Early stopping patience: number of evaluations without improvement before stopping (default: 3 for ClassLA/Stanza). Set to 0 to disable. Not supported for fastText or flexitag.",
+    )
+    train_parser.add_argument(
+        "--eval-interval",
+        type=int,
+        dest="eval_interval",
+        default=None,
+        help="Number of steps between evaluations (default: 100 for ClassLA/Stanza). Only applies to ClassLA/Stanza backends.",
     )
     
     # convert ------------------------------------------------------
@@ -4130,13 +4246,17 @@ def run_tag(args: argparse.Namespace) -> int:
             detection_result = None
         backend_type = getattr(args, "backend", None) or "flexitag"
         segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-        tokenize_locally = segment_locally
+        tokenize_locally = segment_locally and backend_type != "treetagger"
         doc = Document.from_plain_text(
             inline_data_text,
             doc_id="",
             segment=segment_locally,
             tokenize=tokenize_locally,
         )
+        # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+        if backend_type == "treetagger" and not tokenize_locally:
+            for sent in doc.sentences:
+                sent.tokens = []
         doc.meta.setdefault("source", "inline-data")
         # Normalize document encoding
         if unicode_normalize != "none":
@@ -4206,8 +4326,10 @@ def run_tag(args: argparse.Namespace) -> int:
             backend_type = "flexitag"  # Default backend
         
         # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+        # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
+        # (so we don't create whitespace-split tokens that would prevent proper tokenization)
         segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-        tokenize_locally = segment_locally
+        tokenize_locally = segment_locally and backend_type != "treetagger"
 
         doc = Document.from_plain_text(
             raw_text,
@@ -4215,6 +4337,11 @@ def run_tag(args: argparse.Namespace) -> int:
             segment=segment_locally,
             tokenize=tokenize_locally,
         )
+        
+        # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+        if backend_type == "treetagger" and not tokenize_locally:
+            for sent in doc.sentences:
+                sent.tokens = []
         # Normalize document encoding
         if unicode_normalize != "none":
             doc.normalize_unicode(unicode_normalize)
@@ -4275,8 +4402,9 @@ def run_tag(args: argparse.Namespace) -> int:
                     
                     # Treat extracted text as raw input - let the backend handle segmentation/tokenization
                     # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+                    # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
                     segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-                    tokenize_locally = segment_locally
+                    tokenize_locally = segment_locally and backend_type != "treetagger"
                     
                     doc = Document.from_plain_text(
                         raw_text,
@@ -4284,6 +4412,10 @@ def run_tag(args: argparse.Namespace) -> int:
                         segment=segment_locally,
                         tokenize=tokenize_locally,
                     )
+                    # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+                    if backend_type == "treetagger" and not tokenize_locally:
+                        for sent in doc.sentences:
+                            sent.tokens = []
                     # Normalize document encoding
                     if unicode_normalize != "none":
                         doc.normalize_unicode(unicode_normalize)
@@ -4378,8 +4510,9 @@ def run_tag(args: argparse.Namespace) -> int:
                 
                 # Treat extracted text as raw input - let the backend handle segmentation/tokenization
                 # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+                # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
                 segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-                tokenize_locally = segment_locally
+                tokenize_locally = segment_locally and backend_type != "treetagger"
                 
                 doc = Document.from_plain_text(
                     raw_text,
@@ -4788,9 +4921,9 @@ def run_tag(args: argparse.Namespace) -> int:
                         else:
                             create_kwargs["language"] = language if not model_name else None
                     
-                    # Only pass verbose to backends that support it (stanza, flair, udpipe1)
+                    # Only pass verbose to backends that support it (stanza, flair, udpipe1, transformers)
                     backend_kwargs_final = dict(create_kwargs)
-                    if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy"):
+                    if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers"):
                         backend_kwargs_final["verbose"] = args.verbose or args.debug
                     
                     # For udpipe1, don't use model_path - pass model directly
@@ -4923,6 +5056,80 @@ def run_tag(args: argparse.Namespace) -> int:
             create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
             if create_implicit_mwt:
                 doc.meta["_create_implicit_mwt"] = True
+            
+            # Apply pre-segmentation and pre-tokenization if needed (before backend processing)
+            from .segmentation import maybe_apply_segmentation
+            from .tokenization import maybe_apply_tokenization
+            
+            # Handle --pretokenize for backwards compatibility (maps to --tokenizer)
+            pretokenize = getattr(args, "pretokenize", False)
+            tokenizer_spec = getattr(args, "tokenizer", None)
+            if pretokenize and tokenizer_spec is None:
+                # --pretokenize without --tokenizer: use auto-detection
+                tokenizer_spec = None  # Will auto-detect
+            elif pretokenize and tokenizer_spec == "":
+                # --pretokenize with --tokenizer '' (disabled): ignore --pretokenize
+                tokenizer_spec = ""
+            
+            # Get model name for registry lookups
+            model_name = getattr(args, "model", None)
+            
+            # Apply segmentation (sentence splitting)
+            segmenter_spec = getattr(args, "segmenter", None)
+            segmenter_lang = getattr(args, "segmenter_language", None) or language
+            doc, segmentation_applied = maybe_apply_segmentation(
+                doc,
+                backend_type,
+                segmenter_spec=segmenter_spec,
+                language=segmenter_lang,
+                model_name=model_name,
+                use_cache=True,
+                verbose=args.verbose or args.debug,
+            )
+            
+            # Apply tokenization (word tokenization)
+            tokenizer_lang = getattr(args, "tokenizer_language", None) or language
+            doc, tokenization_applied = maybe_apply_tokenization(
+                doc,
+                backend_type,
+                tokenizer_spec=tokenizer_spec,
+                language=tokenizer_lang,
+                model_name=model_name,
+                use_cache=True,
+                verbose=args.verbose or args.debug,
+            )
+            
+            # Apply normalization BEFORE backend processing (so backend uses corrected forms)
+            from .normalization import maybe_apply_normalization
+            normalizer_spec = getattr(args, "normalizer", None)
+            normalizer_lang = getattr(args, "normalizer_language", None) or language
+            doc, normalization_applied = maybe_apply_normalization(
+                doc,
+                backend_type,
+                normalizer_spec=normalizer_spec,
+                language=normalizer_lang,
+                model_name=model_name,
+                use_cache=True,
+                verbose=args.verbose or args.debug,
+            )
+            
+            if normalization_applied and (args.verbose or args.debug):
+                print("[flexipipe] Orthographic normalization applied. Backend will process corrected forms.", file=sys.stderr)
+            
+            # Note: We no longer force pretokenized mode when normalization is applied.
+            # Backends should use raw_text mode by default and reconstruct text using effective forms (reg attribute).
+            # This allows the NLP model to do its own tokenization, which is usually better.
+            # The backend will map results back to the original pretokenized document.
+            
+            # Note: We no longer force pretokenized mode when tokenization is applied.
+            # Backends should use raw_text mode by default and map results back to the original pretokenized Doc.
+            # This allows the NLP model to do its own tokenization, which is usually better.
+            if segmentation_applied:
+                # Only segmentation applied - sentences have text but no tokens
+                # Keep use_raw_text=True so backend processes the text
+                if args.verbose or args.debug:
+                    print("[flexipipe] Pre-segmentation applied. Main backend will process sentence text.", file=sys.stderr)
+            
             try:
                 if args.verbose or args.debug:
                     components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
@@ -4946,6 +5153,75 @@ def run_tag(args: argparse.Namespace) -> int:
             result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
             _propagate_sentence_metadata(result.document, doc)
             _propagate_token_ids(result.document, doc)
+            
+            # Copy normalization map from original doc to result doc meta if it exists
+            # (needed for restoration after backend processing)
+            if normalization_applied and "_normalization_map" in doc.meta:
+                result.document.meta["_normalization_map"] = doc.meta["_normalization_map"].copy()
+            
+            # If normalization was applied, restore original forms and preserve reg attributes
+            # Backends may create new tokens, so we need to match them back to original tokens
+            normalization_map = None
+            if normalization_applied:
+                # Check result document meta (should have been copied above)
+                if "_normalization_map" in result.document.meta:
+                    normalization_map = result.document.meta["_normalization_map"].copy()
+                # Fallback to original doc meta
+                elif "_normalization_map" in doc.meta:
+                    normalization_map = doc.meta["_normalization_map"].copy()
+            
+            if normalization_map:
+                import re
+                if args.debug:
+                    print(f"[flexipipe] DEBUG: Normalization map has {len(normalization_map)} entries: {normalization_map}", file=sys.stderr)
+                for sent_idx, sentence in enumerate(result.document.sentences):
+                    for token in sentence.tokens:
+                        # Try to match token form to normalization map
+                        # The normalization map keys are (sentence_idx, normalized_form)
+                        # We need to match the backend's output (which has normalized forms) back to original forms
+                        
+                        # Try exact match first (case-sensitive)
+                        key = (sent_idx, token.form)
+                        if key in normalization_map:
+                            original_form, reg_value = normalization_map[key]
+                            if args.debug:
+                                print(f"[flexipipe] DEBUG: Exact match token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
+                            # Restore original form and set reg attribute
+                            token.form = original_form
+                            # Only set reg if it's different from the original form
+                            if reg_value and reg_value != original_form:
+                                token.reg = reg_value
+                        else:
+                            # Try case-insensitive match (in case backend changed case)
+                            matched = False
+                            for (map_sent_idx, map_form), (orig_form, reg_val) in normalization_map.items():
+                                if map_sent_idx == sent_idx and map_form.lower() == token.form.lower():
+                                    if args.debug:
+                                        print(f"[flexipipe] DEBUG: Case-insensitive match token '{token.form}' -> '{orig_form}' (reg={reg_val})", file=sys.stderr)
+                                    token.form = orig_form
+                                    if reg_val and reg_val != orig_form:
+                                        token.reg = reg_val
+                                    matched = True
+                                    break
+                            
+                            # If still no match, try stripping punctuation (for cases where backend attached punctuation)
+                            if not matched:
+                                token_form_clean = re.sub(r'[.!?,:;]+$', '', token.form)
+                                key_clean = (sent_idx, token_form_clean)
+                                if key_clean in normalization_map:
+                                    original_form, reg_value = normalization_map[key_clean]
+                                    if args.debug:
+                                        print(f"[flexipipe] DEBUG: Matched (stripped punctuation) token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
+                                    token.form = original_form
+                                    if reg_value and reg_value != original_form:
+                                        token.reg = reg_value
+                                    matched = True
+                
+                # Clean up the normalization map
+                if "_normalization_map" in result.document.meta:
+                    del result.document.meta["_normalization_map"]
+                if "_normalization_map" in doc.meta:
+                    del doc.meta["_normalization_map"]
             
             # Track backend used
             if "_backends_used" not in result.document.meta:
@@ -5638,7 +5914,7 @@ def run_train(args: argparse.Namespace) -> int:
         _cleanup_nlpform_paths()
         return 0
     
-    if backend_type in ("spacy", "transformers", "udpipe1"):
+    if backend_type in ("spacy", "transformers", "udpipe1", "classla"):
         # Neural backend training
         from .backend_registry import create_backend
         from .train import _prepare_teitok_corpus, _find_ud_splits
@@ -5753,9 +6029,30 @@ def run_train(args: argparse.Namespace) -> int:
                 output_dir = storage_root  # Models are saved directly in storage_root with .udpipe extension
             else:
                 output_dir = output_dir_arg.resolve()
+        elif backend_type == "classla":
+            storage_root = get_backend_models_dir("classla")
+            label = args.name or args.language or "classla-model"
+            safe_label = label.replace("/", "_") or f"classla-model-{datetime.now():%Y%m%d%H%M%S}"
+            if output_dir_arg is None:
+                output_dir = (storage_root / safe_label).resolve()
+            else:
+                resolved = output_dir_arg.resolve()
+                try:
+                    same_as_root = resolved.exists() and resolved.samefile(storage_root)
+                except FileNotFoundError:
+                    same_as_root = False
+                if not output_dir_arg.is_absolute():
+                    output_dir = (storage_root / output_dir_arg).resolve()
+                elif same_as_root:
+                    output_dir = (storage_root / safe_label).resolve()
+                else:
+                    output_dir = resolved
         else:
             output_dir = output_dir_arg.resolve() if output_dir_arg else Path(args.output_dir or ".").expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract force flag - it's passed to train(), not to backend constructor
+        force = getattr(args, "force", False)
         
         backend_kwargs = {}
         if backend_type == "spacy":
@@ -5769,6 +6066,13 @@ def run_train(args: argparse.Namespace) -> int:
             if not args.model:
                 raise SystemExit("--model is required for Transformers backend")
             backend_kwargs["model_name"] = args.model
+        elif backend_type == "classla":
+            if args.language:
+                backend_kwargs["language"] = args.language
+            else:
+                raise SystemExit("--language is required for ClassLA backend")
+            if args.model:
+                backend_kwargs["model_name"] = args.model
         elif backend_type == "udpipe1":
             model_target = args.model
             if not model_target:
@@ -5803,17 +6107,39 @@ def run_train(args: argparse.Namespace) -> int:
                 from .model_storage import get_unicode_normalization
                 unicode_normalize = get_unicode_normalization()
             
+            # Prepare train_kwargs for backends that need them
+            train_kwargs = {
+                "language": args.language,
+                "verbose": args.verbose or args.debug,
+                "debug": args.debug,
+                "force": force,
+            }
+            
+            # Add backend-specific kwargs
+            if backend_type == "spacy":
+                train_kwargs["model_name"] = args.name  # Use --name for training (naming the model being created)
+                train_kwargs["unicode_normalization"] = unicode_normalize
+            elif backend_type == "classla":
+                # Use --name for training (naming the model being created) as package name to support multiple models per language
+                train_kwargs["model_name"] = args.name
+                train_kwargs["unimorph_vocab"] = getattr(args, "unimorph_vocab", None)
+                train_kwargs["tagset_file"] = getattr(args, "tagset_file", None)
+                train_kwargs["wordvec_pretrain_file"] = getattr(args, "wordvec_pretrain_file", None)
+            
             model_path = backend.train(
                 train_data=train_path,
                 output_dir=output_dir,
                 dev_data=dev_path,
-                model_name=args.name,
-                language=args.language,
-                verbose=args.verbose or args.debug,
-                debug=args.debug,
-                unicode_normalization=unicode_normalize,
+                **train_kwargs,
             )
-            print(f"[flexipipe] trained {backend_type} model at {model_path}")
+            # For classla, the backend already prints detailed status messages
+            # Only print a generic message if not verbose (verbose output already shown)
+            if backend_type == "classla" and not (args.verbose or args.debug):
+                # Backend will have shown detailed messages if training failed
+                # This is just a confirmation that data was prepared
+                print(f"[flexipipe] ClassLA training data prepared at {model_path}")
+            else:
+                print(f"[flexipipe] trained {backend_type} model at {model_path}")
             # Invalidate unified catalog cache so the new model appears immediately
             from .model_catalog import invalidate_unified_catalog_cache
             invalidate_unified_catalog_cache()
@@ -5841,7 +6167,7 @@ def run_train(args: argparse.Namespace) -> int:
             if teitok_temp_dir and not ud_folder:
                 shutil.rmtree(teitok_temp_dir, ignore_errors=True)
             _cleanup_nlpform_paths()
-            raise SystemExit(f"Training failed: {e}")
+            raise SystemExit(f"[flexipipe] Training failed: {e}")
         finally:
             # Clean up temporary TEITOK preparation directory (unless ud_folder was specified)
             ud_folder = getattr(args, "ud_folder", None)
@@ -5964,11 +6290,22 @@ def run_train(args: argparse.Namespace) -> int:
         }
         
         # Training kwargs (passed to train() method)
+        # Map generic arguments to backend-specific ones
+        max_steps = getattr(args, "max_steps", None)
+        epoch_arg = getattr(args, "epoch", None)
+        epoch = epoch_arg if epoch_arg is not None else 30
+        
+        # If --max-steps is provided, use it for backends that support it
+        # For fastText, --max-steps maps to --epoch (but --epoch takes precedence if both provided)
+        if max_steps is not None and backend_type == "fasttext" and epoch_arg is None:
+            # For fastText, max_steps means epochs (only if --epoch wasn't explicitly provided)
+            epoch = max_steps
+        
         train_kwargs = {
             "language": args.language,
             "language_name": getattr(args, "language_name", None),
             "context_window": getattr(args, "context_window", 2),
-            "epoch": getattr(args, "epoch", 30),
+            "epoch": epoch,
             "lr": getattr(args, "lr", 0.5),
             "wordNgrams": getattr(args, "word_ngrams", 3),
             "minn": getattr(args, "minn", 3),
@@ -5984,6 +6321,16 @@ def run_train(args: argparse.Namespace) -> int:
             "finetune_max_evals": getattr(args, "finetune_max_evals", 50),
             "lrWarmup": getattr(args, "lr_warmup", 0),
             "lrWarmupRatio": getattr(args, "lr_warmup_ratio", 0.1),
+            "unimorph_vocab": getattr(args, "unimorph_vocab", None),
+            "tagset_file": getattr(args, "tagset_file", None),
+            "force": getattr(args, "force", False),
+            # Generic training arguments (mapped per backend)
+            "max_steps": max_steps if backend_type in ("classla", "stanza") else None,
+            "patience": getattr(args, "patience", None) if backend_type in ("classla", "stanza") else None,
+            "eval_interval": getattr(args, "eval_interval", None) if backend_type in ("classla", "stanza") else None,
+            # For SpaCy, pass max_steps and patience to modify config
+            "training_iterations": max_steps if backend_type == "spacy" else None,
+            "training_patience": getattr(args, "patience", None) if backend_type == "spacy" else None,
         }
         
         train_path = _maybe_prepare_nlpform_path(train_path)
@@ -6042,11 +6389,11 @@ def run_train(args: argparse.Namespace) -> int:
             if teitok_temp_dir and not ud_folder:
                 shutil.rmtree(teitok_temp_dir, ignore_errors=True)
             _cleanup_nlpform_paths()
-            raise SystemExit(f"Training failed: {e}")
+            raise SystemExit(f"[flexipipe] Training failed: {e}")
     
     else:
         _cleanup_nlpform_paths()
-        raise SystemExit(f"Unknown backend: {backend_type}. Supported backends for training: flexitag, spacy, transformers, fasttext")
+        raise SystemExit(f"Unknown backend: {backend_type}. Supported backends for training: flexitag, spacy, transformers, fasttext, classla")
 
 
 def run_convert(args: argparse.Namespace) -> int:
@@ -6612,6 +6959,14 @@ def run_config(args: argparse.Namespace) -> int:
         get_default_download_model,
         set_language_detector,
         get_language_detector,
+        set_default_tokenizer,
+        get_default_tokenizer,
+        set_default_segmenter,
+        get_default_segmenter,
+        set_default_normalizer,
+        get_default_normalizer,
+        set_use_reg_for_nlp,
+        get_use_reg_for_nlp,
     )
     import os
     
@@ -6708,6 +7063,40 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"[flexipipe] Configuration saved to: {get_config_file()}")
         return 0
     
+    if args.set_default_tokenizer is not None:
+        set_default_tokenizer(args.set_default_tokenizer if args.set_default_tokenizer else None)
+        if args.set_default_tokenizer:
+            print(f"[flexipipe] Default tokenizer set to: {args.set_default_tokenizer}")
+        else:
+            print(f"[flexipipe] Default tokenizer disabled (will use auto-detection)")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+    
+    if args.set_default_segmenter is not None:
+        set_default_segmenter(args.set_default_segmenter if args.set_default_segmenter else None)
+        if args.set_default_segmenter:
+            print(f"[flexipipe] Default segmenter set to: {args.set_default_segmenter}")
+        else:
+            print(f"[flexipipe] Default segmenter disabled (will use auto-detection)")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+    
+    if args.set_default_normalizer is not None:
+        set_default_normalizer(args.set_default_normalizer if args.set_default_normalizer else None)
+        if args.set_default_normalizer:
+            print(f"[flexipipe] Default normalizer set to: {args.set_default_normalizer}")
+        else:
+            print(f"[flexipipe] Default normalizer disabled (will use auto-detection)")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+    
+    if args.set_use_reg_for_nlp is not None:
+        set_use_reg_for_nlp(args.set_use_reg_for_nlp)
+        status = "enabled" if args.set_use_reg_for_nlp else "disabled"
+        print(f"[flexipipe] Use reg for NLP processing set to: {status}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+    
     if args.set_default_create_implicit_mwt is not None:
         # Set default create_implicit_mwt
         set_default_create_implicit_mwt(args.set_default_create_implicit_mwt)
@@ -6759,6 +7148,9 @@ def run_config(args: argparse.Namespace) -> int:
         prompt_install_extras = get_prompt_install_extras()
         default_download_model = get_default_download_model()
         language_detector = get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+        default_tokenizer = get_default_tokenizer()
+        default_segmenter = get_default_segmenter()
+        default_normalizer = get_default_normalizer()
 
         # Model registry configuration
         from .model_registry import DEFAULT_REGISTRY_BASE_URL
@@ -6825,6 +7217,10 @@ def run_config(args: argparse.Namespace) -> int:
                     "prompt_install_extras": bool(prompt_install_extras),
                     "download_model": bool(default_download_model),
                     "language_detector": language_detector,
+                    "default_tokenizer": default_tokenizer,
+                    "default_segmenter": default_segmenter,
+                    "default_normalizer": default_normalizer,
+                    "use_reg_for_nlp": bool(use_reg_for_nlp),
                 },
                 "model_registry": {
                     "mode": registry_mode,
@@ -6864,6 +7260,19 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"  Prompt before installing extras: {'enabled' if prompt_install_extras else 'disabled'}")
         print(f"  Auto-download models: {'enabled' if default_download_model else 'disabled'}")
         print(f"  Language detector: {language_detector}")
+        if default_tokenizer:
+            print(f"  Default tokenizer: {default_tokenizer}")
+        else:
+            print(f"  Default tokenizer: (not configured, will use auto-detection)")
+        if default_segmenter:
+            print(f"  Default segmenter: {default_segmenter}")
+        else:
+            print(f"  Default segmenter: (not configured, will use auto-detection)")
+        if default_normalizer:
+            print(f"  Default normalizer: {default_normalizer}")
+        else:
+            print(f"  Default normalizer: (not configured, will use auto-detection)")
+        print(f"  Use reg for NLP: {'enabled' if use_reg_for_nlp else 'disabled'}")
 
         # Show model registry configuration
         if registry_mode == "local":
@@ -6900,6 +7309,8 @@ def run_config(args: argparse.Namespace) -> int:
     print("  --set-default-backend <backend>              Set the default backend")
     print("  --set-default-output-format <format>  Set the default output format (teitok, conllu, conllu-ne, json)")
     print("  --set-language-detector <detector>           Set the language detector backend")
+    print("  --set-default-tokenizer <tokenizer>          Set the default tokenizer (e.g., 'flexitag', 'sentencepiece', or '' to disable)")
+    print("  --set-default-segmenter <segmenter>          Set the default segmenter (e.g., 'flexitag', 'sentencepiece', or '' to disable)")
     print("  --show                           Display current configuration")
     print(f"\nExample: python -m flexipipe config --set-models-dir /Volumes/External/models")
     print(f"Example: python -m flexipipe config --refresh-all-caches")

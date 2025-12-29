@@ -882,6 +882,52 @@ def evaluate_model(
     # Track tokenization differences for debug output
     tokenization_diffs = []
     
+    # Debug: Track alignment statistics (initialize even if not debug to avoid scope issues)
+    alignment_stats = {
+        "total_aligned": len(aligned_tokens),
+        "matched_tokens": sum(1 for _, p, _, _ in aligned_tokens if p is not None),
+        "unmatched_tokens": sum(1 for _, p, _, _ in aligned_tokens if p is None),
+        "upos_evaluations": 0,
+        "upos_correct": 0,
+        "is_positional": False,
+    }
+    
+    if debug:
+        # Check if alignment is 1:1 positional (all tokens match by position)
+        if len(aligned_tokens) == gold_token_count == pred_token_count:
+            positional_alignment = True
+            for i, (g_tok, p_tok, _, _) in enumerate(aligned_tokens):
+                if p_tok is None:
+                    positional_alignment = False
+                    break
+                # Check if gold token at position i matches predicted token at position i
+                gold_flat_idx = 0
+                for sent in eval_gold_doc.sentences:
+                    for tok in sent.tokens:
+                        if gold_flat_idx == i:
+                            if tok.form != g_tok.form:
+                                positional_alignment = False
+                            break
+                        gold_flat_idx += 1
+                    if gold_flat_idx > i:
+                        break
+                pred_flat_idx = 0
+                for sent in pred_doc.sentences:
+                    for tok in sent.tokens:
+                        if pred_flat_idx == i:
+                            if tok.form != p_tok.form:
+                                positional_alignment = False
+                            break
+                        pred_flat_idx += 1
+                    if pred_flat_idx > i:
+                        break
+                if not positional_alignment:
+                    break
+            alignment_stats["is_positional"] = positional_alignment
+        else:
+            alignment_stats["is_positional"] = False
+        print(f"[DEBUG] Alignment stats: {alignment_stats}")
+    
     # Evaluate on aligned tokens
     for gold_tok, pred_tok, gold_sent_idx, pred_sent_idx in aligned_tokens:
         if pred_tok is None:
@@ -897,7 +943,9 @@ def evaluate_model(
                 if gold_feats == "_":
                     gold_feats = ""
                 metrics["feats"].add(False)
-                metrics["feats_partial"].add(False)
+                # Only count FEATS_PARTIAL if there are actually features to compare
+                if gold_feats:
+                    metrics["feats_partial"].add(False)
                 if gold_part.upos or gold_feats:
                     metrics["upos+feats"].add(False)
                 if gold_part.lemma:
@@ -933,7 +981,12 @@ def evaluate_model(
         if len(gold_parts) == len(pred_parts):
             for gold_part, pred_part in zip(gold_parts, pred_parts):
                 if gold_part.upos:
-                    metrics["upos"].add(gold_part.upos == (pred_part.upos or ""))
+                    is_correct = gold_part.upos == (pred_part.upos or "")
+                    metrics["upos"].add(is_correct)
+                    if debug:
+                        alignment_stats["upos_evaluations"] += 1
+                        if is_correct:
+                            alignment_stats["upos_correct"] += 1
                 if gold_part.xpos:
                     metrics["xpos"].add(gold_part.xpos == (pred_part.xpos or ""))
                 gold_feats = gold_part.feats if gold_part.feats is not None else ""
@@ -943,7 +996,10 @@ def evaluate_model(
                 if pred_feats == "_":
                     pred_feats = ""
                 metrics["feats"].add(gold_feats == pred_feats)
-                metrics["feats_partial"].add(_feats_partial_match(gold_feats, pred_feats))
+                # Only count FEATS_PARTIAL if there are actually features to compare
+                # (either in gold or pred - if both are empty, don't count it)
+                if gold_feats or pred_feats:
+                    metrics["feats_partial"].add(_feats_partial_match(gold_feats, pred_feats))
                 # Evaluate UPOS+FEATS combination (both must match)
                 if gold_part.upos or gold_feats:
                     gold_upos = gold_part.upos or ""
@@ -958,6 +1014,11 @@ def evaluate_model(
                 if gold_part.expan:
                     metrics["expan"].add((pred_part.expan or "") == gold_part.expan)
         else:
+            # Debug: Track component mismatches
+            if debug:
+                print(f"[DEBUG] Component count mismatch: gold_parts={len(gold_parts)}, pred_parts={len(pred_parts)}")
+                print(f"  Gold token: form='{gold_tok.form}', upos='{gold_tok.upos}', tokid='{gold_tok.tokid}'")
+                print(f"  Pred token: form='{pred_tok.form}', upos='{pred_tok.upos}', tokid='{pred_tok.tokid}'")
             # Different number of parts - mark all fields as incorrect for this token
             for gold_part in gold_parts:
                 if gold_part.upos:
@@ -1078,6 +1139,54 @@ def evaluate_model(
         coverage = (split_covered / gold_split_total) if gold_split_total else None
         precision = (split_covered / predicted_split_total) if predicted_split_total else None
         part_form_accuracy = (split_correct_forms / split_covered) if split_covered else None
+
+    # Debug: Print final alignment statistics
+    if debug:
+        print(f"[DEBUG] Final alignment statistics:")
+        print(f"  Total aligned tokens: {alignment_stats['total_aligned']}")
+        print(f"  Matched tokens: {alignment_stats['matched_tokens']}")
+        print(f"  Unmatched tokens: {alignment_stats['unmatched_tokens']}")
+        print(f"  UPOS evaluations: {alignment_stats['upos_evaluations']}")
+        print(f"  UPOS correct: {alignment_stats['upos_correct']}")
+        print(f"  Is positional alignment: {alignment_stats.get('is_positional', 'unknown')}")
+        print(f"  UPOS metric: {metrics['upos'].correct}/{metrics['upos'].total} = {metrics['upos'].accuracy}")
+        # Compare with simple positional matching
+        if len(eval_gold_doc.sentences) == len(pred_doc.sentences):
+            positional_correct = 0
+            positional_total = 0
+            gold_flat = []
+            for sent in eval_gold_doc.sentences:
+                for tok in sent.tokens:
+                    gold_flat.append(tok)
+            pred_flat = []
+            for sent in pred_doc.sentences:
+                for tok in sent.tokens:
+                    pred_flat.append(tok)
+            for i in range(min(len(gold_flat), len(pred_flat))):
+                if gold_flat[i].upos:
+                    positional_total += 1
+                    if gold_flat[i].upos == (pred_flat[i].upos or ""):
+                        positional_correct += 1
+            positional_acc = positional_correct/positional_total if positional_total > 0 else 0
+            print(f"  Simple positional match: {positional_correct}/{positional_total} = {positional_acc}")
+            if abs(positional_correct - metrics['upos'].correct) < 2 and abs(positional_total - metrics['upos'].total) < 2:
+                print(f"  ⚠️ WARNING: Alignment results match simple positional matching!")
+                print(f"     This is expected when tokenization is identical and tokids align.")
+                print(f"     However, if different models produce identical scores, this may indicate a bug.")
+                # Check if alignment is actually 1:1 positional
+                alignment_is_positional = True
+                for i, (g_tok, p_tok, _, _) in enumerate(aligned_tokens):
+                    if p_tok is None:
+                        alignment_is_positional = False
+                        break
+                    if i < len(gold_flat) and i < len(pred_flat):
+                        if gold_flat[i].form != g_tok.form or pred_flat[i].form != p_tok.form:
+                            alignment_is_positional = False
+                            break
+                if alignment_is_positional:
+                    print(f"  INFO: Alignment is effectively 1:1 positional (tokenization identical, tokids match)")
+                else:
+                    print(f"  INFO: Alignment differs from positional matching")
 
     summary = {
         "model": model_str,

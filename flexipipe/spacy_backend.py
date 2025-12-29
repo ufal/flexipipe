@@ -526,15 +526,37 @@ def _spacy_doc_to_document(
             # Preserve from original if available
             space_after = original_token.space_after
         
+        # Use pos_ for UPOS, but fall back to tag_ if pos_ is empty (some models only have tagger, not morphologizer)
+        upos_value = ""
+        if preserve_pos_tags and original_token and original_token.upos:
+            upos_value = original_token.upos
+        elif hasattr(spacy_token, 'pos_') and spacy_token.pos_:
+            upos_value = spacy_token.pos_
+        elif hasattr(spacy_token, 'tag_') and spacy_token.tag_:
+            # Fallback: use tag_ if pos_ is empty (some models only have tagger)
+            # This is not ideal, but better than empty UPOS
+            upos_value = spacy_token.tag_
+        
+        # Calculate head: if head points to itself (self-loop), set to 0 (root)
+        # This handles cases where the parser wasn't trained properly
+        head_value = 0
+        if spacy_token.head:
+            head_idx = spacy_token.head.i
+            token_idx = spacy_token.i
+            # If head points to itself, it's a self-loop (parser issue) - treat as root
+            if head_idx == token_idx:
+                head_value = 0  # Root
+            else:
+                head_value = head_idx + 1  # Convert to 1-based
+        
         token = Token(
             id=spacy_token.i + 1,  # SpaCy uses 0-based, we use 1-based
             form=spacy_token.text,
             lemma=spacy_token.lemma_ if hasattr(spacy_token, 'lemma_') else "",
-            # Preserve POS tags from original if requested and available
-            upos=original_token.upos if (preserve_pos_tags and original_token and original_token.upos) else (spacy_token.pos_ if hasattr(spacy_token, 'pos_') else ""),
+            upos=upos_value,
             xpos=original_token.xpos if (preserve_pos_tags and original_token and original_token.xpos) else (spacy_token.tag_ if hasattr(spacy_token, 'tag_') else ""),
             feats=original_token.feats if (preserve_pos_tags and original_token and original_token.feats) else (_format_spacy_morph(spacy_token) if hasattr(spacy_token, 'morph') else ""),
-            head=spacy_token.head.i + 1 if spacy_token.head else 0,  # Convert to 1-based
+            head=head_value,
             deprel=spacy_token.dep_ if hasattr(spacy_token, 'dep_') else "",
             space_after=space_after,
             tokid=matched_tokid or "",  # Preserve tokid from original if matched
@@ -1162,11 +1184,12 @@ class SpacyBackend(BackendManager):
                     words = []
                     spaces = []
                     expanded_tokens = []  # Track which original tokens/subtokens map to which SpaCy tokens
+                    from ..doc_utils import get_effective_form
                     for tok in sent.tokens:
                         if tok.is_mwt and tok.subtokens:
                             # Expand MWT into subtokens
                             for sub_idx, sub in enumerate(tok.subtokens):
-                                words.append(sub.form)
+                                words.append(get_effective_form(sub))
                                 # Space after: only on the last subtoken of the MWT
                                 has_space = (sub_idx == len(tok.subtokens) - 1) and (
                                     tok.space_after is not False and (tok.space_after or tok.space_after is None)
@@ -1175,7 +1198,7 @@ class SpacyBackend(BackendManager):
                                 expanded_tokens.append(tok)  # Map back to parent MWT token
                         else:
                             # Regular token
-                            words.append(tok.form)
+                            words.append(get_effective_form(tok))
                             has_space = tok.space_after is not False and (tok.space_after or tok.space_after is None)
                             spaces.append(has_space)
                             expanded_tokens.append(tok)
@@ -1384,10 +1407,21 @@ class SpacyBackend(BackendManager):
                     dev_files = []
 
         output_dir = output_dir.resolve()
+        force = kwargs.get("force", False)
         if output_dir.exists():
             if any(output_dir.iterdir()):
-                raise ValueError(f"Output directory {output_dir} must be empty before training.")
-            shutil.rmtree(output_dir)
+                if force:
+                    import sys
+                    print(f"[flexipipe] Warning: Model already exists at {output_dir}. Emptying directory (--force specified).", file=sys.stderr)
+                    shutil.rmtree(output_dir)
+                else:
+                    raise ValueError(
+                        f"Output directory {output_dir} must be empty before training. "
+                        f"Use --force to overwrite existing model."
+                    )
+            else:
+                # Directory exists but is empty, remove it anyway for clean state
+                shutil.rmtree(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory() as tmp_dir_str:
@@ -1436,15 +1470,28 @@ class SpacyBackend(BackendManager):
             coverage = detect_annotation_coverage(train_files[0]) if train_files else {}
             
             # Build pipeline based on available annotations
-            # - tagger: needs UPOS or XPOS
-            # - morphologizer: needs FEATS
+            # - morphologizer: predicts pos_ (UPOS) and morph (FEATS) - use when we have UPOS
+            # - tagger: predicts tag_ (XPOS) - use when we have XPOS but no UPOS, or when we want both
             # - parser: needs HEAD and DEPREL
             pipeline = ["tok2vec"]  # Always include tok2vec (token vectorizer)
             
-            if coverage.get("upos") or coverage.get("xpos"):
-                pipeline.append("tagger")
-            if coverage.get("feats"):
+            # Use morphologizer for UPOS (it predicts pos_ which is UPOS)
+            # Use tagger for XPOS (it predicts tag_ which is XPOS)
+            # If we have both UPOS and XPOS, we can use both components
+            # If we only have UPOS, use morphologizer (even without FEATS, it can predict pos_)
+            # If we only have XPOS, use tagger
+            if coverage.get("upos"):
+                # Morphologizer predicts pos_ (UPOS) - use it when we have UPOS
+                # Even if we don't have FEATS, morphologizer can still predict pos_
                 pipeline.append("morphologizer")
+            if coverage.get("xpos") and not coverage.get("upos"):
+                # Only use tagger if we have XPOS but no UPOS
+                # If we have both, morphologizer handles UPOS and tagger handles XPOS
+                pipeline.append("tagger")
+            elif coverage.get("xpos") and coverage.get("upos"):
+                # If we have both UPOS and XPOS, use both components
+                # Morphologizer for UPOS (pos_), tagger for XPOS (tag_)
+                pipeline.append("tagger")
             if coverage.get("head") and coverage.get("deprel"):
                 pipeline.append("parser")
             
@@ -1492,7 +1539,24 @@ class SpacyBackend(BackendManager):
             # Use the original path (not resolved) to match where the file actually exists
             base_config["paths"]["train"] = str(train_docbin)
             base_config["paths"]["dev"] = str(dev_docbin)
+            
+            # Note: SpaCy's convert maps CoNLL-U column 4 (UPOS) to pos_ and column 5 (XPOS) to tag_
+            # - Morphologizer predicts pos_ (UPOS) and morph (FEATS)
+            # - Tagger predicts tag_ (XPOS)
+            # The pipeline components are already configured correctly above based on available annotations
 
+            # Apply training parameters from kwargs if provided
+            training_iterations = kwargs.get("training_iterations")
+            training_patience = kwargs.get("training_patience")
+            if training_iterations is not None:
+                if "training" not in base_config:
+                    base_config["training"] = {}
+                base_config["training"]["max_steps"] = training_iterations
+            if training_patience is not None:
+                if "training" not in base_config:
+                    base_config["training"] = {}
+                base_config["training"]["patience"] = training_patience
+            
             config_path = tmp_dir / "config.cfg"
             base_config.to_disk(config_path)
             
@@ -1525,8 +1589,13 @@ class SpacyBackend(BackendManager):
             except Exception:
                 meta = {}
         meta["name"] = model_name
-        meta["lang"] = language
+        meta["lang"] = language  # This may be "xx" for unsupported languages
         flexipipe_meta = meta.get("flexipipe", {})
+        # Always preserve the original language code provided during training (e.g., "swa")
+        # This is more reliable than extracting from the model name
+        original_language = kwargs.get("language") or self._language
+        if original_language:
+            flexipipe_meta["original_language"] = original_language
         flexipipe_meta.update(
             {
                 "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -1929,16 +1998,20 @@ def get_spacy_model_entries(
                     # If flexipipe.trained_at exists, this is a locally trained model
                     if flexipipe_meta.get("trained_at"):
                         model_source = "local"
-                    # Use lang from meta.json, but prefer flexipipe metadata if available
-                    meta_lang = meta.get("lang")
-                    # If lang is "xx" (multilingual) but we have flexipipe metadata, 
-                    # the actual language might be in the model name or training source
-                    if meta_lang and meta_lang != "xx":
-                        lang = meta_lang
+                    # Prioritize original_language from flexipipe metadata (the language provided during training)
+                    # This is more reliable than extracting from the model name
+                    if flexipipe_meta.get("original_language"):
+                        lang = flexipipe_meta["original_language"]
+                    else:
+                        # Fall back to lang from meta.json if no original_language is set
+                        meta_lang = meta.get("lang")
+                        if meta_lang and meta_lang != "xx":
+                            lang = meta_lang
             except Exception:
                 pass
         
-        # If not found in meta.json, extract from model name (handle both _ and -)
+        # Only extract from model name as a last resort if no language info is available
+        # Model names don't necessarily follow a fixed structure, so this is unreliable
         if not lang:
             # Try splitting on underscore first (standard SpaCy format: en_core_web_sm)
             if "_" in model_name:
@@ -1947,7 +2020,7 @@ def get_spacy_model_entries(
             elif "-" in model_name:
                 lang = model_name.split("-")[0]
             else:
-                # No separator, use whole name as language code
+                # No separator, use whole name as language code (last resort)
                 lang = model_name
         
         # Determine source if not already set

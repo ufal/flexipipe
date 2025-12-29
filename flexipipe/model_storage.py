@@ -383,6 +383,81 @@ def get_prompt_install_extras() -> bool:
     return config.get("prompt_install_extras", True)
 
 
+def get_default_tokenizer() -> Optional[str]:
+    """
+    Get the configured default tokenizer.
+    Returns None if not set (will use auto-detection).
+    """
+    config = read_config()
+    return config.get("default_tokenizer", None)
+
+
+def set_default_tokenizer(tokenizer: Optional[str]) -> None:
+    """
+    Set the default tokenizer in configuration.
+    Set to None or empty string to disable default and use auto-detection.
+    """
+    if tokenizer == "":
+        tokenizer = None
+    write_config({"default_tokenizer": tokenizer})
+
+
+def get_default_segmenter() -> Optional[str]:
+    """
+    Get the configured default segmenter.
+    Returns None if not set (will use auto-detection).
+    """
+    config = read_config()
+    return config.get("default_segmenter", None)
+
+
+def set_default_segmenter(segmenter: Optional[str]) -> None:
+    """
+    Set the default segmenter in configuration.
+    Set to None or empty string to disable default and use auto-detection.
+    """
+    if segmenter == "":
+        segmenter = None
+    write_config({"default_segmenter": segmenter})
+
+
+def get_default_normalizer() -> Optional[str]:
+    """
+    Get the configured default normalizer.
+    Returns None if not set (will use auto-detection).
+    """
+    config = read_config()
+    return config.get("default_normalizer", None)
+
+
+def set_default_normalizer(normalizer: Optional[str]) -> None:
+    """
+    Set the default normalizer in configuration.
+    Set to None or empty string to disable default and use auto-detection.
+    """
+    if normalizer == "":
+        normalizer = None
+    write_config({"default_normalizer": normalizer})
+
+
+def get_use_reg_for_nlp() -> bool:
+    """
+    Get whether to use reg attribute instead of form for NLP processing when reg exists.
+    Returns False if not set (default: use form only).
+    """
+    config = read_config()
+    return config.get("use_reg_for_nlp", False)
+
+
+def set_use_reg_for_nlp(use_reg: bool) -> None:
+    """
+    Set whether to use reg attribute instead of form for NLP processing when reg exists.
+    When True, backends will use token.reg if available, otherwise token.form.
+    When False (default), backends always use token.form.
+    """
+    write_config({"use_reg_for_nlp": bool(use_reg)})
+
+
 def set_prompt_install_extras(enabled: bool) -> None:
     """Set prompting behaviour for optional extras."""
     write_config({"prompt_install_extras": bool(enabled)})
@@ -666,13 +741,21 @@ def is_model_installed(backend: str, model_name: str) -> bool:
             try:
                 import spacy  # type: ignore
                 # Try to load the model to verify it's actually usable
+                # For models in flexipipe directory, load by path; for standard models, load by name
                 try:
-                    nlp = spacy.load(model_name)
+                    # First try loading by path (for flexipipe-managed models)
+                    nlp = spacy.load(str(model_path))
                     if nlp is not None:
                         return True
                 except Exception:
-                    # Model directory exists but model can't be loaded - not really installed
-                    return False
+                    # If path loading fails, try loading by name (for standard SpaCy models)
+                    try:
+                        nlp = spacy.load(model_name)
+                        if nlp is not None:
+                            return True
+                    except Exception:
+                        # Model directory exists but model can't be loaded - not really installed
+                        return False
             except ImportError:
                 # If spacy is not available, just check for meta.json
                 return True

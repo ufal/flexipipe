@@ -808,6 +808,7 @@ def document_to_conllu(
     custom_misc_attrs: Optional[Dict[str, str]] = None,  # Map attr key -> MISC tag name (e.g., {"myattr": "MyTag"})
     include_tokid: bool = False,  # Force include TokId in MISC (even auto-generated ones)
     suppress_space_after_in_misc: bool = False,  # If True, don't add SpaceAfter=No to MISC (use token.space_after instead)
+    use_effective_form: bool = False,  # If True, use effective form (reg attribute) instead of form when available
 ) -> str:
     lines: List[str] = []
 
@@ -975,7 +976,7 @@ def document_to_conllu(
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
         extra_entities = span_entities.get(sent_idx)
-        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid, suppress_space_after_in_misc=suppress_space_after_in_misc)
+        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid, suppress_space_after_in_misc=suppress_space_after_in_misc, use_effective_form=use_effective_form)
         lines.extend(sentence_lines)
         # Add exactly one empty line after each sentence (required by CoNLL-U format)
         lines.append("")
@@ -1000,7 +1001,7 @@ def document_to_conllu(
     return result
 
 
-def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False, suppress_space_after_in_misc: bool = False) -> List[str]:
+def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False, suppress_space_after_in_misc: bool = False, use_effective_form: bool = False) -> List[str]:
     lines: List[str] = []
     # Print standard UD sentence attributes
     sent_standard_attrs = sentence.get_standard_attrs()
@@ -1138,6 +1139,8 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
                 space_after_range = None
             
             end_id = current_id + len(token.subtokens) - 1
+            # Always use token.form for output (not get_effective_form)
+            # get_effective_form is only for NLP processing, not for output
             form = _escape(token.form)
             # For MWT range, include TokId if requested (for UDPipe preservation)
             misc_range = _format_misc_for_range(space_after_range, token=token, include_tokid=include_tokid)
@@ -1173,7 +1176,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
                 space_after_tok = None
             
             entity_label = token_entity_labels.get(current_id, "")
-            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, suppress_space_after_in_misc=suppress_space_after_in_misc, has_dependencies=has_dependencies))
+            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, suppress_space_after_in_misc=suppress_space_after_in_misc, has_dependencies=has_dependencies, use_effective_form=use_effective_form))
             current_id += 1
 
     return lines
@@ -1193,6 +1196,7 @@ def _format_token_line(
     custom_misc_attrs: Optional[Dict[str, str]] = None,
     suppress_space_after_in_misc: bool = False,
     has_dependencies: bool = True,  # Default to True for backward compatibility
+    use_effective_form: bool = False,  # If True, use effective form (reg attribute) instead of form when available
 ) -> str:
     # Normalize head: flexipipe stores root as 0/None; some callers may use "_" or "".
     head_raw = getattr(token, "head", 0)
@@ -1223,8 +1227,16 @@ def _format_token_line(
         entity_format=entity_format,
         use_ne_format=use_ne_format,
     )
+    # Use effective form if requested (for backend processing with normalized forms)
+    # Otherwise use token.form (for output, showing original surface form)
+    if use_effective_form:
+        from .doc_utils import get_effective_form
+        form_to_use = get_effective_form(token)
+    else:
+        form_to_use = token.form
+    
     return (
-        f"{token_id}\t{_escape(token.form)}\t{_escape(getattr(token, 'lemma', ''))}\t"
+        f"{token_id}\t{_escape(form_to_use)}\t{_escape(getattr(token, 'lemma', ''))}\t"
         f"{_escape(getattr(token, 'upos', ''))}\t{_escape(getattr(token, 'xpos', ''))}\t"
         f"{_escape(getattr(token, 'feats', ''))}\t{head_value}\t{_escape(deprel)}\t{_escape(deps)}\t{misc}"
     )

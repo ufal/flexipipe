@@ -332,9 +332,10 @@ class TreeTaggerBackend(BackendManager):
 
         flat_tokens: List[str] = []
         token_map: List[tuple[int, int]] = []
+        from ..doc_utils import get_effective_form
         for sent_idx, sentence in enumerate(document.sentences):
             for tok_idx, token in enumerate(sentence.tokens):
-                form = token.form or token.text or ""
+                form = get_effective_form(token) or token.text or ""
                 cleaned = (form if form else "_").replace("\t", " ")
                 flat_tokens.append(cleaned)
                 token_map.append((sent_idx, tok_idx))

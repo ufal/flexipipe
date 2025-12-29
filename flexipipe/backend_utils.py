@@ -38,30 +38,43 @@ def validate_backend_kwargs(
 
 
 def resolve_model_from_language(
-    language: str,
+    language: Optional[str],
     backend_name: str,
     *,
+    model_name: Optional[str] = None,
     preferred_only: bool = True,
     use_cache: bool = True,
-) -> str:
+) -> Optional[str]:
     """
-    Resolve a model name from a language code using the model catalog.
+    Central function to resolve a model name from language code or return provided model.
     
-    This is a common pattern used by backends like UDPipe and Flexitag
-    to automatically select a model based on language.
+    This is the unified model resolution function used by all backends. It:
+    1. Returns model_name if provided (no resolution needed)
+    2. Resolves model from language using the unified model catalog if language is provided
+    3. Returns None if neither model_name nor language is provided
     
     Args:
-        language: Language code (e.g., "en", "cs")
-        backend_name: Name of the backend (e.g., "udpipe", "flexitag")
-        preferred_only: If True, only look for preferred models first
+        language: Language code (e.g., "en", "cs", "yor")
+        backend_name: Name of the backend (e.g., "udpipe", "flexitag", "spacy", "transformers")
+        model_name: Optional model name (if provided, this is returned directly)
+        preferred_only: If True, prefer models marked as preferred in the registry
         use_cache: Whether to use cached model catalog data
     
     Returns:
-        Model name/identifier
+        Model name/identifier, or None if neither model_name nor language is provided
     
     Raises:
-        ValueError: If no model is found for the language
+        ValueError: If language is provided but no model is found for that language
     """
+    # If model_name is provided, return it directly (no resolution needed)
+    if model_name:
+        return model_name
+    
+    # If no language provided, cannot resolve
+    if not language:
+        return None
+    
+    # Resolve from unified model catalog
     from .model_catalog import get_models_for_language
     
     # Try preferred models first if requested
@@ -85,6 +98,6 @@ def resolve_model_from_language(
     from .model_storage import is_running_from_teitok
     teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend {backend_name}' to see available models."
     raise ValueError(
-        f"No {backend_name} model found for language '{language}'.{teitok_msg}"
+        f"[flexipipe] No {backend_name} model found for language '{language}'.{teitok_msg}"
     )
 

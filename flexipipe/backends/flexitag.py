@@ -431,23 +431,25 @@ def _create_flexitag_backend(
     
     validate_backend_kwargs(kwargs, "Flexitag", allowed_extra=["download_model", "training"])
     
-    # Resolve model path
-    resolved_model = model or model_name
-    
-    # If no model specified but language is provided, try to resolve from model catalog
-    if not resolved_model and language:
-        try:
-            resolved_model = resolve_model_from_language(language, "flexitag")
-        except ValueError:
-            # Re-raise ValueError as-is (it already has a helpful message)
-            raise
-        except Exception as e:
-            # If model catalog lookup fails for other reasons, provide a helpful error message
-            from ..model_storage import is_running_from_teitok
-            teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend flexitag' to see available models."
-            raise ValueError(
-                f"Could not resolve Flexitag model for language '{language}': {e}.{teitok_msg}"
-            ) from e
+    # Resolve model using central function
+    try:
+        resolved_model = resolve_model_from_language(
+            language=language,
+            backend_name="flexitag",
+            model_name=model or model_name,
+            preferred_only=True,
+            use_cache=True,
+        )
+    except ValueError:
+        # Re-raise ValueError as-is (it already has a helpful message)
+        raise
+    except Exception as e:
+        # If model catalog lookup fails for other reasons, provide a helpful error message
+        from ..model_storage import is_running_from_teitok
+        teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend flexitag' to see available models."
+        raise ValueError(
+            f"Could not resolve Flexitag model for language '{language}': {e}.{teitok_msg}"
+        ) from e
     
     if params_path:
         resolved_path = Path(params_path)

@@ -388,10 +388,26 @@ def merge_remote_and_local_models(
         else:
             # Merge metadata from remote (but keep local status)
             local_entry = merged[model_name]
-            # Update metadata fields that might be missing locally
-            for key in ["backend_version", "download_url", "preferred", "description"]:
-                if key not in local_entry and key in model_entry:
-                    local_entry[key] = model_entry[key]
+            # Update metadata fields that might be missing locally or incorrect
+            # Language metadata from registry should take precedence (registry is authoritative)
+            for key in ["backend_version", "download_url", "preferred", "description", 
+                       "language_iso", "language_name", "languages"]:
+                if key in model_entry:
+                    # For language fields, always prefer registry (it's authoritative)
+                    if key in ["language_iso", "language_name", "languages"]:
+                        local_entry[key] = model_entry[key]
+                    # For other fields, only update if missing locally
+                    elif key not in local_entry:
+                        local_entry[key] = model_entry[key]
+            
+            # If language_iso was updated but languages wasn't explicitly in registry, update languages from language_iso
+            if "language_iso" in model_entry and "languages" not in model_entry:
+                updated_iso = local_entry.get("language_iso")
+                if updated_iso:
+                    local_entry["languages"] = [updated_iso]
+                elif "language_iso" in local_entry and local_entry["language_iso"]:
+                    local_entry["languages"] = [local_entry["language_iso"]]
+            
             # Mark source as local (local takes precedence)
             local_entry["source"] = "local"
     

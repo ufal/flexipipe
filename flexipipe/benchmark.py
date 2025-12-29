@@ -135,6 +135,7 @@ class BenchmarkRunner:
         treebank_root: Optional[Path] = None,
         output_root: Optional[Path] = None,
         verbose: bool = False,
+        debug: bool = False,
         dry_run: bool = False,
         treebank_catalog: Optional[list[dict]] = None,
         download_models: bool = False,
@@ -146,6 +147,7 @@ class BenchmarkRunner:
         self.output_root = output_root or (BENCHMARK_ROOT / "runs")
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose
+        self.debug = debug
         self.dry_run = dry_run
         self.download_models = download_models
         self.unicode_normalize = unicode_normalize
@@ -226,7 +228,9 @@ class BenchmarkRunner:
         for entry in entries.values():
             if not isinstance(entry, dict):
                 continue
-            if language_matches_entry(entry, query, allow_fuzzy=True):
+            # Don't use fuzzy matching for model discovery - it causes incorrect matches
+            # (e.g., "sa" models matching "swa")
+            if language_matches_entry(entry, query, allow_fuzzy=False):
                 model_name = entry.get("model")
                 if model_name:
                     models.append(model_name)
@@ -367,6 +371,12 @@ class BenchmarkRunner:
             / treebank_path.stem
         )
         output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Debug: Verify output directory is unique
+        if self.debug:
+            print(f"[DEBUG] Job: language={job.language}, backend={job.backend}, model={job.model}, treebank={treebank_path.name}")
+            print(f"[DEBUG] Output directory: {output_dir}")
+            print(f"[DEBUG] Metrics path will be: {output_dir / 'metrics.json'}")
 
         neural_backend = None
         model_path: Optional[Path] = None
@@ -513,11 +523,30 @@ class BenchmarkRunner:
                     model_path=model_path,
                     neural_backend=neural_backend,
                     verbose=self.verbose,
+                    debug=self.debug,
                     mode=job.mode,
                     create_implicit_mwt=False,
                     unicode_normalize=self.unicode_normalize,
                 )
             except Exception as exc:
+                error_msg = str(exc)
+                error_lower = error_msg.lower()
+                
+                # Check for unsupported language errors (e.g., from Stanza)
+                is_unsupported_lang = (
+                    "unsupported" in error_lower and "language" in error_lower
+                    or "no processors to load for language" in error_lower
+                    or "language" in error_lower and "is currently unsupported" in error_lower
+                )
+                
+                if is_unsupported_lang:
+                    print(
+                        f"[benchmark] ⚠ Skipping {job.backend}/{job.model or 'default'} "
+                        f"on {Path(job.treebank).name}: Language '{job.language}' is not supported by this backend.",
+                        file=sys.stderr
+                    )
+                    return  # Skip this job
+                
                 print(
                     f"[benchmark] ✗ Failed {job.backend}/{job.model or 'default'} "
                     f"on {Path(job.treebank).name}: {exc}",
@@ -528,6 +557,18 @@ class BenchmarkRunner:
                     traceback.print_exc()
                 return  # Skip this job
             elapsed = time.time() - start
+            
+            # Debug: Verify metrics path
+            if self.debug:
+                print(f"[DEBUG] Metrics path loaded: {metrics_path}")
+                print(f"[DEBUG] Metrics path exists: {metrics_path.exists()}")
+                if metrics_path.exists():
+                    import json
+                    with metrics_path.open("r", encoding="utf-8") as f:
+                        metrics_data = json.load(f)
+                    upos_metric = metrics_data.get("metrics", {}).get("upos", {})
+                    print(f"[DEBUG] Metrics file UPOS: {upos_metric.get('correct')}/{upos_metric.get('total')} = {upos_metric.get('accuracy')}")
+            
             summary = self._load_metrics(metrics_path)
             model_size = self._compute_model_size_bytes(job, model_path)
             entry = self._build_result_entry(job, summary, elapsed, model_size)
@@ -542,16 +583,28 @@ class BenchmarkRunner:
             parts = []
             if upos_acc is not None:
                 parts.append(f"UPOS: {upos_acc*100:.1f}%")
+            else:
+                parts.append("UPOS: --")
             if xpos_acc is not None:
                 parts.append(f"XPOS: {xpos_acc*100:.1f}%")
+            else:
+                parts.append("XPOS: --")
             if feats_partial_acc is not None:
                 parts.append(f"FEATS_PARTIAL: {feats_partial_acc*100:.1f}%")
+            else:
+                parts.append("FEATS_PARTIAL: --")
             if lemma_acc is not None:
                 parts.append(f"LEMMA: {lemma_acc*100:.1f}%")
+            else:
+                parts.append("LEMMA: --")
             if uas is not None:
                 parts.append(f"UAS: {uas*100:.1f}%")
+            else:
+                parts.append("UAS: --")
             if las is not None:
                 parts.append(f"LAS: {las*100:.1f}%")
+            else:
+                parts.append("LAS: --")
             metrics_str = ", ".join(parts) if parts else "no metrics"
             print(
                 f"[benchmark] ✓ Completed {job.backend}/{job.model or 'default'} "
@@ -1434,9 +1487,30 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
         for tb in args.treebank:
             tb_path = Path(tb).expanduser()
             if not tb_path.exists():
-                print(f"[benchmark] Warning: treebank file '{tb_path}' does not exist; skipping.")
+                print(f"[benchmark] Warning: treebank path '{tb_path}' does not exist; skipping.")
                 continue
-            explicit_treebanks.append(tb_path)
+            # If it's a directory, look for train.conllu, test.conllu, or dev.conllu
+            if tb_path.is_dir():
+                # Try train.conllu first (most common for benchmarking)
+                train_file = tb_path / "train.conllu"
+                test_file = tb_path / "test.conllu"
+                dev_file = tb_path / "dev.conllu"
+                if train_file.exists():
+                    explicit_treebanks.append(train_file)
+                    if runner.verbose:
+                        print(f"[benchmark] Found train.conllu in directory '{tb_path}', using it for benchmarking.")
+                elif test_file.exists():
+                    explicit_treebanks.append(test_file)
+                    if runner.verbose:
+                        print(f"[benchmark] Found test.conllu in directory '{tb_path}', using it for benchmarking.")
+                elif dev_file.exists():
+                    explicit_treebanks.append(dev_file)
+                    if runner.verbose:
+                        print(f"[benchmark] Found dev.conllu in directory '{tb_path}', using it for benchmarking.")
+                else:
+                    print(f"[benchmark] Warning: directory '{tb_path}' does not contain train.conllu, test.conllu, or dev.conllu; skipping.")
+            else:
+                explicit_treebanks.append(tb_path)
         if not explicit_treebanks:
             print("[benchmark] No valid treebank paths supplied via --treebank.")
         # When explicit treebanks are provided, only use the explicitly provided language(s)
@@ -1453,9 +1527,22 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
     jobs: list[BenchmarkJob] = []
     for language in languages:
         if explicit_treebanks is not None:
-            treebanks = [
-                tb for tb in explicit_treebanks if language.lower() in tb.name.lower()
-            ] or explicit_treebanks
+            # Filter treebanks by language code in filename
+            # If multiple languages are specified, each should only use treebanks that match its language code
+            filtered_treebanks = [
+                tb for tb in explicit_treebanks if language.lower() in tb.name.lower() or language.lower() in str(tb).lower()
+            ]
+            # Only fall back to all treebanks if:
+            # 1. No treebanks matched the language filter, AND
+            # 2. Only one language is being processed (to avoid using the same treebank for multiple languages)
+            if not filtered_treebanks and len(languages) == 1:
+                treebanks = explicit_treebanks
+            elif not filtered_treebanks:
+                # Multiple languages but no match - warn and skip this language
+                print(f"[benchmark] Warning: no treebanks found matching language '{language}' in explicitly provided treebanks. Skipping language '{language}'.")
+                continue
+            else:
+                treebanks = filtered_treebanks
         else:
             treebanks = runner.discover_treebanks(language, limit=args.limit_treebanks)
         if not treebanks:
@@ -1489,7 +1576,9 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
                     for entry in entries.values():
                         if not isinstance(entry, dict):
                             continue
-                        if language_matches_entry(entry, query, allow_fuzzy=True):
+                        # Don't use fuzzy matching for model discovery - it causes incorrect matches
+                        # (e.g., "sa" models matching "swa")
+                        if language_matches_entry(entry, query, allow_fuzzy=False):
                             model_name = entry.get("model")
                             if model_name:
                                 model_names.append(model_name)
@@ -1630,6 +1719,7 @@ def run_cli(args: argparse.Namespace) -> None:
         treebank_root=treebank_root,
         output_root=output_root,
         verbose=args.verbose,
+        debug=getattr(args, "debug", False),
         dry_run=args.dry_run,
         treebank_catalog=treebank_catalog,
         download_models=getattr(args, "download_models", False),

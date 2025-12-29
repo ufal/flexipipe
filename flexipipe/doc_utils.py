@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .doc import Document, Entity, Sentence, SubToken, Token
+from .model_storage import get_use_reg_for_nlp
 
 
 def collect_span_entities_by_sentence(
@@ -151,4 +152,31 @@ def document_to_json_payload(document: Document) -> dict:
     if document.spans:
         result["spans"] = {layer: [span.to_dict() for span in spans] for layer, spans in document.spans.items()}
     return result
+
+
+def get_effective_form(token: Token | SubToken, *, use_reg_for_nlp: Optional[bool] = None) -> str:
+    """
+    Get the effective form to use for NLP processing.
+    
+    If use_reg_for_nlp is True (or configured), returns token.reg if available,
+    otherwise returns token.form. This allows backends to use normalized forms
+    when available, similar to how flexitag works.
+    
+    Args:
+        token: Token or SubToken to get form from
+        use_reg_for_nlp: Whether to use reg when available. If None, reads from config.
+    
+    Returns:
+        The form to use for NLP processing (reg if available and configured, otherwise form)
+    """
+    if use_reg_for_nlp is None:
+        from .model_storage import get_use_reg_for_nlp
+        use_reg_for_nlp = get_use_reg_for_nlp()
+    
+    if use_reg_for_nlp:
+        reg = getattr(token, "reg", "") or token.attrs.get("reg", "")
+        if reg and reg != "_" and reg != "":
+            return reg
+    
+    return token.form or ""
 

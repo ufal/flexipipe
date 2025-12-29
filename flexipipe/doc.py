@@ -727,36 +727,34 @@ class Document(AttrsMixin):
             self.set_attr(name, value)
 
     @classmethod
-    def from_plain_text(cls, text: str, *, doc_id: str = "", tokenize: bool = True, segment: bool = True) -> "Document":
+    def from_plain_text(
+        cls, 
+        text: str, 
+        *, 
+        doc_id: str = "", 
+        tokenize: bool = True, 
+        segment: bool = True,
+        keep_contractions: bool = True,
+        keep_hyphenated: bool = True,
+    ) -> "Document":
         """
         Create a Document from plain text.
         
         Args:
             text: Plain text input
             doc_id: Document ID
-            tokenize: If True, use UD-style tokenization (splits punctuation from words).
-                     If False, simple whitespace splitting.
+            tokenize: If True, use improved Unicode-based tokenization (properly handles
+                     combining marks/diacritics). If False, simple whitespace splitting.
             segment: If True, split text into sentences at sentence-ending punctuation.
+            keep_contractions: If True, keep contractions like "it's" as one token.
+                             If False, split them: ["it", "'", "s"]
+            keep_hyphenated: If True, keep hyphenated compounds like "state-of-the-art"
+                           as one token. If False, split on hyphens.
         """
-        import re  # Import at the top level since it's used in multiple places
+        from .unicode_tokenizer import tokenize_unicode, segment_sentences
         
         document = cls(id=doc_id)
         sentence_id = 1
-        
-        if tokenize:
-            apostrophes = "'’"
-            # Use UD-style tokenization that splits punctuation from words
-            # Pattern for contractions: letter(s) + apostrophe + letter(s)
-            contraction_pattern = rf"[\w]+[{apostrophes}][\w]+"
-            trailing_apostrophe_pattern = rf"[\w]+[{apostrophes}]"
-            # Pattern for hyphenated compounds
-            compound_pattern = r"[\w]+(?:-[\w]+)+"
-            # Pattern for regular words (including numbers and mixed alphanumeric, Unicode-aware)
-            word_pattern = r"[\w]+"
-            # Pattern for punctuation (everything that's not whitespace, word chars, hyphen, or apostrophe)
-            punct_pattern = r"[^\s\w\-']+"
-            # Combined pattern (order matters: contractions first, then compounds, then words, then punctuation)
-            token_pattern = f"({contraction_pattern}|{trailing_apostrophe_pattern}|{compound_pattern}|{word_pattern}|{punct_pattern})"
         
         # Process each line
         for line in text.splitlines():
@@ -764,119 +762,9 @@ class Document(AttrsMixin):
             if not stripped:
                 continue
             
-            # Sentence segmentation: split on sentence-ending punctuation
-            # But be smart about quotes - don't split on punctuation inside quotes
+            # Sentence segmentation
             if segment:
-                sentence_texts = []
-                current_sentence = []
-                in_double_quotes = False
-                in_single_quotes = False
-                i = 0
-                
-                while i < len(stripped):
-                    char = stripped[i]
-                    
-                    # Track quote state
-                    if char == '"' and (i == 0 or stripped[i-1] != '\\'):
-                        was_in_quotes = in_double_quotes
-                        in_double_quotes = not in_double_quotes
-                        current_sentence.append(char)
-                        # If we just closed quotes, check if there's more text after
-                        # If there's text after the quote (after whitespace), it's a new sentence
-                        if was_in_quotes and not in_double_quotes:
-                            # We just closed quotes - look ahead for text after whitespace
-                            j = i + 1
-                            while j < len(stripped) and stripped[j] in ' \t':
-                                j += 1
-                            if j < len(stripped) and stripped[j] not in '.!?':
-                                # There's text after the closing quote - end this sentence
-                                sentence_text = ''.join(current_sentence).strip()
-                                if sentence_text:
-                                    sentence_texts.append(sentence_text)
-                                current_sentence = []
-                                # Skip whitespace
-                                i = j - 1  # Will be incremented at end of loop
-                                continue
-                    elif char in ("'", "’") and (i == 0 or stripped[i-1] != '\\'):
-                        # Treat apostrophes as quotes only when they are not part of a word
-                        prev_is_word = i > 0 and re.match(r'[\w]', stripped[i-1])
-                        next_is_word = i < len(stripped) - 1 and re.match(r'[\w]', stripped[i+1])
-                        if prev_is_word or next_is_word:
-                            # Part of a word (contraction, possessive, etc.)
-                            current_sentence.append(char)
-                        else:
-                            was_in_quotes = in_single_quotes
-                            in_single_quotes = not in_single_quotes
-                            current_sentence.append(char)
-                            # If we just closed quotes, check if there's more text after
-                            if was_in_quotes and not in_single_quotes:
-                                j = i + 1
-                                while j < len(stripped) and stripped[j] in ' \t':
-                                    j += 1
-                                if j < len(stripped) and stripped[j] not in '.!?':
-                                    sentence_text = ''.join(current_sentence).strip()
-                                    if sentence_text:
-                                        sentence_texts.append(sentence_text)
-                                    current_sentence = []
-                                    i = j - 1
-                                    continue
-                    elif char in '.!?' and not in_double_quotes and not in_single_quotes:
-                        # Sentence-ending punctuation outside of quotes
-                        current_sentence.append(char)
-                        # Check if followed by whitespace or end of string
-                        # Also check if followed by closing quote then whitespace
-                        if (i + 1 >= len(stripped) or  # End of string
-                            stripped[i+1] in ' \t\n'):  # Whitespace
-                            # End of sentence
-                            sentence_text = ''.join(current_sentence).strip()
-                            if sentence_text:
-                                sentence_texts.append(sentence_text)
-                            current_sentence = []
-                            # Skip whitespace after sentence ending
-                            i += 1
-                            while i < len(stripped) and stripped[i] in ' \t\n':
-                                i += 1
-                            # Don't continue here - we need to process the next character
-                            # The loop will increment i, but we've already advanced past whitespace
-                            if i >= len(stripped):
-                                break
-                            continue
-                        elif i + 1 < len(stripped) and stripped[i+1] in '"\'':
-                            # Punctuation followed by quote - check if quote is closing and followed by whitespace
-                            if i + 2 < len(stripped) and stripped[i+2] in ' \t\n':
-                                # Quote then whitespace - end of sentence
-                                current_sentence.append(stripped[i+1])  # Add the quote
-                                sentence_text = ''.join(current_sentence).strip()
-                                if sentence_text:
-                                    sentence_texts.append(sentence_text)
-                                current_sentence = []
-                                # Skip quote and whitespace
-                                i += 2
-                                while i < len(stripped) and stripped[i] in ' \t':
-                                    i += 1
-                                continue
-                            else:
-                                # Quote but no whitespace after - not end of sentence
-                                current_sentence.append(char)
-                        else:
-                            # Not end of sentence (e.g., "Dr. Smith" or "U.S.A.")
-                            # Check if it's likely an abbreviation (short sequence of letters and periods)
-                            # For now, we'll be conservative and only split on clear sentence endings
-                            current_sentence.append(char)
-                    else:
-                        current_sentence.append(char)
-                    
-                    i += 1
-                
-                # Add remaining text as final sentence
-                if current_sentence:
-                    sentence_text = ''.join(current_sentence).strip()
-                    if sentence_text:
-                        sentence_texts.append(sentence_text)
-                
-                # If no sentence boundaries found, treat entire line as one sentence
-                if not sentence_texts:
-                    sentence_texts = [stripped]
+                sentence_texts = segment_sentences(stripped, preserve_quotes=True)
             else:
                 sentence_texts = [stripped]
             
@@ -887,12 +775,30 @@ class Document(AttrsMixin):
                     continue
                 
                 if tokenize:
-                    # Use UD-style tokenization
-                    parts = re.findall(token_pattern, sent_text, re.UNICODE)
-                    parts = [p for p in parts if p.strip()]  # Filter out empty tokens
+                    # Use improved Unicode-based tokenization
+                    parts = tokenize_unicode(
+                        sent_text,
+                        keep_contractions=keep_contractions,
+                        keep_hyphenated=keep_hyphenated,
+                        keep_trailing_apostrophe=keep_contractions,  # Use same setting
+                    )
                 else:
-                    # Simple whitespace splitting
-                    parts = sent_text.split()
+                    # Simple whitespace splitting, but also separate trailing punctuation
+                    # This ensures periods, exclamation marks, etc. are separate tokens
+                    import re
+                    # Split on whitespace, then separate trailing punctuation from each word
+                    words = sent_text.split()
+                    parts = []
+                    for word in words:
+                        # Check if word ends with sentence-ending punctuation
+                        match = re.match(r'^(.+?)([.!?]+)$', word)
+                        if match:
+                            # Word has trailing punctuation - split it
+                            parts.append(match.group(1))  # The word part
+                            parts.append(match.group(2))  # The punctuation part
+                        else:
+                            # No trailing punctuation - keep as is
+                            parts.append(word)
                 
                 if not parts:
                     continue
@@ -904,8 +810,13 @@ class Document(AttrsMixin):
                     if idx + 1 < len(parts):
                         next_part = parts[idx + 1]
                         # If next token is punctuation, no space after
-                        if next_part and not re.match(r"^[\w\-']", next_part):
-                            space_after = False
+                        # Check if next token starts with a letter/number (not punctuation)
+                        import unicodedata
+                        if next_part:
+                            next_first_char = next_part[0]
+                            next_cat = unicodedata.category(next_first_char)
+                            if not (next_cat.startswith(("L", "N"))):
+                                space_after = False
                     else:
                         # Last token: set to None (no SpaceAfter entry in CoNLL-U)
                         space_after = None
@@ -966,6 +877,9 @@ class Document(AttrsMixin):
             return
         from .unicode_utils import normalize_unicode
         for sentence in self.sentences:
+            # Preserve original text if there are no tokens (needed for treetagger)
+            original_text = sentence.text if not sentence.tokens else None
+            
             for token in sentence.tokens:
                 token.form = normalize_unicode(token.form, form) or ""
                 token.lemma = normalize_unicode(token.lemma, form) or ""
@@ -974,7 +888,12 @@ class Document(AttrsMixin):
                         subtoken.form = normalize_unicode(subtoken.form, form) or ""
                         subtoken.lemma = normalize_unicode(subtoken.lemma, form) or ""
             # Rebuild sentence text after normalization
-            sentence.text = _rebuild_sentence_text(sentence.tokens)
+            # If there are no tokens, preserve the original text
+            if sentence.tokens:
+                sentence.text = _rebuild_sentence_text(sentence.tokens)
+            elif original_text:
+                # No tokens but we had original text - preserve it (normalize the text itself)
+                sentence.text = normalize_unicode(original_text, form) or original_text
 
     def tokens(self) -> Iterable[Token]:
         for sentence in self.sentences:

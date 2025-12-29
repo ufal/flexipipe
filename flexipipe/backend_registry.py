@@ -452,6 +452,16 @@ def create_backend(
             factory_kwargs.setdefault("language", language)
         try:
             return info.factory(**factory_kwargs)
+        except RuntimeError as e:
+            # Check if this is a user-friendly error message (starts with [flexipipe])
+            error_msg = str(e)
+            if error_msg.startswith("[flexipipe]"):
+                # Print the error message directly and exit cleanly without traceback
+                import sys
+                print(error_msg, file=sys.stderr)
+                raise SystemExit(1) from None  # from None suppresses the exception chain
+            # Re-raise if it's not a user-friendly message
+            raise
         except ImportError as e:
             # Handle missing module gracefully
             error_str = str(e)

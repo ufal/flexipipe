@@ -62,6 +62,10 @@ EXTRAS = {
     "nametag": ["requests>=2.31.0"],
     "udpipe": ["requests>=2.31.0"],
     "udmorph": ["requests>=2.31.0"],
+    "heliport": ["heliport>=0.5.0"],
+    "langdetect": ["langdetect>=1.0.9"],
+    "langid": ["langid>=1.1.6"],
+    "phunspell": ["phunspell>=0.1.0"],
 }
 
 all_extras = sorted({dep for deps in EXTRAS.values() for dep in deps})

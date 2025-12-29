@@ -98,13 +98,19 @@ class HuggingFaceTransformersBackend(BackendManager):
         revision: Optional[str] = None,
         trust_remote_code: bool = False,
         context_attrs: Optional[List[str]] = None,
+        verbose: bool = False,
     ):
         cache_dir = get_backend_models_dir("transformers", create=True)
         setup_backend_environment("transformers")
 
         try:
             import torch
-            from transformers import AutoConfig, AutoModelForTokenClassification, AutoTokenizer
+            from transformers import (
+                AutoConfig,
+                AutoModelForTokenClassification,
+                AutoTokenizer,
+                TokenClassificationPipeline,
+            )
         except ImportError as exc:
             raise ImportError(
                 "Transformers backend requires 'torch' and 'transformers'. "
@@ -151,6 +157,31 @@ class HuggingFaceTransformersBackend(BackendManager):
         self._tokenizer = tokenizer
         self._model = model
         self._id2label = config.id2label or {idx: label for label, idx in config.label2id.items()}
+        
+        # Create pipeline for raw text mode with aggregation strategy
+        # This handles subword grouping much better than manual grouping
+        # Suppress "Device set to use cpu" message from transformers library unless verbose
+        if not verbose:
+            import sys
+            import io
+            old_stderr = sys.stderr
+            try:
+                sys.stderr = io.StringIO()
+                self._pipeline = TokenClassificationPipeline(
+                    model=model,
+                    tokenizer=tokenizer,
+                    aggregation_strategy="simple",  # Groups subwords into words
+                    device=self._device,
+                )
+            finally:
+                sys.stderr = old_stderr
+        else:
+            self._pipeline = TokenClassificationPipeline(
+                model=model,
+                tokenizer=tokenizer,
+                aggregation_strategy="simple",  # Groups subwords into words
+                device=self._device,
+            )
 
         if self._task is None:
             self._task = self._infer_task_from_labels()
@@ -219,16 +250,63 @@ class HuggingFaceTransformersBackend(BackendManager):
         if document is None:
             raise ValueError("Document cannot be None")
         total_tokens = 0
-        for sentence in document.sentences:
-            if not sentence.tokens:
-                continue
-            words = [self._prepare_token_input(token) for token in sentence.tokens]
-            labels, confidences = self._predict_labels(words)
-            total_tokens += len(labels)
-            if self._task == "ner":
-                self._apply_ner_labels(sentence, labels, confidences)
-            else:
-                self._apply_pos_labels(sentence, labels, confidences)
+        
+        if use_raw_text:
+            # Raw text mode: use sentence text and let tokenizer handle tokenization
+            # This allows the model to properly tokenize into subwords as it was trained
+            for sentence in document.sentences:
+                if not sentence.text:
+                    continue
+                text = sentence.text.strip()
+                if not text:
+                    continue
+                try:
+                    labels, confidences, word_tokens = self._predict_labels_from_raw_text(text)
+                    # Create new tokens from tokenizer output, preserving original text
+                    new_tokens = self._create_tokens_from_raw_text(sentence, labels, confidences, word_tokens, text)
+                    sentence.tokens = new_tokens
+                    total_tokens += len(new_tokens)
+                except (ValueError, TypeError) as e:
+                    # If raw text mode fails (e.g., no offset mapping support), fall back to pre-tokenized
+                    if not sentence.tokens:
+                        # If no tokens exist, create from text by splitting
+                        words = text.split()
+                        labels, confidences = self._predict_labels(words)
+                        total_tokens += len(labels)
+                        # Create tokens from split words
+                        from ..doc import Token
+                        new_tokens = []
+                        for idx, (word, label, score) in enumerate(zip(words, labels, confidences)):
+                            token = Token(
+                                id=idx + 1,
+                                form=word,
+                                upos=label if self._task == "tag" else "",
+                                upos_confidence=score,
+                            )
+                            new_tokens.append(token)
+                        sentence.tokens = new_tokens
+                    else:
+                        # Use existing tokens
+                        words = [self._prepare_token_input(token) for token in sentence.tokens]
+                        labels, confidences = self._predict_labels(words)
+                        total_tokens += len(labels)
+                        if self._task == "ner":
+                            self._apply_ner_labels(sentence, labels, confidences)
+                        else:
+                            self._apply_pos_labels(sentence, labels, confidences)
+        else:
+            # Pre-tokenized mode: use existing tokens
+            for sentence in document.sentences:
+                if not sentence.tokens:
+                    continue
+                words = [self._prepare_token_input(token) for token in sentence.tokens]
+                labels, confidences = self._predict_labels(words)
+                total_tokens += len(labels)
+                if self._task == "ner":
+                    self._apply_ner_labels(sentence, labels, confidences)
+                else:
+                    self._apply_pos_labels(sentence, labels, confidences)
+        
         stats = {
             "model": self._model_name,
             "task": self._task,
@@ -268,6 +346,119 @@ class HuggingFaceTransformersBackend(BackendManager):
                 labels[i] = default_label
         return labels, confidences
 
+    def _predict_labels_from_raw_text(self, text: str) -> tuple[List[str], List[float], List[dict]]:
+        """
+        Predict labels from raw text using TokenClassificationPipeline with aggregation.
+        
+        This uses HuggingFace's built-in aggregation strategy which handles subword
+        grouping much better than manual grouping.
+        """
+        # Use the pipeline which handles subword aggregation automatically
+        outputs = self._pipeline(text)
+        
+        # Convert pipeline output to our format
+        labels: List[str] = []
+        confidences: List[float] = []
+        word_tokens: List[dict] = []
+        
+        for entity in outputs:
+            # Extract the label - for POS tagging, it's in 'entity_group'
+            # For NER, it's also in 'entity_group' but might have B-/I- prefixes
+            label = entity.get("entity_group", "")
+            if not label:
+                # Fallback to 'label' field if 'entity_group' is not present
+                label = entity.get("label", "")
+            
+            # The label should already be in the correct format from the pipeline
+            # but we can validate it against our id2label mapping
+            if label and label not in self._id2label.values():
+                # Try to find a matching label (case-insensitive)
+                label_upper = label.upper()
+                matching_label = None
+                for known_label in self._id2label.values():
+                    if str(known_label).upper() == label_upper:
+                        matching_label = str(known_label)
+                        break
+                if matching_label:
+                    label = matching_label
+                elif not label:
+                    label = "X"  # Default label
+            
+            score = entity.get("score", 0.0)
+            start = entity.get("start", 0)
+            end = entity.get("end", 0)
+            
+            # Extract word text from original text using offsets to preserve exact text
+            word_text = text[start:end] if start < len(text) and end <= len(text) else entity.get("word", "")
+            
+            if not word_text.strip():
+                continue  # Skip empty tokens
+            
+            labels.append(label)
+            confidences.append(float(score))
+            word_tokens.append({
+                "start": start,
+                "end": end,
+                "label": label,
+                "confidence": float(score),
+            })
+        
+        default_label = "O" if self._task == "ner" else "X"
+        for i in range(len(labels)):
+            if not labels[i]:
+                labels[i] = default_label
+        
+        return labels, confidences, word_tokens
+    
+    def _create_tokens_from_raw_text(
+        self,
+        sentence,
+        labels: List[str],
+        confidences: List[float],
+        word_tokens: List[dict],
+        original_text: str,
+    ) -> List:
+        """Create Token objects from word token info, preserving original text exactly."""
+        from ..doc import Token
+        
+        tokens = []
+        for idx, (label, confidence, word_info) in enumerate(zip(labels, confidences, word_tokens)):
+            start = word_info["start"]
+            end = word_info["end"]
+            
+            # Extract token text from original text using offsets - this preserves the exact text
+            if start < len(original_text) and end <= len(original_text):
+                token_text = original_text[start:end]
+            else:
+                continue  # Skip invalid offsets
+            
+            if not token_text.strip():
+                continue  # Skip whitespace-only tokens
+            
+            token = Token(
+                id=idx + 1,
+                form=token_text,
+                upos=label if self._task == "tag" else "",
+                upos_confidence=confidence,
+            )
+            tokens.append(token)
+        
+        # Set space_after based on actual text between tokens
+        for i in range(len(tokens) - 1):
+            if i + 1 < len(word_tokens):
+                current_end = word_tokens[i]["end"]
+                next_start = word_tokens[i + 1]["start"]
+                # Check if there's whitespace between tokens
+                if current_end < len(original_text) and next_start <= len(original_text):
+                    between = original_text[current_end:next_start]
+                    tokens[i].space_after = bool(between.strip() == "" and between != "")
+                else:
+                    tokens[i].space_after = True
+        if tokens:
+            tokens[-1].space_after = None
+        
+        return tokens
+    
     def _apply_pos_labels(self, sentence, labels: List[str], confidences: List[float]) -> None:
         for token, label, score in zip(sentence.tokens, labels, confidences):
             token.upos = label
@@ -332,6 +523,22 @@ class HuggingFaceTransformersBackend(BackendManager):
         raise NotImplementedError("Transformers backend training will be added in a future update.")
 
 
+def _resolve_transformers_model_name(
+    model_name: Optional[str],
+    language: Optional[str],
+) -> Optional[str]:
+    """Resolve transformers model name using central resolution function."""
+    from ..backend_utils import resolve_model_from_language
+    
+    return resolve_model_from_language(
+        language=language,
+        backend_name="transformers",
+        model_name=model_name,
+        preferred_only=True,
+        use_cache=True,
+    )
+
+
 def _create_transformers_backend(
     *,
     model_name: Optional[str] = None,
@@ -342,22 +549,50 @@ def _create_transformers_backend(
     revision: Optional[str] = None,
     trust_remote_code: bool = False,
     context_attrs: Optional[List[str]] = None,
+    verbose: bool = False,
     **kwargs: Any,
 ) -> HuggingFaceTransformersBackend:
-    if not model_name:
-        raise ValueError("Transformers backend requires --model to specify a HuggingFace model name.")
+    # Resolve model name from language if not provided (using central function)
+    from ..backend_utils import resolve_model_from_language
+    
+    try:
+        resolved_model_name = resolve_model_from_language(
+            language=language,
+            backend_name="transformers",
+            model_name=model_name,
+            preferred_only=True,
+            use_cache=True,
+        )
+    except ValueError as e:
+        # Re-raise with context if language was provided but no model found
+        if language:
+            raise
+        # If no language provided, provide a clearer error
+        raise ValueError("Transformers backend requires --model to specify a HuggingFace model name, or --language to auto-select a model.") from e
+    
+    if not resolved_model_name:
+        if language:
+            raise ValueError(
+                f"[flexipipe] No transformers model found for language '{language}'. "
+                f"Use --model to specify a HuggingFace model name, or run 'flexipipe info models --backend transformers --language {language}' to see available models."
+            )
+        else:
+            raise ValueError("Transformers backend requires --model to specify a HuggingFace model name, or --language to auto-select a model.")
+    
     unexpected = set(kwargs) - {"download_model", "training"}
     if unexpected:
         raise ValueError(f"Unexpected Transformers backend arguments: {', '.join(sorted(unexpected))}")
     normalized_task = _normalize_task(task)
+    
     return HuggingFaceTransformersBackend(
-        model_name=model_name,
+        model_name=resolved_model_name,
         adapter_name=adapter_name,
         device=device,
         task=normalized_task,
         revision=revision,
         trust_remote_code=trust_remote_code,
         context_attrs=context_attrs,
+        verbose=verbose,
     )
 
 

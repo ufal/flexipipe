@@ -639,16 +639,20 @@ def _create_udmorph_backend(
     
     validate_backend_kwargs(kwargs, "UDMorph", allowed_extra=["download_model", "training"])
     
-    # If no model provided but language is, try to look up a model for that language
-    resolved_model = model
-    if not resolved_model and language:
-        try:
-            resolved_model = resolve_model_from_language(language, "udmorph", preferred_only=True, use_cache=True)
-            if log_requests:
-                print(f"[udmorph] Resolved model '{resolved_model}' for language '{language}'")
-        except ValueError as exc:
-            # No model found for language - raise a clearer error
-            raise ValueError(f"UDMorph REST backend: No model found for language '{language}'. Provide --model to specify a model name.") from exc
+    # Resolve model using central function
+    try:
+        resolved_model = resolve_model_from_language(
+            language=language,
+            backend_name="udmorph",
+            model_name=model,
+            preferred_only=True,
+            use_cache=True,
+        )
+        if log_requests and resolved_model and resolved_model != model:
+            print(f"[udmorph] Resolved model '{resolved_model}' for language '{language}'")
+    except ValueError as exc:
+        # No model found for language - raise a clearer error
+        raise ValueError(f"UDMorph REST backend: No model found for language '{language}'. Provide --model to specify a model name.") from exc
     
     return UDMorphRESTBackend(
         endpoint_url=endpoint_url,

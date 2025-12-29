@@ -34,6 +34,10 @@ def _run_pip_install(extra_name: str) -> bool:
         "nametag": ["requests>=2.31.0"],
         "udpipe": ["requests>=2.31.0"],
         "udmorph": ["requests>=2.31.0"],
+        "heliport": ["heliport>=0.5.0"],
+        "langdetect": ["langdetect>=1.0.9"],
+        "langid": ["langid>=1.1.6"],
+        "phunspell": ["phunspell>=0.1.0"],
     }
     
     deps = EXTRA_DEPENDENCIES.get(extra_name)
@@ -45,21 +49,46 @@ def _run_pip_install(extra_name: str) -> bool:
     # If it's an editable install or run from source, install dependencies directly
     use_extra_syntax = False
     try:
-        import pkg_resources
-        dist = pkg_resources.get_distribution("flexipipe")
+        from importlib.metadata import distribution, PackageNotFoundError
+        dist = distribution("flexipipe")
         # Check if it's installed in editable mode
-        # Editable installs typically have the location pointing to the source directory
-        # or have .egg-link files. For simplicity, check if location contains common dev paths
-        location = dist.location
-        if location and (
-            "site-packages" in location or 
-            "dist-packages" in location or
-            location.endswith(".egg")
-        ):
-            # Likely installed from PyPI or as a regular package - try extra syntax
-            use_extra_syntax = True
-    except (pkg_resources.DistributionNotFound, pkg_resources.RequirementParseError, ImportError, AttributeError):
+        # Editable installs typically have files pointing to the source directory
+        # Regular installs have files in site-packages or dist-packages
+        try:
+            # Get files from the distribution to determine installation location
+            files = list(dist.files)
+            if files:
+                # Get the first file's path to determine installation location
+                first_file = files[0]
+                if hasattr(first_file, 'locate'):
+                    from pathlib import Path
+                    file_path = first_file.locate()
+                    # Resolve to absolute path
+                    try:
+                        abs_path = Path(file_path).resolve()
+                        file_path_str = str(abs_path)
+                        # Check if it's in a standard installation location
+                        if (
+                            "site-packages" in file_path_str or 
+                            "dist-packages" in file_path_str or
+                            ".egg" in file_path_str
+                        ):
+                            # Likely installed from PyPI or as a regular package - try extra syntax
+                            use_extra_syntax = True
+                    except (OSError, ValueError):
+                        # Can't resolve path - assume it's not a regular install
+                        pass
+        except (AttributeError, OSError):
+            # Can't determine location - assume it's not a regular install
+            pass
+    except (ImportError, ModuleNotFoundError):
+        # importlib.metadata not available (Python < 3.8) - fall back to direct install
+        pass
+    except PackageNotFoundError:
         # flexipipe is not installed as a package - install dependencies directly
+        pass
+    except Exception:
+        # Other error - install dependencies directly
         pass
     
     if use_extra_syntax:
