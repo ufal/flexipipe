@@ -9,7 +9,7 @@ from ..language_utils import (
 
 def _prepare_fasttext(verbose: bool) -> None:
     try:
-        ensure_fasttext_language_model()
+        ensure_fasttext_language_model(verbose=verbose)
     except RuntimeError as exc:
         raise RuntimeError(
             f"fastText language detector unavailable: {exc}"
@@ -26,7 +26,7 @@ def _detect_fasttext(
         if verbose:
             print("[flexipipe] fastText detector skipped: input too short.")
         return None
-    ensure_fasttext_language_model()
+    ensure_fasttext_language_model(verbose=verbose)
     try:
         # Get top 5 candidates when verbose to help with debugging
         top_k = 5 if verbose else 1

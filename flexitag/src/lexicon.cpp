@@ -1160,6 +1160,29 @@ void Lexicon::compute_tag_type_counts() const {
     tag_type_counts_computed_ = true;
 }
 
+const LexiconEntry* Lexicon::get_most_common_entry_for_tag(const std::string& tag) const {
+    // Find the most frequent entry (by count) for the given tag across all lexicon items
+    const LexiconEntry* best_entry = nullptr;
+    int best_count = 0;
+    
+    for (const auto& [form, item] : items_) {
+        for (const auto& token : item.tokens) {
+            if (token.tag == tag && !token.entries.empty()) {
+                // Find the entry with the highest count in this token
+                for (const auto& entry : token.entries) {
+                    int entry_count = entry.count > 0 ? entry.count : 1;
+                    if (entry_count > best_count) {
+                        best_count = entry_count;
+                        best_entry = &entry;
+                    }
+                }
+            }
+        }
+    }
+    
+    return best_entry;
+}
+
 const std::unordered_map<std::string, int>& Lexicon::tag_type_counts() const {
     compute_tag_type_counts();
     return tag_type_counts_cache_;

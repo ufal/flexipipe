@@ -365,9 +365,10 @@ def _get_fasttext_model_path(explicit: Optional[str] = None) -> Path:
     return cache_dir / FASTTEXT_MODEL_NAME
 
 
-def _download_fasttext_model(path: Path) -> None:
+def _download_fasttext_model(path: Path, verbose: bool = False) -> None:
     tmp_path = path.with_suffix(".tmp")
-    print(f"[flexipipe] Downloading fastText language model to {path}...")
+    if verbose:
+        print(f"[flexipipe] Downloading fastText language model to {path}...")
     try:
         with urllib.request.urlopen(FASTTEXT_MODEL_URL) as response, open(tmp_path, "wb") as out:
             out.write(response.read())
@@ -381,7 +382,7 @@ def _download_fasttext_model(path: Path) -> None:
         raise RuntimeError(f"Failed to download fastText language model: {exc}") from exc
 
 
-def _ensure_fasttext_model(model_path: Optional[Path] = None):
+def _ensure_fasttext_model(model_path: Optional[Path] = None, verbose: bool = False):
     global _FASTTEXT_MODEL, _FASTTEXT_MODEL_PATH, _FASTTEXT_IMPORT_ERROR
 
     if _FASTTEXT_MODEL is not None:
@@ -401,15 +402,19 @@ def _ensure_fasttext_model(model_path: Optional[Path] = None):
     path = model_path or _get_fasttext_model_path()
     _FASTTEXT_MODEL_PATH = path
     if not path.exists():
-        _download_fasttext_model(path)
+        _download_fasttext_model(path, verbose=verbose)
     _FASTTEXT_MODEL = fasttext.load_model(str(path))
     return _FASTTEXT_MODEL
 
 
-def ensure_fasttext_language_model(force_download: bool = False) -> Path:
+def ensure_fasttext_language_model(force_download: bool = False, verbose: bool = False) -> Path:
     """
     Ensure the fastText language model is present locally.
 
+    Args:
+        force_download: If True, re-download even if model exists
+        verbose: If True, print download progress messages
+    
     Returns path to the model file.
     """
     path = _get_fasttext_model_path()
@@ -418,7 +423,7 @@ def ensure_fasttext_language_model(force_download: bool = False) -> Path:
             path.unlink()
         except (OSError, PermissionError):
             pass
-    _ensure_fasttext_model(path)
+    _ensure_fasttext_model(path, verbose=verbose)
     return path
 
 

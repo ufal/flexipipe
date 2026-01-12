@@ -110,6 +110,11 @@ public:
     // Get all form->reg mappings for pattern extraction
     // Returns a map of form -> reg (only entries where reg exists and differs from form)
     std::unordered_map<std::string, std::string> get_normalization_mappings() const;
+    
+    // Get the most common analysis (entry) for a given tag
+    // This is used for OOV words to provide best-guess values for feats, lemma, etc.
+    // Returns nullptr if no entries found for the tag
+    const LexiconEntry* get_most_common_entry_for_tag(const std::string& tag) const;
 
 private:
     void reset();

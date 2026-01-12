@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -30,6 +31,7 @@ DEFAULT_TAGGER_SETTINGS: Dict[str, Any] = {
     "case_prob_min": 1e-3,  # Minimum case probability
     "ending_decay_base": 5.0,  # Base for pow(ending_decay_base, 0-fnd) in word ending heuristics
     "dtok_fallback_prob": 1e-6,  # Probability for existing dtok fallback
+    "aggregate_upos_for_utot": False,  # When tagging with utot, aggregate candidates by UPOS and choose most common
 }
 
 # Candidate values explored during optional fine-tuning.
@@ -49,6 +51,7 @@ PARAM_SEARCH_SPACE: Dict[str, List[Any]] = {
     "case_prob_min": [1e-4, 1e-3, 1e-2],
     "ending_decay_base": [3.0, 5.0, 7.0],
     "dtok_fallback_prob": [1e-7, 1e-6, 1e-5],
+    "aggregate_upos_for_utot": [False, True],  # Aggregate by UPOS when using utot
 }
 
 ACCURACY_TOLERANCE = 1e-4
@@ -60,6 +63,8 @@ class CandidateResult(NamedTuple):
     pos_accuracy: float
     lemma_accuracy: float
     speed: float
+    # Optional: full upos+feats accuracy for utot (only set when tagpos == "utot")
+    utot_full_accuracy: Optional[float] = None
 
 
 def _write_model(path: Path, payload: Dict[str, Any]) -> None:
@@ -171,6 +176,8 @@ def _evaluate_candidate(
 
     tagpos = settings.get("tagpos", "xpos")
     pos_total = pos_correct = 0
+    # For utot, also track full upos+feats accuracy for comparison
+    utot_full_total = utot_full_correct = 0
     lemma_total = lemma_correct = 0
 
     def components(token: Token) -> List[Token | SubToken]:
@@ -212,17 +219,47 @@ def _evaluate_candidate(
             if gold_tags_present:
                 pos_total += 1
                 token_pos_correct = len(gold_parts) == len(pred_parts)
+                # For utot, also track full upos+feats accuracy
+                token_utot_full_correct = len(gold_parts) == len(pred_parts) if tagpos == "utot" else False
+                
                 if token_pos_correct:
                     for g_part, p_part in zip(gold_parts, pred_parts):
                         gold_tag = get_tag_value(g_part, tagpos)
                         if not gold_tag or gold_tag == "_":
                             continue
                         pred_tag = get_tag_value(p_part, tagpos)
-                        if pred_tag != gold_tag:
-                            token_pos_correct = False
-                            break
+                        
+                        # Special handling for utot (upos+feats): evaluate on upos only
+                        # This is because upos+feats is more informative, so we should
+                        # check if the upos part is correct, not the full upos#feats string
+                        if tagpos == "utot":
+                            # Extract upos from gold_tag and pred_tag (format: "upos#feats" or just "upos")
+                            gold_upos = gold_tag.split("#")[0] if "#" in gold_tag else gold_tag
+                            pred_upos = pred_tag.split("#")[0] if "#" in pred_tag else pred_tag
+                            if pred_upos != gold_upos:
+                                token_pos_correct = False
+                                token_utot_full_correct = False
+                                break
+                            # Also track full upos+feats accuracy for comparison
+                            if pred_tag != gold_tag:
+                                token_utot_full_correct = False
+                        else:
+                            # For upos and xpos, compare directly
+                            if pred_tag != gold_tag:
+                                token_pos_correct = False
+                                break
+                else:
+                    if tagpos == "utot":
+                        token_utot_full_correct = False
+                
                 if token_pos_correct:
                     pos_correct += 1
+                
+                # Track full utot accuracy separately
+                if tagpos == "utot":
+                    utot_full_total += 1
+                    if token_utot_full_correct:
+                        utot_full_correct += 1
 
             # Lemma accuracy at orthographic token level
             if gold_lemmas_present:
@@ -242,12 +279,20 @@ def _evaluate_candidate(
 
     pos_accuracy = pos_correct / pos_total if pos_total else 0.0
     lemma_accuracy = lemma_correct / lemma_total if lemma_total else 0.0
+    utot_full_accuracy = utot_full_correct / utot_full_total if utot_full_total else None
 
     elapsed = float(result.stats.get("elapsed_seconds", 0.0) or 0.0)
     orth_token_count = sum(len(sent.tokens) for sent in predicted.sentences)
     word_count = int(result.stats.get("word_count", orth_token_count))
     speed = word_count / elapsed if elapsed > 0 else 0.0
-    return CandidateResult(pos_accuracy, lemma_accuracy, speed)
+    
+    # Return CandidateResult with utot_full_accuracy if applicable
+    return CandidateResult(
+        pos_accuracy=pos_accuracy,
+        lemma_accuracy=lemma_accuracy,
+        speed=speed,
+        utot_full_accuracy=utot_full_accuracy if tagpos == "utot" else None,
+    )
 
 
 def _prefer_smaller(param: str, candidate_value: Any, current_value: Any) -> bool:
@@ -1564,40 +1609,131 @@ def train_ud_treebank(
             print(f"[flexipipe] testing {attr} ({idx}/{len(candidate_tag_attributes)})...", end=" ", flush=True)
         
         payload = _build_model_payload(documents, splits, ud_root, model_name, attr, include_dev)
-        baseline: Optional[CandidateResult] = None
-        error: Optional[str] = None
         
-        # Only evaluate if we have a dev set (never evaluate on training data)
-        if evaluation_doc is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".json", dir=output_dir) as tmp:
-                tmp_file = Path(tmp.name)
-            try:
-                _write_model(tmp_file, payload)
+        # For utot, test both with and without aggregation to see which performs better
+        if attr == "utot" and auto_select and len(candidate_tag_attributes) > 1:
+            # Test without aggregation first (default)
+            baseline_no_agg: Optional[CandidateResult] = None
+            baseline_with_agg: Optional[CandidateResult] = None
+            error: Optional[str] = None
+            
+            if evaluation_doc is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".json", dir=output_dir) as tmp:
+                    tmp_file = Path(tmp.name)
                 try:
-                    baseline = _evaluate_candidate(tmp_file, evaluation_doc, payload["settings"])
-                    if baseline is None:
-                        error = "evaluation returned no metrics"
+                    _write_model(tmp_file, payload)
+                    try:
+                        # Test without aggregation
+                        baseline_no_agg = _evaluate_candidate(tmp_file, evaluation_doc, payload["settings"])
+                        
+                        # Test with aggregation
+                        settings_with_agg = dict(payload["settings"])
+                        settings_with_agg["aggregate_upos_for_utot"] = True
+                        try:
+                            baseline_with_agg = _evaluate_candidate(tmp_file, evaluation_doc, settings_with_agg)
+                        except Exception as agg_exc:
+                            # Aggregation test failed - use no aggregation result
+                            if verbose:
+                                print(f"\n[flexipipe] WARNING: Aggregation test failed: {agg_exc}", file=sys.stderr)
+                            baseline_with_agg = None
+                        
+                        if baseline_no_agg and baseline_with_agg:
+                            # Choose the better one
+                            if baseline_with_agg.pos_accuracy > baseline_no_agg.pos_accuracy:
+                                baseline = baseline_with_agg
+                                payload["settings"]["aggregate_upos_for_utot"] = True
+                                if auto_select and len(candidate_tag_attributes) > 1:
+                                    print(
+                                        f"pos(upos)={baseline.pos_accuracy*100:.2f}% "
+                                        f"pos(upos+feats)={baseline.utot_full_accuracy*100:.2f}% "
+                                        f"lemma={baseline.lemma_accuracy*100:.2f}% "
+                                        f"speed={baseline.speed:.0f} tok/s "
+                                        f"[AGG: {baseline_no_agg.pos_accuracy*100:.2f}% -> {baseline.pos_accuracy*100:.2f}% (+{((baseline.pos_accuracy - baseline_no_agg.pos_accuracy)*100):.2f}%)]"
+                                    )
+                            else:
+                                baseline = baseline_no_agg
+                                if auto_select and len(candidate_tag_attributes) > 1:
+                                    print(
+                                        f"pos(upos)={baseline.pos_accuracy*100:.2f}% "
+                                        f"pos(upos+feats)={baseline.utot_full_accuracy*100:.2f}% "
+                                        f"lemma={baseline.lemma_accuracy*100:.2f}% "
+                                        f"speed={baseline.speed:.0f} tok/s "
+                                        f"[AGG: {baseline.pos_accuracy*100:.2f}% vs {baseline_with_agg.pos_accuracy*100:.2f}% (no agg better)]"
+                                    )
+                        elif baseline_no_agg:
+                            baseline = baseline_no_agg
+                            if auto_select and len(candidate_tag_attributes) > 1:
+                                agg_info = ""
+                                if baseline_with_agg is None:
+                                    agg_info = " (aggregation test failed)"
+                                print(
+                                    f"pos(upos)={baseline.pos_accuracy*100:.2f}% "
+                                    f"pos(upos+feats)={baseline.utot_full_accuracy*100:.2f}% "
+                                    f"lemma={baseline.lemma_accuracy*100:.2f}% "
+                                    f"speed={baseline.speed:.0f} tok/s{agg_info}"
+                                )
+                        else:
+                            error = "evaluation returned no metrics"
+                            if auto_select and len(candidate_tag_attributes) > 1:
+                                print(f"error: {error} (skipping {attr})")
+                    except (RuntimeError, UnicodeDecodeError) as exc:
+                        error = str(exc)
                         if auto_select and len(candidate_tag_attributes) > 1:
                             print(f"error: {error} (skipping {attr})")
-                    elif auto_select and len(candidate_tag_attributes) > 1:
-                        print(
-                            f"pos={baseline.pos_accuracy*100:.2f}% "
-                            f"lemma={baseline.lemma_accuracy*100:.2f}% "
-                            f"speed={baseline.speed:.0f} tok/s"
-                        )
-                except (RuntimeError, UnicodeDecodeError) as exc:
-                    error = str(exc)
-                    if auto_select and len(candidate_tag_attributes) > 1:
-                        print(f"error: {error} (skipping {attr})")
-            finally:
-                try:
-                    tmp_file.unlink()
-                except OSError:
-                    pass
+                finally:
+                    try:
+                        tmp_file.unlink()
+                    except OSError:
+                        pass
+            else:
+                # No dev set - skip evaluation
+                if auto_select and len(candidate_tag_attributes) > 1:
+                    print("(no dev set, skipping evaluation)")
         else:
-            # No dev set - skip evaluation, use first candidate or default
-            if auto_select and len(candidate_tag_attributes) > 1:
-                print("(no dev set, skipping evaluation)")
+            # For non-utot or when not auto-selecting, use normal evaluation
+            baseline: Optional[CandidateResult] = None
+            error: Optional[str] = None
+            
+            # Only evaluate if we have a dev set (never evaluate on training data)
+            if evaluation_doc is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".json", dir=output_dir) as tmp:
+                    tmp_file = Path(tmp.name)
+                try:
+                    _write_model(tmp_file, payload)
+                    try:
+                        baseline = _evaluate_candidate(tmp_file, evaluation_doc, payload["settings"])
+                        if baseline is None:
+                            error = "evaluation returned no metrics"
+                            if auto_select and len(candidate_tag_attributes) > 1:
+                                print(f"error: {error} (skipping {attr})")
+                        elif auto_select and len(candidate_tag_attributes) > 1:
+                            # For utot, show both upos accuracy (what we evaluate) and full upos+feats accuracy
+                            if attr == "utot" and baseline.utot_full_accuracy is not None:
+                                print(
+                                    f"pos(upos)={baseline.pos_accuracy*100:.2f}% "
+                                    f"pos(upos+feats)={baseline.utot_full_accuracy*100:.2f}% "
+                                    f"lemma={baseline.lemma_accuracy*100:.2f}% "
+                                    f"speed={baseline.speed:.0f} tok/s"
+                                )
+                            else:
+                                print(
+                                    f"pos={baseline.pos_accuracy*100:.2f}% "
+                                    f"lemma={baseline.lemma_accuracy*100:.2f}% "
+                                    f"speed={baseline.speed:.0f} tok/s"
+                                )
+                    except (RuntimeError, UnicodeDecodeError) as exc:
+                        error = str(exc)
+                        if auto_select and len(candidate_tag_attributes) > 1:
+                            print(f"error: {error} (skipping {attr})")
+                finally:
+                    try:
+                        tmp_file.unlink()
+                    except OSError:
+                        pass
+            else:
+                # No dev set - skip evaluation, use first candidate or default
+                if auto_select and len(candidate_tag_attributes) > 1:
+                    print("(no dev set, skipping evaluation)")
         
         candidate_results.append({
             "tag_attribute": attr,
@@ -1609,7 +1745,21 @@ def train_ud_treebank(
     if auto_select and len(candidate_tag_attributes) > 1:
         def _score_preview(result: Dict[str, Any]) -> float:
             baseline_result = result["baseline"]
-            return baseline_result.pos_accuracy if baseline_result else float("-inf")
+            if not baseline_result:
+                return float("-inf")
+            score = baseline_result.pos_accuracy
+            # Prefer utot (upos+feats) over upos even if upos is slightly better
+            # Add a small bias (0.5%) to prefer more informative tag attributes
+            tag_attr = result["tag_attribute"]
+            if tag_attr == "utot":
+                # Check if there's an upos candidate with similar or better accuracy
+                upos_result = next((r for r in candidate_results if r["tag_attribute"] == "upos"), None)
+                if upos_result and upos_result["baseline"]:
+                    upos_acc = upos_result["baseline"].pos_accuracy
+                    # If utot is within 0.5% of upos, prefer utot (it's more informative)
+                    if score >= upos_acc - 0.005:
+                        score += 0.005  # Small bias to prefer utot
+            return score
         best_result_preview = max(candidate_results, key=_score_preview)
         if best_result_preview["baseline"] is None:
             raise RuntimeError("No tag attribute candidate produced evaluation metrics; aborting training.")
@@ -1617,7 +1767,21 @@ def train_ud_treebank(
 
     def _score(result: Dict[str, Any]) -> float:
         baseline_result = result["baseline"]
-        return baseline_result.pos_accuracy if baseline_result else float("-inf")
+        if not baseline_result:
+            return float("-inf")
+        score = baseline_result.pos_accuracy
+        # Prefer utot (upos+feats) over upos even if upos is slightly better
+        # Add a small bias (0.5%) to prefer more informative tag attributes
+        tag_attr = result["tag_attribute"]
+        if tag_attr == "utot":
+            # Check if there's an upos candidate with similar or better accuracy
+            upos_result = next((r for r in candidate_results if r["tag_attribute"] == "upos"), None)
+            if upos_result and upos_result["baseline"]:
+                upos_acc = upos_result["baseline"].pos_accuracy
+                # If utot is within 0.5% of upos, prefer utot (it's more informative)
+                if score >= upos_acc - 0.005:
+                    score += 0.005  # Small bias to prefer utot
+        return score
 
     best_result = max(candidate_results, key=_score)
     if best_result["baseline"] is None:

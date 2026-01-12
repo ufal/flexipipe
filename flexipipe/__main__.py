@@ -1696,7 +1696,15 @@ def _maybe_detect_language(
     min_length: int = LANGUAGE_DETECTION_MIN_LENGTH,
 ) -> Optional[Dict[str, Any]]:
     explicit = bool(getattr(args, "detect_language", False))
-    need_detection = explicit or not getattr(args, "language", None)
+    # Skip language detection if:
+    # 1. Language is already provided, OR
+    # 2. Model is explicitly provided (implies language is known)
+    # Note: REST backends (udmorph, nametag, udpipe) still need language detection when
+    # neither model nor language is provided, to select the appropriate model
+    model_provided = bool(getattr(args, "model", None))
+    language_provided = bool(getattr(args, "language", None))
+    
+    need_detection = explicit or (not language_provided and not model_provided)
     if not need_detection:
         return None
     log_failures = explicit or getattr(args, "verbose", False) or getattr(args, "debug", False)
@@ -4018,7 +4026,40 @@ def run_tag(args: argparse.Namespace) -> int:
                                         print(f"[flexipipe] Extracted language '{language}' from model '{model_name}' in catalog", file=sys.stderr)
                                     break
                     except Exception:
-                        pass  # If catalog lookup fails, continue to error
+                        pass  # If catalog lookup fails, try model file
+                    
+                    # If still no language, try reading from model file directly (for flexitag models)
+                    if not language and backend_lower == "flexitag":
+                        try:
+                            import json
+                            # Try model_name as direct path first
+                            model_path = Path(model_name)
+                            if not model_path.exists() or not model_path.suffix == ".json":
+                                # Try to find model in default locations
+                                from .model_storage import get_models_dir
+                                models_dir = get_models_dir("flexitag")
+                                # Try as filename in models directory
+                                candidate_path = models_dir / model_name
+                                if candidate_path.exists() and candidate_path.suffix == ".json":
+                                    model_path = candidate_path
+                                elif not model_name.endswith(".json"):
+                                    # Try adding .json extension
+                                    candidate_path = models_dir / f"{model_name}.json"
+                                    if candidate_path.exists():
+                                        model_path = candidate_path
+                            
+                            if model_path.exists() and model_path.suffix == ".json":
+                                with open(model_path, "r", encoding="utf-8") as f:
+                                    model_data = json.load(f)
+                                    metadata = model_data.get("metadata", {})
+                                    model_lang = metadata.get("language") or metadata.get("lang")
+                                    if model_lang:
+                                        language = model_lang
+                                        args.language = language
+                                        if args.verbose or args.debug:
+                                            print(f"[flexipipe] Extracted language '{language}' from flexitag model file '{model_path}'", file=sys.stderr)
+                        except Exception:
+                            pass  # If model file read fails, continue to error
         
         if not language:
             print("[flexipipe] Error: --example requires --language to be specified.", file=sys.stderr)
@@ -6977,7 +7018,8 @@ def run_config(args: argparse.Namespace) -> int:
         from .language_utils import ensure_fasttext_language_model
 
         try:
-            path = ensure_fasttext_language_model(force_download=True)
+            verbose = getattr(args, "verbose", False) or getattr(args, "debug", False)
+            path = ensure_fasttext_language_model(force_download=True, verbose=verbose)
         except RuntimeError as exc:
             print(f"[flexipipe] Failed to download fastText model: {exc}", file=sys.stderr)
             return 1
@@ -7454,7 +7496,8 @@ def _run_config_wizard() -> int:
     if language_detector == "fasttext":
         if _prompt_bool("Download fastText language detection model now?", True):
             try:
-                path = ensure_fasttext_language_model()
+                # In wizard mode, show download progress
+                path = ensure_fasttext_language_model(verbose=True)
                 print(f"[flexipipe] fastText language model ready at {path}")
             except RuntimeError as exc:
                 print(f"[flexipipe] Failed to prepare language model: {exc}")
