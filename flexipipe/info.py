@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any, Dict, Optional
 
 from .backend_registry import get_backend_info, list_models_display, get_model_entries
@@ -169,6 +170,72 @@ def list_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def list_sessions(args: argparse.Namespace) -> int:
+    """List currently running training and tagging sessions."""
+    from .session_tracker import list_sessions, cleanup_stale_sessions
+    
+    output_format = getattr(args, "output_format", "table")
+    include_completed = getattr(args, "include_completed", False)
+    cleanup = not getattr(args, "no_cleanup", False)  # Default to True unless --no-cleanup is set
+    
+    # Clean up stale sessions if requested
+    if cleanup:
+        cleaned = cleanup_stale_sessions()
+        if cleaned > 0 and (args.verbose or args.debug):
+            print(f"[flexipipe] Cleaned up {cleaned} stale session(s)", file=sys.stderr)
+    
+    sessions = list_sessions(include_completed=include_completed, cleanup_stale=cleanup)
+    
+    if output_format == "json":
+        sessions_data = []
+        for session in sessions:
+            session_dict = session.to_dict()
+            session_dict["duration"] = session.duration
+            session_dict["is_running"] = session.is_running
+            sessions_data.append(session_dict)
+        print(json.dumps({"sessions": sessions_data, "total": len(sessions_data)}, indent=2, ensure_ascii=False), flush=True)
+        return 0
+    
+    if not sessions:
+        print("No active sessions found.")
+        if not include_completed:
+            print("Use --include-completed to see recently completed sessions.")
+        return 0
+    
+    # Table format
+    print("Active flexipipe sessions:")
+    print(f"{'Session ID':<30} {'Command':<10} {'Backend':<15} {'Model':<25} {'Duration':<12} {'Status':<10} {'PID':<8}")
+    print("=" * 130)
+    
+    for session in sessions:
+        session_id_short = session.session_id[:28] + ".." if len(session.session_id) > 30 else session.session_id
+        command = session.command
+        backend = session.backend or "-"
+        model = (session.model or "-")[:23] + ".." if session.model and len(session.model) > 25 else (session.model or "-")
+        
+        # Format duration
+        duration = session.duration
+        if duration < 60:
+            duration_str = f"{duration:.1f}s"
+        elif duration < 3600:
+            duration_str = f"{duration/60:.1f}m"
+        else:
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            duration_str = f"{hours}h{minutes}m"
+        
+        status = session.status
+        if not session.is_running and status == "running":
+            status = "completed"  # Process died but wasn't marked as completed
+        
+        pid = str(session.pid)
+        
+        print(f"{session_id_short:<30} {command:<10} {backend:<15} {model:<25} {duration_str:<12} {status:<10} {pid:<8}")
+    
+    print(f"\nTotal: {len(sessions)} session(s)")
+    return 0
+
+
 def list_models(args: argparse.Namespace) -> int:
     """List available models for the specified backend."""
     import time
@@ -215,8 +282,14 @@ def list_models(args: argparse.Namespace) -> int:
                 from .__main__ import _suggest_similar_languages
                 query = resolve_language_query(language_filter)
                 try:
+                    # Rebuild catalog only if we need it for suggestions (use expired cache for speed)
                     from .model_catalog import build_unified_catalog
-                    full_catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                    full_catalog = build_unified_catalog(
+                        use_cache=True,
+                        refresh_cache=False,
+                        verbose=False,
+                        allow_expired_cache=True,  # Use expired cache for fast read-only operations
+                    )
                     full_entries_by_backend: dict[str, dict] = {}
                     for entry in full_catalog.values():
                         backend = entry.get("backend")
@@ -1223,7 +1296,7 @@ def run_info_cli(args: argparse.Namespace) -> int:
     # Require an action if detect-language not used
     if not hasattr(args, "info_action") or not args.info_action:
         print(
-            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, teitok, or --detect-language"
+            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, teitok, sessions, or --detect-language"
         )
         return 1
     
@@ -1241,7 +1314,8 @@ def run_info_cli(args: argparse.Namespace) -> int:
         return list_tasks(args)
     elif args.info_action == "teitok":
         return list_teitok_settings(args)
+    elif args.info_action == "sessions":
+        return list_sessions(args)
     else:
         print(f"Error: Unknown info action '{args.info_action}'")
         return 1
-

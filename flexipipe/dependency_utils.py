@@ -12,12 +12,28 @@ def _module_available(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None  # type: ignore[attr-defined]
 
 
-def _run_pip_install(extra_name: str) -> bool:
+def _run_pip_install(extra_name: str, *, direct: bool = False) -> bool:
     """Install optional dependencies for a backend extra.
     
     If flexipipe is installed from PyPI, installs flexipipe[extra_name].
     If flexipipe is installed in editable mode or run from source, installs dependencies directly.
+    
+    Args:
+        extra_name: Name of the extra or package to install
+        direct: If True, install the package directly via pip (don't use flexipipe extras)
     """
+    # If direct=True, install the package directly
+    if direct:
+        cmd = [sys.executable, "-m", "pip", "install", extra_name]
+        print(f"[flexipipe] Installing package via: {' '.join(cmd)}")
+        try:
+            subprocess.check_call(cmd)
+            importlib.invalidate_caches()
+            return True
+        except subprocess.CalledProcessError as exc:
+            print(f"[flexipipe] Failed to install package '{extra_name}': {exc}", file=sys.stderr)
+            return False
+    
     # Hardcoded mapping of extra names to their dependencies (matches setup.py)
     EXTRA_DEPENDENCIES = {
         "spacy": ["spacy>=3.7.0"],

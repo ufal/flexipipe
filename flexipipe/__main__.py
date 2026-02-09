@@ -2535,6 +2535,30 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[parent_parser],
     )
     
+    # info sessions
+    sessions_parser = info_subparsers.add_parser(
+        "sessions",
+        help="List currently running training and tagging sessions",
+        parents=[parent_parser],
+    )
+    sessions_parser.add_argument(
+        "--output-format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table). Use 'json' for machine-readable output.",
+    )
+    sessions_parser.add_argument(
+        "--include-completed",
+        action="store_true",
+        help="Include completed/failed sessions in the output",
+    )
+    sessions_parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        dest="no_cleanup",
+        help="Don't automatically clean up stale session files",
+    )
+    
     # info ud-tags
     ud_tags_parser = info_subparsers.add_parser(
         "ud-tags",
@@ -3891,6 +3915,22 @@ def run_tag(args: argparse.Namespace) -> int:
     from .doc import Document
     from .language_mapping import get_language_metadata
     from .unicode_utils import normalize_unicode
+    from .session_tracker import create_session, update_session, delete_session
+    
+    # Create session for tracking
+    session = None
+    try:
+        session = create_session(
+            command="process",
+            backend=getattr(args, "backend", None),
+            model=getattr(args, "model", None),
+            language=getattr(args, "language", None),
+            input_file=getattr(args, "input", None),
+            output_file=getattr(args, "output", None),
+        )
+    except Exception:
+        # If session creation fails, continue anyway (non-critical)
+        pass
     
     # Get Unicode normalization form (from args or config, default NFC)
     unicode_normalize = getattr(args, "unicode_normalize", None)
@@ -4962,9 +5002,9 @@ def run_tag(args: argparse.Namespace) -> int:
                         else:
                             create_kwargs["language"] = language if not model_name else None
                     
-                    # Only pass verbose to backends that support it (stanza, flair, udpipe1, transformers)
+                    # Only pass verbose to backends that support it (stanza, flair, udpipe1, transformers, ctext)
                     backend_kwargs_final = dict(create_kwargs)
-                    if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers"):
+                    if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers", "ctext"):
                         backend_kwargs_final["verbose"] = args.verbose or args.debug
                     
                     # For udpipe1, don't use model_path - pass model directly
@@ -5300,6 +5340,17 @@ def run_tag(args: argparse.Namespace) -> int:
                 else:
                     # No specific model - just show the version (e.g., "NameTag3")
                     model_str = backend_descriptor or f"NameTag{getattr(neural_backend, 'version', '3')}"
+            elif backend_type_lower == "ctext":
+                # For CTexT, get model name from backend's model_name property
+                # This is accessed after tag() runs, so _actual_techs_used should be set
+                backend_model_name = getattr(neural_backend, "model_name", None)
+                if backend_model_name:
+                    model_str = f"{display_backend}: {backend_model_name}"
+                elif language:
+                    # Fallback to language name if model name not available
+                    model_str = f"{display_backend}: {language}"
+                else:
+                    model_str = f"{display_backend}: unknown"
             else:
                 model_display = model_name or backend_descriptor or "unknown"
                 model_str = f"{display_backend}: {model_display}"
@@ -5727,6 +5778,7 @@ def run_tag(args: argparse.Namespace) -> int:
             elif emit_teitok_output:
                 print(tei_output)
     elif output_format == "json":
+        import json as json_module  # Use explicit name to avoid shadowing issues
         performed_tasks = sorted(_detect_performed_tasks(result.document)) or sorted(requested_tasks)
         payload = {
             "document": document_to_json_payload(result.document),
@@ -5735,7 +5787,7 @@ def run_tag(args: argparse.Namespace) -> int:
             "tasks": performed_tasks,
             "stats": result.stats,
         }
-        json_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        json_text = json_module.dumps(payload, ensure_ascii=False, indent=2)
         if output_path:
             Path(output_path).write_text(
                 json_text if json_text.endswith("\n") else f"{json_text}\n",
@@ -5805,8 +5857,21 @@ def run_tag(args: argparse.Namespace) -> int:
                 pass
         
         if validation_rc != 0:
+            if session:
+                try:
+                    update_session(session.session_id, status="failed", error=f"Validation failed with exit code {validation_rc}")
+                except Exception:
+                    pass
             return validation_rc
 
+    # Clean up session on successful completion
+    if session:
+        try:
+            update_session(session.session_id, status="completed")
+            delete_session(session.session_id)
+        except Exception:
+            pass
+    
     return 0
 
 
@@ -5863,6 +5928,22 @@ def _required_annotations_for_backend(
 
 def run_train(args: argparse.Namespace) -> int:
     """Run training command with backend-specific logic."""
+    from .session_tracker import create_session, update_session, delete_session
+    
+    # Create session for tracking
+    session = None
+    try:
+        session = create_session(
+            command="train",
+            backend=getattr(args, "backend", None),
+            model=getattr(args, "model", None),
+            language=getattr(args, "language", None),
+            output_dir=getattr(args, "output_dir", None),
+        )
+    except Exception:
+        # If session creation fails, continue anyway (non-critical)
+        pass
+    
     cleanup_paths: List[Path] = []
     nlpform_mode = getattr(args, "nlpform", "form") or "form"
 
@@ -6384,6 +6465,12 @@ def run_train(args: argparse.Namespace) -> int:
             if teitok_temp_dir and not getattr(args, "ud_folder", None):
                 shutil.rmtree(teitok_temp_dir, ignore_errors=True)
             _cleanup_nlpform_paths()
+            if session:
+                try:
+                    update_session(session.session_id, status="failed", error=f"Failed to create backend: {e}")
+                    delete_session(session.session_id)
+                except Exception:
+                    pass
             raise SystemExit(f"Failed to create {backend_type} backend: {e}")
         
         if not backend.supports_training:
@@ -6391,6 +6478,12 @@ def run_train(args: argparse.Namespace) -> int:
             if teitok_temp_dir and not getattr(args, "ud_folder", None):
                 shutil.rmtree(teitok_temp_dir, ignore_errors=True)
             _cleanup_nlpform_paths()
+            if session:
+                try:
+                    update_session(session.session_id, status="failed", error=f"{backend_type} backend does not support training")
+                    delete_session(session.session_id)
+                except Exception:
+                    pass
             raise SystemExit(f"{backend_type} backend does not support training")
         
         try:
@@ -6434,6 +6527,12 @@ def run_train(args: argparse.Namespace) -> int:
     
     else:
         _cleanup_nlpform_paths()
+        if session:
+            try:
+                update_session(session.session_id, status="failed", error=f"Unknown backend: {backend_type}")
+                delete_session(session.session_id)
+            except Exception:
+                pass
         raise SystemExit(f"Unknown backend: {backend_type}. Supported backends for training: flexitag, spacy, transformers, fasttext, classla")
 
 
@@ -6562,6 +6661,16 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
     elif output_format in ("conllu", "conllu-ne"):
         entity_format = "ne" if output_format == "conllu-ne" else "iob"
         conllu_text = document_to_conllu(doc, entity_format=entity_format)
+        # Filter out Java error messages that might leak into stdout
+        # These are printed by ctextcore's Java subprocess and can't be easily suppressed
+        # Java errors can appear on the same line as conllu comments, so we need to handle both cases
+        import re
+        # Remove Java error text that appears before conllu comments (on the same line)
+        conllu_text = re.sub(r'java\.lang\.[^#]*?(?=#)', '', conllu_text)
+        # Remove standalone Java error lines
+        conllu_text = re.sub(r'^java\.lang\.[^\n]*$', '', conllu_text, flags=re.MULTILINE)
+        # Clean up any double spaces or empty lines left by the removal
+        conllu_text = re.sub(r'\n\n+', '\n\n', conllu_text)
         if args.output:
             with open(args.output, "w", encoding="utf-8") as f:
                 f.write(conllu_text)
@@ -6823,6 +6932,16 @@ def _write_document(
             model_info=None,
             entity_format=entity_format,
         )
+        # Filter out Java error messages that might leak into stdout
+        # These are printed by ctextcore's Java subprocess and can't be easily suppressed
+        # Java errors can appear on the same line as conllu comments, so we need to handle both cases
+        import re
+        # Remove Java error text that appears before conllu comments (on the same line)
+        conllu_text = re.sub(r'java\.lang\.[^#]*?(?=#)', '', conllu_text)
+        # Remove standalone Java error lines
+        conllu_text = re.sub(r'^java\.lang\.[^\n]*$', '', conllu_text, flags=re.MULTILINE)
+        # Clean up any double spaces or empty lines left by the removal
+        conllu_text = re.sub(r'\n\n+', '\n\n', conllu_text)
         if output:
             Path(output).write_text(conllu_text, encoding="utf-8")
         else:

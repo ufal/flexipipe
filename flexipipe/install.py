@@ -25,8 +25,14 @@ def run_install(args: argparse.Namespace) -> int:
         "hunspell": "phunspell",  # Backend name is "hunspell", but package is "phunspell"
     }
     
+    # Map backend names to direct pip packages (for backends not in flexipipe extras)
+    BACKEND_TO_PACKAGE = {
+        "ctext": "ctextcore",
+    }
+    
     all_backends = set(get_backend_choices())
     backends_to_install = []
+    backends_to_install_direct = []  # Backends that install packages directly via pip
     invalid_backends = []
     no_install_needed = []
     
@@ -37,6 +43,7 @@ def run_install(args: argparse.Namespace) -> int:
         if backend_lower == "all":
             # Install all backends that have extras
             backends_to_install.extend(BACKEND_TO_EXTRA.keys())
+            backends_to_install_direct.extend(BACKEND_TO_PACKAGE.keys())
             continue
         
         if backend_lower not in all_backends:
@@ -45,7 +52,24 @@ def run_install(args: argparse.Namespace) -> int:
         
         # Get backend info to check install instructions
         backend_info = get_backend_info(backend_lower)
+        
+        # Check if backend installs a package directly via pip
+        if backend_lower in BACKEND_TO_PACKAGE:
+            backends_to_install_direct.append(backend_lower)
+            continue
+        
         if backend_info and backend_info.install_instructions:
+            # Check if install_instructions contains "pip install" - if so, we can extract and install
+            instructions = backend_info.install_instructions
+            if "pip install" in instructions.lower():
+                # Try to extract package name from instructions like "Install via: pip install ctextcore"
+                import re
+                match = re.search(r'pip install\s+([^\s]+)', instructions, re.IGNORECASE)
+                if match:
+                    package_name = match.group(1).strip()
+                    # Store as (backend_name, package_name) tuple
+                    backends_to_install_direct.append((backend_lower, package_name))
+                    continue
             # Backend has custom install instructions (e.g., REST service, CLI tool)
             no_install_needed.append((backend_lower, backend_info.install_instructions))
             continue
@@ -68,7 +92,7 @@ def run_install(args: argparse.Namespace) -> int:
     for backend_name, instructions in no_install_needed:
         print(f"[flexipipe] {instructions}")
     
-    if not backends_to_install:
+    if not backends_to_install and not backends_to_install_direct:
         if not no_install_needed and not args.verbose:
             print("[flexipipe] No backends require installation (all are built-in or require CLI tools)")
         return 0
@@ -81,10 +105,70 @@ def run_install(args: argparse.Namespace) -> int:
             seen.add(backend)
             unique_backends.append(backend)
     
-    # Install each backend's extra
+    # Initialize counters
     success_count = 0
     failed_backends = []
     
+    # Install backends that install packages directly via pip
+    for item in backends_to_install_direct:
+        if isinstance(item, tuple):
+            backend_name, package_name = item
+        else:
+            backend_name = item
+            package_name = BACKEND_TO_PACKAGE[backend_name]
+        
+        # Check if already installed
+        module_name = package_name.replace("-", "_")  # Convert package name to module name
+        if _module_available(module_name):
+            if args.verbose:
+                print(f"[flexipipe] Backend '{backend_name}' dependencies already installed")
+            success_count += 1
+            continue
+        
+        if args.verbose:
+            print(f"[flexipipe] Installing dependencies for backend '{backend_name}' (pip install {package_name})...")
+        
+        # Special handling for ctext (requires Java)
+        if backend_name == "ctext":
+            import shutil
+            if shutil.which("java") is None:
+                print(f"[flexipipe] ⚠ Warning: Java (OpenJDK 17+) is required for CTexT backend but not found on PATH.", file=sys.stderr)
+                print(f"[flexipipe]    Install Java from https://openjdk.org or via your system package manager.", file=sys.stderr)
+                print(f"[flexipipe]    After installing Java, ensure 'java' is available in your PATH.", file=sys.stderr)
+            else:
+                # Check Java version
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ["java", "-version"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    version_output = result.stderr or result.stdout
+                    import re
+                    version_match = re.search(r'version "(\d+)', version_output)
+                    if version_match:
+                        java_version = int(version_match.group(1))
+                        if java_version < 17:
+                            print(f"[flexipipe] ⚠ Warning: Java version {java_version} found, but CTexT requires Java 17+.", file=sys.stderr)
+                            print(f"[flexipipe]    Please upgrade to Java OpenJDK 17+ from https://openjdk.org", file=sys.stderr)
+                except Exception:
+                    pass  # If we can't check version, continue anyway
+        
+        # Install package directly via pip
+        if _run_pip_install(package_name, direct=True):
+            if _module_available(module_name):
+                print(f"[flexipipe] ✓ Successfully installed dependencies for '{backend_name}'")
+                success_count += 1
+            else:
+                print(f"[flexipipe] ⚠ Installation completed but module '{module_name}' is not importable", file=sys.stderr)
+                failed_backends.append(backend_name)
+        else:
+            print(f"[flexipipe] ✗ Failed to install dependencies for '{backend_name}'", file=sys.stderr)
+            failed_backends.append(backend_name)
+    
+    # Install each backend's extra
     for backend in unique_backends:
         extra_name = BACKEND_TO_EXTRA[backend]
         

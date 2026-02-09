@@ -1075,7 +1075,7 @@ def _create_fasttext_backend(
     **kwargs: Any,
 ) -> FastTextBackend:
     """Instantiate the fastText backend."""
-    from ..backend_utils import validate_backend_kwargs
+    from ..backend_utils import validate_backend_kwargs, resolve_model_from_language
     
     validate_backend_kwargs(kwargs, "fasttext", allowed_extra=["download_model", "training"])
     
@@ -1091,8 +1091,25 @@ def _create_fasttext_backend(
             skip_model_load=True,  # Skip loading model during training
         )
     
-    # Resolve model path
-    resolved_model = model or model_name
+    # Resolve model using central function (supports automatic selection from language)
+    try:
+        resolved_model = resolve_model_from_language(
+            language=language,
+            backend_name="fasttext",
+            model_name=model or model_name,
+            preferred_only=True,
+            use_cache=True,
+        )
+    except ValueError:
+        # Re-raise ValueError as-is (it already has a helpful message from resolve_model_from_language)
+        raise
+    except Exception as e:
+        # If model catalog lookup fails for other reasons, provide a helpful error message
+        from ..model_storage import is_running_from_teitok
+        teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend fasttext' to see available models."
+        raise ValueError(
+            f"[flexipipe] Could not resolve fastText model for language '{language}': {e}.{teitok_msg}"
+        ) from e
     
     if model_path:
         model_dir = Path(model_path)
@@ -1101,12 +1118,18 @@ def _create_fasttext_backend(
         models_dir = get_backend_models_dir("fasttext", create=False)
         model_dir = models_dir / resolved_model
     else:
-        raise ValueError("fastText backend requires either 'model', 'model_name', or 'model_path'")
+        from ..model_storage import is_running_from_teitok
+        teitok_msg = "" if is_running_from_teitok() else f" Provide --model to specify a model name, or use 'python -m flexipipe info models --backend fasttext' to see available models."
+        raise ValueError(
+            f"[flexipipe] fastText backend requires either 'model', 'model_name', 'model_path', or 'language'.{teitok_msg}"
+        )
     
     if not model_dir.exists():
+        from ..model_storage import is_running_from_teitok
+        teitok_msg = "" if is_running_from_teitok() else f" Use 'python -m flexipipe info models --backend fasttext' to see available models."
         raise FileNotFoundError(
-            f"fastText model not found: {model_dir}. "
-            f"Train a model first using: flexipipe train --backend fasttext"
+            f"[flexipipe] fastText model not found: {model_dir}. "
+            f"Train a model first using: flexipipe train --backend fasttext.{teitok_msg}"
         )
     
     return FastTextBackend(

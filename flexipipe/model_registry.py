@@ -130,6 +130,7 @@ def fetch_remote_registry(
     refresh_cache: bool = False,
     cache_ttl_seconds: int = REGISTRY_CACHE_TTL_SECONDS,
     verbose: bool = False,
+    allow_expired_cache: bool = False,
 ) -> Dict[str, Any]:
     """
     Fetch the remote model registry for a backend.
@@ -164,11 +165,20 @@ def fetch_remote_registry(
     
     # Check cache
     if use_cache and not refresh_cache:
-        cached = read_model_cache_entry(cache_key, max_age_seconds=cache_ttl_seconds)
+        # For read-only operations, use expired cache to avoid network requests
+        max_age = None if allow_expired_cache else cache_ttl_seconds
+        cached = read_model_cache_entry(cache_key, max_age_seconds=max_age)
         if cached:
             if verbose:
-                print(f"[flexipipe] Using cached remote model registry from {url}")
+                cache_age = "expired" if allow_expired_cache else "fresh"
+                print(f"[flexipipe] Using cached remote model registry from {url} ({cache_age})")
             return cached
+    
+    # For read-only operations, don't make network requests if cache doesn't exist
+    if allow_expired_cache:
+        if verbose:
+            print(f"[flexipipe] No cached registry available for {url}, skipping (read-only mode)")
+        return {}
     
     if not requests:
         if verbose:
@@ -288,6 +298,7 @@ def get_remote_models_for_backend(
     use_cache: bool = True,
     refresh_cache: bool = False,
     verbose: bool = False,
+    allow_expired_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Get remote models for a specific backend.
@@ -307,6 +318,7 @@ def get_remote_models_for_backend(
         use_cache=use_cache,
         refresh_cache=refresh_cache,
         verbose=verbose,
+        allow_expired_cache=allow_expired_cache,
     )
     
     # Per-backend registries have sources at the top level

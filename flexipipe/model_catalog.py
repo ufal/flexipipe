@@ -37,6 +37,7 @@ def build_unified_catalog(
     use_cache: bool = True,
     refresh_cache: bool = False,
     verbose: bool = False,
+    allow_expired_cache: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Build a unified model catalog from all backends.
@@ -52,18 +53,20 @@ def build_unified_catalog(
         use_cache: If True, use cached catalog if available
         refresh_cache: If True, force rebuild of catalog
         verbose: If True, print progress messages
+        allow_expired_cache: If True, use cached catalog even if expired (for read-only operations)
         
     Returns:
         Dictionary mapping "{backend}:{model_name}" to model entry dicts
     """
     # Check cache first
     if use_cache and not refresh_cache:
-        # Use cache with 1 hour TTL - this allows new models to appear within an hour
-        # without requiring explicit --refresh-cache, while still being fast for repeated queries
-        cached = read_model_cache_entry(CATALOG_CACHE_KEY, max_age_seconds=3600)  # 1 hour
+        # For read-only operations (like info models), use expired cache to avoid slow rebuilds
+        max_age = None if allow_expired_cache else 3600  # 1 hour TTL unless allow_expired_cache
+        cached = read_model_cache_entry(CATALOG_CACHE_KEY, max_age_seconds=max_age)
         if cached:
             if verbose:
-                print(f"[flexipipe] Using cached unified model catalog ({len(cached)} models)")
+                cache_age = "expired" if allow_expired_cache else "fresh"
+                print(f"[flexipipe] Using cached unified model catalog ({len(cached)} models, {cache_age})")
             return cached
         # If cache is missing or expired, fall through to rebuild
         if verbose:
@@ -111,6 +114,11 @@ def build_unified_catalog(
             if not refresh_cache:
                 entries = read_model_cache_entry(cache_key, max_age_seconds=None)
             if not entries:
+                # For read-only operations (allow_expired_cache=True), skip backends without cache
+                # to avoid slow network requests. Only fetch fresh data if explicitly requested.
+                if allow_expired_cache:
+                    # Skip this backend - no cache available and we're in read-only mode
+                    continue
                 # No cache or refresh requested - try loading normally (this will include remote models if available)
                 entries = get_model_entries(
                     backend,
@@ -310,38 +318,40 @@ def _apply_preference_rules(catalog: Dict[str, Dict[str, Any]]) -> None:
     """
     from .__main__ import _get_language_backend_priority
     
-    # Group by language
-    by_language: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
+    # Group by language+backend combination (prefer one model per language+backend)
+    by_language_backend: Dict[tuple[str, str], List[tuple[str, Dict[str, Any]]]] = {}
     for key, entry in catalog.items():
         lang_iso = entry.get("language_iso")
-        if not lang_iso:
+        backend = entry.get("backend", "")
+        if not lang_iso or not backend:
             continue
-        if lang_iso not in by_language:
-            by_language[lang_iso] = []
-        by_language[lang_iso].append((key, entry))
+        lang_backend_key = (lang_iso, backend)
+        if lang_backend_key not in by_language_backend:
+            by_language_backend[lang_backend_key] = []
+        by_language_backend[lang_backend_key].append((key, entry))
     
     backend_priority_list = _get_language_backend_priority()
     backend_priority = {name: idx for idx, name in enumerate(backend_priority_list) if name}
     
-    for lang_iso, models in by_language.items():
+    for (lang_iso, backend), models in by_language_backend.items():
         existing_preferred = [entry for _, entry in models if entry.get("preferred")]
         if existing_preferred:
             for entry in existing_preferred:
                 _assign_model_ratings(entry)
             continue
 
-        # Sort by: installed first, then backend priority, then model name
+        # Sort by: installed first, then prefer _full models, then model name
         def sort_key(item: tuple[str, Dict[str, Any]]) -> tuple[int, int, str]:
             key, entry = item
-            backend = entry.get("backend", "")
             installed = 0 if entry.get("available_without_download") else 1
-            backend_rank = backend_priority.get(backend, 999)
             model_name = entry.get("model", "")
-            return (installed, backend_rank, model_name)
+            # Prefer _full models over individual tech models (e.g., zu_full > zu_tok)
+            is_full_model = 0 if model_name.endswith("_full") else 1
+            return (installed, is_full_model, model_name)
         
         models.sort(key=sort_key)
         
-        # Mark first model as preferred (best balance of installed + backend priority)
+        # Mark first model as preferred (best balance of installed + _full preference)
         if models:
             _, preferred_entry = models[0]
             preferred_entry["preferred"] = True
@@ -369,7 +379,13 @@ def get_models_for_language(
     Returns:
         List of model entry dicts matching the criteria
     """
-    catalog = build_unified_catalog(use_cache=use_cache, refresh_cache=refresh_cache, verbose=False)
+    # For read-only queries, allow using expired cache to avoid slow rebuilds
+    catalog = build_unified_catalog(
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+        verbose=False,
+        allow_expired_cache=True,  # Use expired cache for fast read-only operations
+    )
     
     from .language_utils import resolve_language_query, language_matches_entry
     

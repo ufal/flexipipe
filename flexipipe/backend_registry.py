@@ -87,12 +87,18 @@ def get_backend_status(backend_name: str) -> Dict[str, Any]:
         "flair": ("flair", "pip install flair"),
         "transformers": ("transformers", "pip install transformers"),
         "classla": ("classla", "pip install classla"),
+        "hunspell": ("phunspell", 'pip install "flexipipe[phunspell]"'),
     }
     
     # CLI backends that need binaries
     cli_backends = {
         "udpipe1": ("udpipe binary", "Install UDPipe and ensure 'udpipe' is on PATH"),
         "treetagger": ("tree-tagger binary", "Install TreeTagger and ensure 'tree-tagger' is on PATH"),
+    }
+    
+    # Backends that need Java
+    java_backends = {
+        "ctext": ("Java Runtime", "Install Java OpenJDK 17+ from https://openjdk.org or via your system package manager"),
     }
     
     # Check for Python module requirements
@@ -128,6 +134,83 @@ def get_backend_status(backend_name: str) -> Dict[str, Any]:
             binary_cmd = "tree-tagger"
         if shutil.which(binary_cmd) is None:
             missing.append(binary_name)
+            status = "missing_binary"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": install_hint,
+            }
+    
+    # Check for Java requirements
+    if backend_key in java_backends:
+        java_name, install_hint = java_backends[backend_key]
+        import shutil
+        import subprocess
+        
+        # Check if java binary exists
+        java_cmd = "java"
+        if shutil.which(java_cmd) is None:
+            missing.append(java_name)
+            status = "missing_binary"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": install_hint,
+            }
+        
+        # Actually try to run java -version to check if it's functional
+        # (macOS has a stub java binary that prompts to install Java)
+        try:
+            result = subprocess.run(
+                [java_cmd, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            # Java version output goes to stderr
+            version_output = result.stderr or result.stdout
+            
+            # Check for macOS stub error message
+            if "Unable to locate a Java Runtime" in version_output or "No Java runtime present" in version_output:
+                missing.append(java_name)
+                status = "missing_binary"
+                return {
+                    "available": False,
+                    "status": status,
+                    "missing": missing,
+                    "install_hint": install_hint,
+                }
+            
+            # Try to extract version number
+            import re
+            version_match = re.search(r'version "(\d+)', version_output)
+            if version_match:
+                java_version = int(version_match.group(1))
+                if java_version < 17:
+                    missing.append(f"{java_name} (version {java_version} found, but 17+ required)")
+                    status = "missing_binary"
+                    return {
+                        "available": False,
+                        "status": status,
+                        "missing": missing,
+                        "install_hint": install_hint,
+                    }
+        except subprocess.TimeoutExpired:
+            # Timeout - assume Java is not working properly
+            missing.append(java_name)
+            status = "missing_binary"
+            return {
+                "available": False,
+                "status": status,
+                "missing": missing,
+                "install_hint": install_hint,
+            }
+        except (subprocess.SubprocessError, ValueError, AttributeError) as e:
+            # If java -version fails, Java is not properly installed
+            # (e.g., macOS stub that can't actually run)
+            missing.append(java_name)
             status = "missing_binary"
             return {
                 "available": False,
@@ -452,10 +535,18 @@ def create_backend(
             factory_kwargs.setdefault("language", language)
         try:
             return info.factory(**factory_kwargs)
-        except RuntimeError as e:
-            # Check if this is a user-friendly error message (starts with [flexipipe])
+        except (RuntimeError, ValueError, FileNotFoundError) as e:
+            # Check if this is a user-friendly error message
             error_msg = str(e)
+            # Check for [flexipipe] prefix (explicit user-friendly messages)
             if error_msg.startswith("[flexipipe]"):
+                # Print the error message directly and exit cleanly without traceback
+                import sys
+                print(error_msg, file=sys.stderr)
+                raise SystemExit(1) from None  # from None suppresses the exception chain
+            # Check for detailed dependency error messages from ensure_extra_installed
+            # These messages are already user-friendly and complete
+            if "requires optional dependency" in error_msg or "Install it manually with" in error_msg:
                 # Print the error message directly and exit cleanly without traceback
                 import sys
                 print(error_msg, file=sys.stderr)
@@ -465,6 +556,13 @@ def create_backend(
         except ImportError as e:
             # Handle missing module gracefully
             error_str = str(e)
+            
+            # Check if this is a detailed error message from ensure_extra_installed
+            # These messages are already user-friendly and complete, so pass them through
+            if "requires optional dependency" in error_str or "Install it manually with" in error_str:
+                # This is a detailed error from ensure_extra_installed - pass it through directly
+                raise RuntimeError(error_str) from e
+            
             # Check if this is a SpaCy language support error (E048)
             # For training, let the backend handle it (it will use 'xx' fallback)
             if training and ("E048" in error_str or ("Can't import language" in error_str and "spacy.lang" in error_str)):

@@ -41,6 +41,7 @@ def _save_conllu(
         create_implicit_mwt=getattr(args, "create_implicit_mwt", False),
         entity_format=entity_format,
     )
+    
     if output_path:
         Path(output_path).write_text(conllu_text, encoding="utf-8")
     else:
