@@ -314,13 +314,14 @@ def parse_conllu_from_backend(conllu_text: str, source_document: "Document", doc
     cleaned_conllu = "\n".join(cleaned_lines)
 
     create_implicit_mwt = source_document.meta.get("_create_implicit_mwt", False)
-    tagged_doc = conllu_to_document(cleaned_conllu, doc_id=doc_id, create_implicit_mwt=create_implicit_mwt)
+    disable_contraction_merge = source_document.meta.get("_disable_contraction_merge", False)
+    tagged_doc = conllu_to_document(cleaned_conllu, doc_id=doc_id, create_implicit_mwt=create_implicit_mwt, disable_contraction_merge=disable_contraction_merge)
     # Preserve original metadata
     tagged_doc.meta.update(source_document.meta)
     return tagged_doc
 
 
-def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: bool = False, create_implicit_mwt: bool = False) -> Document:
+def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: bool = False, create_implicit_mwt: bool = False, disable_contraction_merge: bool = False) -> Document:
     """
     Parse CoNLL-U text into a Document, respecting UD hierarchy.
     
@@ -762,7 +763,10 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
     
     # Merge adjacent non-punctuation tokens with SpaceAfter=No into contractions
     # This handles treebanks that represent contractions as two tokens without a space
-    _merge_spaceafter_no_contractions(document)
+    # Can be disabled via disable_contraction_merge parameter
+    # (used by backends like UD-Kanbun that output proper dependency relations)
+    if not disable_contraction_merge:
+        _merge_spaceafter_no_contractions(document)
     
     # Set space_after to None for the last token of each sentence (no SpaceAfter entry in CoNLL-U)
     # This must be done AFTER _merge_spaceafter_no_contractions, which may modify tokens

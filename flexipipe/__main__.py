@@ -2228,9 +2228,15 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--output-format",
         "--output-form",
-        choices=["teitok", "conllu", "conllu-ne", "json"],
+        choices=["teitok", "conllu", "conllu-ne", "json", "svg"],
         default=None,
-        help="Output format (default: from config, or teitok)",
+        help="Output format (default: from config, or teitok). SVG requires dependency relations and spaCy (for displacy).",
+    )
+    process_parser.add_argument(
+        "--svg-style",
+        choices=["dep", "tree"],
+        default="dep",
+        help="SVG visualization style: 'dep' for arrow-style dependency relations (default), 'tree' for tree-style visualization.",
     )
     process_parser.add_argument(
         "--unicode-normalize",
@@ -5006,6 +5012,10 @@ def run_tag(args: argparse.Namespace) -> int:
                     backend_kwargs_final = dict(create_kwargs)
                     if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers", "ctext"):
                         backend_kwargs_final["verbose"] = args.verbose or args.debug
+                    # Pass debug separately for backends that support it (udkanbun)
+                    if backend_type.lower() == "udkanbun":
+                        backend_kwargs_final["debug"] = args.debug
+                        backend_kwargs_final["verbose"] = args.verbose
                     
                     # For udpipe1, don't use model_path - pass model directly
                     model_path_arg = None
@@ -5351,6 +5361,9 @@ def run_tag(args: argparse.Namespace) -> int:
                     model_str = f"{display_backend}: {language}"
                 else:
                     model_str = f"{display_backend}: unknown"
+            elif backend_type_lower == "udkanbun":
+                # UD-Kanbun uses a single default model, so just show the backend name
+                model_str = "UD-Kanbun"
             else:
                 model_display = model_name or backend_descriptor or "unknown"
                 model_str = f"{display_backend}: {model_display}"
@@ -5568,19 +5581,24 @@ def run_tag(args: argparse.Namespace) -> int:
         # Don't apply when updating existing tokens in writeback mode
         # When updating existing tokens, the backend might create MWTs from SpaceAfter=No sequences,
         # but we don't want to apply _create_implicit_mwt as it would break token alignment
+        # Also don't apply if backend explicitly disables it (e.g., UD-Kanbun)
         if args.create_implicit_mwt and output_format == "teitok":
-            should_apply_mwt = False
-            if not use_writeback:
-                # Regular output - always apply if requested
-                should_apply_mwt = True
-            elif use_writeback and is_extracted_text:
-                # Writeback mode but inserting new tokens (untokenized file)
-                should_apply_mwt = True
-            elif use_writeback and output_doc.meta.get("_processed_from_raw_text", False) and original_input_path:
-                # Processed from raw text - check if file has no tokens
-                from .teitok import teitok_has_tokens
-                if not teitok_has_tokens(str(original_input_path)):
+            # Check if backend explicitly disables create_implicit_mwt
+            if output_doc.meta.get("_disable_create_implicit_mwt", False):
+                should_apply_mwt = False
+            else:
+                should_apply_mwt = False
+                if not use_writeback:
+                    # Regular output - always apply if requested
                     should_apply_mwt = True
+                elif use_writeback and is_extracted_text:
+                    # Writeback mode but inserting new tokens (untokenized file)
+                    should_apply_mwt = True
+                elif use_writeback and output_doc.meta.get("_processed_from_raw_text", False) and original_input_path:
+                    # Processed from raw text - check if file has no tokens
+                    from .teitok import teitok_has_tokens
+                    if not teitok_has_tokens(str(original_input_path)):
+                        should_apply_mwt = True
             # Explicitly don't apply when updating existing tokens in writeback mode
             # (is_extracted_text is False and we're in writeback mode)
             if should_apply_mwt:
@@ -5795,6 +5813,22 @@ def run_tag(args: argparse.Namespace) -> int:
             )
         else:
             print(json_text)
+    else:
+        # For other formats (conllu, conllu-ne, svg), use _write_document
+        # Get Unicode normalization form for output
+        from .model_storage import get_unicode_normalization
+        output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
+        if output_unicode_normalize is None:
+            output_unicode_normalize = get_unicode_normalization()
+        
+        svg_style = getattr(args, "svg_style", "dep")
+        _write_document(
+            result.document,
+            output_path,
+            output_format,
+            unicode_normalization=output_unicode_normalize,
+            svg_style=svg_style,
+        )
 
     if args.debug:
         print(f"[flexipipe] completed. stats={result.stats}")
@@ -6890,6 +6924,155 @@ def _load_document(path: Path, fmt: str, *, args: Optional[argparse.Namespace] =
     raise SystemExit(f"Unsupported input format '{fmt}' for {path}")
 
 
+def _render_tree_style(sent, token_id_to_idx: dict[int, int]) -> str:
+    """
+    Render a sentence as a hierarchical tree-style SVG visualization.
+    
+    Args:
+        sent: Sentence object with tokens
+        token_id_to_idx: Mapping from token.id to list index
+        
+    Returns:
+        SVG string with tree visualization
+    """
+    if not sent.tokens:
+        return ""
+    
+    # Build tree structure: node_idx -> list of child indices
+    children: dict[int, list[int]] = {}
+    root_idx = None
+    
+    for idx, token in enumerate(sent.tokens):
+        if token.head == 0 or token.head is None:
+            root_idx = idx
+        else:
+            head_idx = token_id_to_idx.get(token.head)
+            if head_idx is not None:
+                if head_idx not in children:
+                    children[head_idx] = []
+                children[head_idx].append(idx)
+    
+    if root_idx is None:
+        # No root found, use first token
+        root_idx = 0
+    
+    # Calculate tree layout (simple top-down layout)
+    # Each level gets a y-coordinate, nodes are spaced horizontally
+    node_positions: dict[int, tuple[float, float]] = {}  # idx -> (x, y)
+    node_width = 80  # Width per node
+    text_height = 20  # Height for text (no boxes)
+    level_height = 120  # Vertical spacing between levels (increased for more vertical layout)
+    padding = 20
+    
+    def calculate_layout(node_idx: int, level: int, x_start: float) -> float:
+        """Calculate positions recursively, returns next x position"""
+        token = sent.tokens[node_idx]
+        node_children = children.get(node_idx, [])
+        
+        if not node_children:
+            # Leaf node
+            x = x_start
+            node_positions[node_idx] = (x, level * level_height)
+            return x_start + node_width + padding
+        
+        # Calculate positions for children first
+        child_x = x_start
+        for child_idx in node_children:
+            child_x = calculate_layout(child_idx, level + 1, child_x)
+        
+        # Position parent above center of children
+        if node_children:
+            first_child_x, _ = node_positions[node_children[0]]
+            last_child_x, _ = node_positions[node_children[-1]]
+            parent_x = (first_child_x + last_child_x) / 2
+        else:
+            parent_x = x_start
+        
+        node_positions[node_idx] = (parent_x, level * level_height)
+        return max(child_x, parent_x + node_width + padding)
+    
+    # Calculate layout starting from root
+    max_x = calculate_layout(root_idx, 0, padding)
+    # Calculate actual max Y from node positions (not from level count)
+    # Text is at y + text_height (20), tag is at y + text_height + 15 (35)
+    # Tag font size is 10px, so tag extends to about y + 35 + 10 = y + 45
+    # Add minimal padding at bottom (just 5px to avoid clipping)
+    if node_positions:
+        max_y_pos = max(y for _, y in node_positions.values())
+        # Bottommost node: y position + text_height (20) + tag_offset (15) + tag_height (~10) + tiny padding (5)
+        max_y = max_y_pos + 50  # Tight fit: 20 + 15 + 10 + 5 = 50
+    else:
+        max_y = 50  # Minimal height for empty tree
+    
+    # Build SVG
+    svg_lines = [
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"',
+        f'width="{max_x + padding}" height="{max_y}"',
+        f'viewBox="0 0 {max_x + padding} {max_y}">',
+        '<style>',
+        '  .tree-node { fill: none; stroke: none; }',
+        '  .tree-text { font-family: Arial, sans-serif; font-size: 12px; text-anchor: middle; fill: #000; }',
+        '  .tree-tag { font-family: Arial, sans-serif; font-size: 10px; fill: #666; text-anchor: middle; }',
+        '  .tree-edge { stroke: #333; stroke-width: 1.5px; fill: none; }',
+        '  .tree-label { font-family: Arial, sans-serif; font-size: 9px; fill: #0066cc; text-anchor: middle; }',
+        '</style>',
+    ]
+    
+    # Draw edges first (so they appear behind nodes)
+    # Calculate reserved space height for nodes
+    node_reserved_height = text_height * 2 + 10  # Space reserved for text + tag + padding
+    
+    for idx, token in enumerate(sent.tokens):
+        if token.head and token.head > 0 and token.deprel:
+            head_idx = token_id_to_idx.get(token.head)
+            if head_idx is not None and head_idx != idx and idx in node_positions and head_idx in node_positions:
+                x1, y1 = node_positions[head_idx]
+                x2, y2 = node_positions[idx]
+                # Adjust for node center (text is centered in reserved space)
+                x1 += node_width / 2
+                x2 += node_width / 2
+                
+                # Connect from just below POS tag to just above word text
+                # Parent node: y1 is top of reserved space
+                #   - Text is at y1 + text_height (20)
+                #   - POS tag is at y1 + text_height + 15 (35)
+                #   - Edge should start just below POS tag, e.g., y1 + text_height + 15 + 5 = y1 + 40
+                # Child node: y2 is top of reserved space
+                #   - Text is at y2 + text_height (20)
+                #   - Edge should end with more space above text, e.g., y2 + text_height - 10 = y2 + 10
+                y1_start = y1 + text_height + 15 + 5  # Just below POS tag (y1 + 40)
+                y2_end = y2 + text_height - 10  # More space above word text (y2 + 10)
+                
+                svg_lines.append(f'<line class="tree-edge" x1="{x1}" y1="{y1_start}" x2="{x2}" y2="{y2_end}"/>')
+                # Add label near midpoint
+                label_x = (x1 + x2) / 2
+                label_y = (y1_start + y2_end) / 2 - 5
+                svg_lines.append(f'<text class="tree-label" x="{label_x}" y="{label_y}">{token.deprel}</text>')
+    
+    # Draw nodes (reserve space but no visible boxes)
+    for idx, token in enumerate(sent.tokens):
+        if idx not in node_positions:
+            continue
+        x, y = node_positions[idx]
+        
+        # Reserve space with invisible rectangle (for spacing, but no visible box)
+        # This ensures text doesn't overlap with edges
+        svg_lines.append(f'<rect class="tree-node" x="{x}" y="{y}" width="{node_width}" height="{text_height * 2 + 10}" fill="none" stroke="none"/>')
+        
+        # Token text (centered in reserved space)
+        text_y = y + text_height
+        svg_lines.append(f'<text class="tree-text" x="{x + node_width/2}" y="{text_y}">{token.form}</text>')
+        
+        # POS tag
+        tag = token.upos or token.xpos or ""
+        if tag:
+            tag_y = y + text_height + 15
+            svg_lines.append(f'<text class="tree-tag" x="{x + node_width/2}" y="{tag_y}">{tag}</text>')
+    
+    svg_lines.append('</svg>')
+    return '\n'.join(svg_lines)
+
+
 def _write_document(
     document: Document,
     output: str | None,
@@ -6900,6 +7083,7 @@ def _write_document(
     skip_spaceafter_for_breaking_elements: bool = True,
     teitok_settings: Optional[TeitokSettings] = None,
     unicode_normalization: Optional[str] = None,
+    svg_style: str = "dep",
 ) -> None:
     if fmt == "teitok":
         if output:
@@ -6927,9 +7111,15 @@ def _write_document(
 
     if fmt in ("conllu", "conllu-ne"):
         entity_format = "ne" if fmt == "conllu-ne" else "iob"
+        # Respect backend's request to disable create_implicit_mwt (e.g., UD-Kanbun)
+        # Note: args is not available in _write_document, so we check document meta directly
+        create_implicit_mwt = False  # Default to False since args is not available
+        if document.meta.get("_disable_create_implicit_mwt", False):
+            create_implicit_mwt = False
         conllu_text = document_to_conllu(
             document,
             model_info=None,
+            create_implicit_mwt=create_implicit_mwt,
             entity_format=entity_format,
         )
         # Filter out Java error messages that might leak into stdout
@@ -6957,6 +7147,213 @@ def _write_document(
             sys.stdout.write(json_text)
             if not json_text.endswith("\n"):
                 sys.stdout.write("\n")
+        return
+
+    if fmt == "svg":
+        # SVG output requires spaCy's displacy module
+        try:
+            from spacy import displacy
+        except ImportError:
+            raise SystemExit("SVG output requires spaCy. Install it with: pip install spacy")
+        
+        # Check if we have UD-Kanbun spaCy Docs (preferred - uses to_svg() if available)
+        # But only use it for dep style; for tree style, use our own renderer
+        spacy_docs = document.meta.get("_udkanbun_spacy_docs")
+        if spacy_docs and svg_style == "dep":
+            # Use UD-Kanbun's spaCy Docs directly for arrow-style visualization
+            svg_parts = []
+            for spacy_doc in spacy_docs:
+                svg_content = None
+                # Try UD-Kanbun's to_svg() method first (if available)
+                if hasattr(spacy_doc, "to_svg"):
+                    try:
+                        svg_content = spacy_doc.to_svg()
+                    except Exception:
+                        pass
+                
+                # Fallback: use spaCy's displacy
+                if not svg_content:
+                    try:
+                        svg_content = displacy.render(spacy_doc, style="dep", jupyter=False)
+                    except Exception:
+                        pass
+                
+                if svg_content:
+                    svg_parts.append(svg_content)
+            
+            if svg_parts:
+                svg_text = "\n".join(svg_parts)
+                if output:
+                    Path(output).write_text(svg_text, encoding="utf-8")
+                else:
+                    sys.stdout.write(svg_text)
+                return
+        
+        # General case: convert flexipipe Document to displacy format
+        # Check if document has dependency relations
+        has_dependencies = False
+        for sent in document.sentences:
+            for token in sent.tokens:
+                if token.head or token.deprel:
+                    has_dependencies = True
+                    break
+            if has_dependencies:
+                break
+        
+        if not has_dependencies:
+            raise SystemExit("SVG output requires dependency relations (head and deprel). The document does not have dependency parsing.")
+        
+        # Convert each sentence to displacy format
+        svg_parts = []
+        for sent in document.sentences:
+            if not sent.tokens:
+                continue
+            
+            # Build displacy options dict
+            # Format: dict with "words", "arcs", "title" (optional)
+            # words: list of dicts with "text", "tag"
+            # arcs: list of dicts with "start", "end", "label", "dir" (optional)
+            words = []
+            arcs = []
+            
+            # Build token index mapping (token.id -> list index)
+            token_id_to_idx = {}
+            for idx, token in enumerate(sent.tokens):
+                token_id_to_idx[token.id] = idx
+                words.append({
+                    "text": token.form,
+                    "tag": token.upos or token.xpos or "",
+                })
+            
+            # Build arcs (dependency relations)
+            for idx, token in enumerate(sent.tokens):
+                if token.head and token.head > 0 and token.deprel:
+                    # Find head token index
+                    head_idx = token_id_to_idx.get(token.head)
+                    if head_idx is not None and head_idx != idx:
+                        arcs.append({
+                            "start": min(idx, head_idx),
+                            "end": max(idx, head_idx),
+                            "label": token.deprel,
+                            "dir": "left" if head_idx < idx else "right",
+                        })
+            
+            if svg_style == "tree":
+                # Tree-style visualization: hierarchical tree layout
+                svg_content = _render_tree_style(sent, token_id_to_idx)
+                if svg_content:
+                    svg_parts.append(svg_content)
+            else:
+                # Arrow-style (dep) visualization using displacy
+                displacy_data = {
+                    "words": words,
+                    "arcs": arcs,
+                }
+                
+                # Render SVG using manual format
+                try:
+                    svg_content = displacy.render(displacy_data, style="dep", jupyter=False, manual=True)
+                    if svg_content:
+                        svg_parts.append(svg_content)
+                except Exception as e:
+                    # Skip sentences that fail to render
+                    if not svg_parts:  # Only raise if this is the first sentence
+                        raise SystemExit(f"SVG output failed: {e}")
+        
+        if not svg_parts:
+            raise SystemExit("SVG output failed: could not generate SVG from document")
+        
+        # Combine multiple SVGs into a single valid SVG document
+        import re
+        if len(svg_parts) == 1:
+            svg_text = svg_parts[0]
+        else:
+            # Multiple sentences: combine into a single SVG with proper structure
+            # Extract dimensions and content from each SVG
+            svg_contents = []
+            max_width = 0
+            total_height = 0
+            spacing = 50  # Space between sentence visualizations
+            
+            for svg_part in svg_parts:
+                # Extract content between <svg> and </svg> tags
+                # Handle both standalone SVG and SVG wrapped in <g> (from tree style)
+                content_match = re.search(r'<svg[^>]*>(.*)</svg>', svg_part, re.DOTALL)
+                if not content_match:
+                    # Try extracting from <g> wrapper (for tree style that was already wrapped)
+                    g_match = re.search(r'<g[^>]*>(.*)</g>', svg_part, re.DOTALL)
+                    if g_match:
+                        svg_content = g_match.group(1)
+                        # Try to extract dimensions from viewBox or attributes
+                        width_val = 1000
+                        height_val = 500
+                        svg_contents.append((svg_content, height_val))
+                        total_height += height_val + spacing
+                        continue
+                    continue
+                
+                svg_content = content_match.group(1)
+                
+                # Extract width and height
+                width_match = re.search(r'width="([^"]+)"', svg_part)
+                height_match = re.search(r'height="([^"]+)"', svg_part)
+                viewbox_match = re.search(r'viewBox="([^"]+)"', svg_part)
+                
+                width_val = 1000  # Default
+                height_val = 500  # Default
+                
+                if width_match:
+                    try:
+                        width_val = float(width_match.group(1).replace('px', ''))
+                    except ValueError:
+                        pass
+                
+                if height_match:
+                    try:
+                        height_val = float(height_match.group(1).replace('px', ''))
+                    except ValueError:
+                        pass
+                elif viewbox_match:
+                    # Extract from viewBox: "0 0 width height"
+                    try:
+                        parts = viewbox_match.group(1).split()
+                        if len(parts) >= 4:
+                            height_val = float(parts[3])
+                    except (ValueError, IndexError):
+                        pass
+                
+                max_width = max(max_width, width_val)
+                svg_contents.append((svg_content, height_val))
+                total_height += height_val
+            
+            # Add spacing between sentences (not after the last one)
+            if len(svg_contents) > 1:
+                total_height += spacing * (len(svg_contents) - 1)
+            
+            # Build combined SVG
+            combined_content = []
+            y_offset = 0
+            for i, (svg_content, height) in enumerate(svg_contents):
+                # Wrap in a group and translate vertically
+                combined_content.append(f'<g transform="translate(0, {y_offset})">{svg_content}</g>')
+                y_offset += height
+                # Add spacing after this sentence (but not after the last one)
+                if i < len(svg_contents) - 1:
+                    y_offset += spacing
+            
+            # Create single SVG root element
+            svg_text = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" '
+                f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                f'width="{max_width}" height="{total_height}" '
+                f'viewBox="0 0 {max_width} {total_height}">\n'
+                + "\n".join(combined_content) + "\n</svg>"
+            )
+        
+        if output:
+            Path(output).write_text(svg_text, encoding="utf-8")
+        else:
+            sys.stdout.write(svg_text)
         return
 
     raise SystemExit(f"Unsupported output format '{fmt}'")

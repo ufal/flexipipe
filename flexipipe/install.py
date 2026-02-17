@@ -28,6 +28,7 @@ def run_install(args: argparse.Namespace) -> int:
     # Map backend names to direct pip packages (for backends not in flexipipe extras)
     BACKEND_TO_PACKAGE = {
         "ctext": "ctextcore",
+        "udkanbun": "udkanbun",
     }
     
     all_backends = set(get_backend_choices())
@@ -118,7 +119,12 @@ def run_install(args: argparse.Namespace) -> int:
             package_name = BACKEND_TO_PACKAGE[backend_name]
         
         # Check if already installed
-        module_name = package_name.replace("-", "_")  # Convert package name to module name
+        # Some packages have different module names than package names
+        module_name_map = {
+            "ctextcore": "ctextcore",
+            "udkanbun": "udkanbun",
+        }
+        module_name = module_name_map.get(package_name, package_name.replace("-", "_"))
         if _module_available(module_name):
             if args.verbose:
                 print(f"[flexipipe] Backend '{backend_name}' dependencies already installed")

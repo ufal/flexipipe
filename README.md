@@ -2,10 +2,9 @@
 
 flexiPipe is a modular NLP pipeline for Universal Dependencies data that glues
 rule-based components, the legacy flexitag tagger, and multiple neural
-backends (SpaCy, Stanza, Flair, UDPipe REST, and
-UDMorph REST).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
-existing annotations, and exports both CoNLL-U (with optional implicit MWTs
-and IOB NER) and TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures.
+backends (SpaCy, Stanza, Flair, UDPipe REST, UDMorph REST, and UD-Kanbun).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
+existing annotations, and exports CoNLL-U (with optional implicit MWTs
+and IOB NER), TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures, and SVG dependency tree visualizations.
 
 The CLI centers around several workflows:
 
@@ -34,6 +33,7 @@ available integrations, models, example texts, and supported tasks.
   * `transformers` ([HuggingFace Transformers](https://huggingface.co/) token-classification models for POS & NER with detailed metadata)
   * `udpipe` ([UDPIPE](https://lindat.mff.cuni.cz/services/udpipe) REST backends with batching, debug logging, and URL overrides)
   * `udmorph` ([UDMorph](https://lindat.mff.cuni.cz/services/teitok-live/udmorph/) REST backends with batching, and debug logging)
+  * `udkanbun` ([UD-Kanbun](https://koichiyasuoka.github.io/UD-Kanbun/) for Classical Chinese with dependency parsing, gloss annotations, and specialized visualization)
 * **Input flexibility**: auto-detects format or accepts `--input-format` (`auto`, `conllu`, `tei`, `raw`).
   Raw mode can read from STDIN (use `--input -` or pipe text).
 * **Backend chaining**: Pipe output from one backend to another to combine different tools (e.g., UDPipe for tagging/parsing, then NameTag for NER).
@@ -44,6 +44,7 @@ available integrations, models, example texts, and supported tasks.
 * **Output control**:
   * CoNLL-U writer can append implicit MWT ranges and selective `TokId` output.
   * TEITOK writer emits `<dtok/>` without extra whitespace, nests `<name>` blocks, and respects `_` skipping rules.
+  * SVG dependency tree visualization with arrow-style (`dep`) or hierarchical tree-style (`tree`) layouts.
   * Configure default output format and implicit MWT behaviour via `flexipipe config`.
 * **Evaluation tooling (`check`)**
   * Aligns tokens via tokids and SequenceMatcher fallbacks.
@@ -79,7 +80,11 @@ available integrations, models, example texts, and supported tasks.
    pip install "flexipipe[classla]"       # Classla backend
    pip install "flexipipe[flair]"         # Flair backend
    pip install "flexipipe[transformers]"  # Transformers backend (installs torch, datasets, etc.)
+   pip install "flexipipe[udkanbun]"      # UD-Kanbun backend (Classical Chinese)
    pip install "flexipipe[all]"           # Everything
+   
+   # Or install via flexipipe's install command
+   flexipipe install udkanbun
    ```
    Additional upstream options (only when needed):
    ```bash
@@ -161,6 +166,23 @@ python -m flexipipe process \
   --output-format tei \
   --output out.xml
 
+# Generate SVG dependency tree visualization
+python -m flexipipe process \
+  --backend udkanbun \
+  --data '不入虎穴不得虎子' \
+  --output-format svg \
+  --svg-style tree \
+  --output tree.svg
+
+# Generate arrow-style dependency visualization
+python -m flexipipe process \
+  --language nld \
+  --example udhr \
+  --backend spacy \
+  --output-format svg \
+  --svg-style dep \
+  --output dependencies.svg
+
 # Use UDPipe REST in raw mode with debug logging
 python -m flexipipe process \
   --backend udpipe \
@@ -179,11 +201,12 @@ Important switches:
 
 | Flag | Description |
 | --- | --- |
-| `--backend` | Selects backend (`flexitag`, `spacy`, `stanza`, `flair`, `udpipe`, `udmorph`, `nametag`) |
+| `--backend` | Selects backend (`flexitag`, `spacy`, `stanza`, `flair`, `udpipe`, `udmorph`, `nametag`, `udkanbun`) |
 | `--model` / `--language` | Backend-specific model hint. SpaCy resolves installed/downloadable names. |
-| `--language English` (SpaCy) | Without `--model`, flexiPipe auto-uses SpaCy’s default core model (e.g., `en_core_web_sm`, if installed). |
+| `--language English` (SpaCy) | Without `--model`, flexiPipe auto-uses SpaCy's default core model (e.g., `en_core_web_sm`, if installed). |
 | `--download-model` | Auto-fetch SpaCy/Stanza/Flair models when missing. |
-| `--output-format` | `tei`, `conllu`, or `json`. Falls back to configuration default. |
+| `--output-format` | `tei`, `conllu`, `conllu-ne`, `json`, or `svg`. Falls back to configuration default. |
+| `--svg-style` | SVG visualization style: `dep` (arrow-style) or `tree` (hierarchical tree). Default: `dep`. |
 | `--create-implicit-mwt` | Rebuilds implicit MWT ranges in output (default configurable). |
 ### Benchmarking
 
@@ -265,6 +288,7 @@ python -m flexipipe config --show
 | `udmorph` | Tokenized | REST morph-only tagging, curl debug output, language-sorted model listing | Requires `--udmorph-model`. |
 | `treetagger` | Tokenized | Local TreeTagger binary for lemma + XPOS tagging (English, German, French, Old French manifests) | Install TreeTagger separately; use `--treetagger-model` or `--treetagger-model-path`, optional `--treetagger-binary`. Works best with `--pretokenize` (e.g., `echo 'Carles li reis …' \| python -m flexipipe --backend treetagger --language fro --download-model --pretokenize`). |
 | `nametag` | Raw + tokenized | REST NER service, supports 21 languages, NameTag 3 (default), curl debug output | Provide `--nametag-model` or `--language`, optional `--nametag-version` (1/2/3), `--nametag-param KEY=VALUE`. |
+| `udkanbun` | Raw | [UD-Kanbun](https://koichiyasuoka.github.io/UD-Kanbun/) for Classical Chinese with dependency parsing, gloss annotations, and specialized visualization | Uses spaCy integration. Install via `flexipipe install udkanbun` or `pip install udkanbun`. Supports `--svg-style` for tree visualization. |
 ### HuggingFace Transformers backend
 
 The new `transformers` backend plugs flexiPipe directly into HuggingFace token-classification
@@ -322,9 +346,16 @@ possible).
 
 * **CoNLL-U**: `document_to_conllu` adds `Entity=` entries, writes
   TokId only when it originates from input, and can rebuild implicit MWT ranges.
+* **CoNLL-U with NER**: `--output-format conllu-ne` exports CoNLL-U with named entity annotations.
 * **TEITOK**: `dump_teitok` produces clean `<dtok/>` blocks, adds `<name>`
   wrappers for entity spans, and avoids redundant `_` attributes (except real
   underscores in lemma/form). TokIds are emitted as `xml:id`.
+* **SVG**: Dependency tree visualization in SVG format. Requires dependency relations (head and deprel).
+  * `--svg-style dep`: Arrow-style dependency visualization (default)
+  * `--svg-style tree`: Hierarchical tree-style visualization
+  * Works with any backend that provides dependency parsing (spacy, stanza, udkanbun, etc.)
+  * UD-Kanbun backend provides specialized Classical Chinese visualization when available
+* **JSON**: Structured JSON output with full document representation.
 * **Intermediates**: `check` stores predicted and detagged corpora for auditing.
 
 ---

@@ -35,10 +35,15 @@ def _save_conllu(
     entity_format: str,
     model_info: Optional[str] = None,
 ) -> None:
+    # Respect backend's request to disable create_implicit_mwt (e.g., UD-Kanbun)
+    create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
+    if document.meta.get("_disable_create_implicit_mwt", False):
+        create_implicit_mwt = False
+    
     conllu_text = document_to_conllu(
         document,
         model=model_info,
-        create_implicit_mwt=getattr(args, "create_implicit_mwt", False),
+        create_implicit_mwt=create_implicit_mwt,
         entity_format=entity_format,
     )
     

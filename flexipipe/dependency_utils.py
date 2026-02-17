@@ -191,3 +191,70 @@ def ensure_extra_installed(
         "`python -m flexipipe config --set-prompt-install-extras true` is enabled."
     )
 
+
+def ensure_package_installed(
+    package_name: str,
+    *,
+    module_name: str,
+    friendly_name: str,
+    backend_name: Optional[str] = None,
+    allow_prompt: Optional[bool] = None,
+) -> None:
+    """
+    Ensure that an optional package dependency is installed directly via pip.
+    
+    Similar to ensure_extra_installed, but for packages installed directly
+    (not via flexipipe extras).
+
+    Args:
+        package_name: Name of the pip package (e.g. "udkanbun")
+        module_name: Module that must be importable after installation
+        friendly_name: Human readable backend name for messaging
+        backend_name: Optional backend name for install command (defaults to package_name)
+        allow_prompt: Override whether prompting is allowed (defaults to stdin isatty)
+    """
+    if _module_available(module_name):
+        return
+
+    auto_install = get_auto_install_extras()
+    prompt_install = get_prompt_install_extras()
+
+    if allow_prompt is None:
+        allow_prompt = sys.stdin.isatty()
+
+    install_backend_name = backend_name or package_name
+    hint = (
+        f"Install it manually with: pip install {package_name}. "
+        "You can enable automatic installs via "
+        "`python -m flexipipe config --set-auto-install-extras true`. "
+        f"Or use: python -m flexipipe install {install_backend_name}"
+    )
+
+    if auto_install:
+        if _run_pip_install(package_name, direct=True) and _module_available(module_name):
+            return
+        raise ImportError(
+            f"{friendly_name} backend requires optional dependency '{package_name}', "
+            f"but automatic installation failed. {hint}"
+        )
+
+    if prompt_install and allow_prompt:
+        answer = input(
+            f"{friendly_name} backend requires optional dependency '{package_name}'. "
+            f"Install it now via pip? [Y/n]: "
+        ).strip().lower()
+        if answer in ("", "y", "yes"):
+            if _run_pip_install(package_name, direct=True) and _module_available(module_name):
+                return
+            raise ImportError(
+                f"{friendly_name} backend requires '{package_name}', "
+                f"but the installation attempt failed. {hint}"
+            )
+
+    raise ImportError(
+        f"{friendly_name} backend requires optional dependency '{package_name}'. "
+        f"{hint} "
+        "To continue receiving prompts, ensure "
+        "`python -m flexipipe config --set-prompt-install-extras true` is enabled."
+    )
+

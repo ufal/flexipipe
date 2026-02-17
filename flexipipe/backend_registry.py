@@ -97,11 +97,25 @@ def get_backend_status(backend_name: str) -> Dict[str, Any]:
     }
     
     # Backends that need Java
-    java_backends = {
-        "ctext": ("Java Runtime", "Install Java OpenJDK 17+ from https://openjdk.org or via your system package manager"),
-    }
+    # NOTE:
+    #   We deliberately do NOT perform an eager Java runtime check for CTexT here,
+    #   because:
+    #     - CTexT's own backend code has more robust Java detection (PATH, JAVA_HOME,
+    #       Homebrew locations, etc.), and
+    #     - on macOS, /usr/bin/java is often a stub which prints an error and
+    #       prompts for installation even when a working OpenJDK is installed
+    #       elsewhere. Probing that stub from `flexipipe info backends` leads to
+    #       false negatives and spurious error output.
+    #   Instead, we treat CTexT like a normal Python‑module backend here and rely
+    #   on its runtime checks to report Java‑related problems when the user
+    #   actually tries to run it.
+    java_backends: dict[str, tuple[str, str]] = {}
     
-    # Check for Python module requirements
+    # Check for Python module requirements (including CTexT's ctextcore)
+    if backend_key == "ctext":
+        # Special‑case: CTexT backend – only require the Python package here
+        required_modules = {**required_modules, "ctext": ("ctextcore", "pip install ctextcore")}
+    
     if backend_key in required_modules:
         module_name, install_hint = required_modules[backend_key]
         try:
