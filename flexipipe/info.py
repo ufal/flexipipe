@@ -1015,6 +1015,96 @@ def list_ud_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def list_renderers(args: argparse.Namespace) -> int:
+    """List all available SVG renderers."""
+    output_format = getattr(args, "output_format", "table")
+    
+    try:
+        from .svg_renderers import _renderer_registry, register_optional_renderers
+        
+        # Register optional renderers to get complete list
+        register_optional_renderers()
+        
+        renderers = []
+        for name, renderer in _renderer_registry.items():
+            renderer_info = {
+                "name": name,
+                "type": type(renderer).__name__,
+                "module": type(renderer).__module__,
+            }
+            
+            # Add description if available
+            if hasattr(renderer, "__doc__") and renderer.__doc__:
+                doc = renderer.__doc__.strip().split("\n")[0] if renderer.__doc__ else ""
+                renderer_info["description"] = doc
+            
+            # Check if it's optional (requires external package)
+            optional_packages = {
+                "udapi": "udapi",
+                "graphviz": "graphviz",
+                "conllview": "conllview",
+                "deplacy": "deplacy",
+            }
+            if name in optional_packages:
+                renderer_info["requires"] = optional_packages[name]
+                # Check if package is installed
+                try:
+                    __import__(optional_packages[name])
+                    renderer_info["installed"] = True
+                except ImportError:
+                    renderer_info["installed"] = False
+            else:
+                renderer_info["installed"] = True  # Built-in renderers
+            
+            renderers.append(renderer_info)
+        
+        # Sort by name
+        renderers.sort(key=lambda x: x["name"])
+        
+        if output_format == "json":
+            result = {
+                "renderers": renderers,
+                "total": len(renderers),
+            }
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        
+        # Table format
+        print("Available SVG Renderers:")
+        print("=" * 80)
+        print(f"{'Name':<20} {'Type':<25} {'Status':<15} {'Description'}")
+        print("-" * 80)
+        
+        for renderer in renderers:
+            name = renderer["name"]
+            renderer_type = renderer["type"]
+            installed = renderer.get("installed", True)
+            status = "✓ Installed" if installed else "✗ Not installed"
+            description = renderer.get("description", "")
+            if len(description) > 40:
+                description = description[:37] + "..."
+            
+            print(f"{name:<20} {renderer_type:<25} {status:<15} {description}")
+        
+        print("-" * 80)
+        print(f"Total: {len(renderers)} renderer(s)")
+        
+        # Show note about optional renderers
+        optional_not_installed = [r for r in renderers if r.get("requires") and not r.get("installed")]
+        if optional_not_installed:
+            print("\nNote: Some renderers require additional packages:")
+            for renderer in optional_not_installed:
+                print(f"  - {renderer['name']}: pip install {renderer['requires']}")
+        
+        return 0
+    except Exception as e:
+        if output_format == "json":
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            print(f"Error listing renderers: {e}")
+        return 1
+
+
 def list_teitok_settings(args: argparse.Namespace) -> int:
     """Display TEITOK settings.xml configuration."""
     from pathlib import Path
@@ -1296,7 +1386,7 @@ def run_info_cli(args: argparse.Namespace) -> int:
     # Require an action if detect-language not used
     if not hasattr(args, "info_action") or not args.info_action:
         print(
-            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, teitok, sessions, or --detect-language"
+            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, renderers, teitok, sessions, or --detect-language"
         )
         return 1
     
@@ -1312,6 +1402,8 @@ def run_info_cli(args: argparse.Namespace) -> int:
         return list_examples(args)
     elif args.info_action == "tasks":
         return list_tasks(args)
+    elif args.info_action == "renderers":
+        return list_renderers(args)
     elif args.info_action == "teitok":
         return list_teitok_settings(args)
     elif args.info_action == "sessions":

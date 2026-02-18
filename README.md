@@ -4,7 +4,7 @@ flexiPipe is a modular NLP pipeline for Universal Dependencies data that glues
 rule-based components, the legacy flexitag tagger, and multiple neural
 backends (SpaCy, Stanza, Flair, UDPipe REST, UDMorph REST, and UD-Kanbun).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
 existing annotations, and exports CoNLL-U (with optional implicit MWTs
-and IOB NER), TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures, and SVG dependency tree visualizations.
+and IOB NER), TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures, SVG dependency tree visualizations, HTML interactive trees, and LaTeX/TikZ dependency trees.
 
 The CLI centers around several workflows:
 
@@ -14,12 +14,13 @@ The CLI centers around several workflows:
 | `python -m flexipipe benchmark` | Evaluate backends against gold treebanks |
 | `python -m flexipipe train` | Train flexitag or (where implemented) neural backends |
 | `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
-| `python -m flexipipe info` | List backends, models, examples, or tasks |
+| `python -m flexipipe info` | List backends, models, examples, tasks, languages, or renderers |
 | `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
+| `python -m flexipipe install` | Install optional backend dependencies (e.g., `flexipipe install udkanbun`, `flexipipe install udapi`) |
 
 Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`, 
-`python -m flexipipe info examples`, or `python -m flexipipe info tasks` to explore
-available integrations, models, example texts, and supported tasks.
+`python -m flexipipe info examples`, `python -m flexipipe info tasks`, `python -m flexipipe info languages`, or `python -m flexipipe info renderers` to explore
+available integrations, models, example texts, supported tasks, languages, and SVG renderers.
 
 ---
 
@@ -44,7 +45,9 @@ available integrations, models, example texts, and supported tasks.
 * **Output control**:
   * CoNLL-U writer can append implicit MWT ranges and selective `TokId` output.
   * TEITOK writer emits `<dtok/>` without extra whitespace, nests `<name>` blocks, and respects `_` skipping rules.
-  * SVG dependency tree visualization with arrow-style (`dep`) or hierarchical tree-style (`tree`) layouts.
+  * SVG dependency tree visualization with arrow-style (`dep`) or hierarchical tree-style (`tree`) layouts, with multiple renderer options (displacy, udapi, conllview, graphviz).
+  * HTML interactive dependency trees using udapi (requires `udapi` package).
+  * LaTeX/TikZ dependency trees using udapi's TikZ writer (requires `udapi` package, use `xelatex`/`lualatex` for Unicode characters).
   * Configure default output format and implicit MWT behaviour via `flexipipe config`.
 * **Evaluation tooling (`check`)**
   * Aligns tokens via tokids and SequenceMatcher fallbacks.
@@ -85,6 +88,7 @@ available integrations, models, example texts, and supported tasks.
    
    # Or install via flexipipe's install command
    flexipipe install udkanbun
+   flexipipe install udapi                 # For HTML and LaTeX output formats
    ```
    Additional upstream options (only when needed):
    ```bash
@@ -183,6 +187,20 @@ python -m flexipipe process \
   --svg-style dep \
   --output dependencies.svg
 
+# Generate HTML interactive dependency tree (requires udapi)
+python -m flexipipe process \
+  --backend udkanbun \
+  --data '不入虎穴不得虎子' \
+  --output-format html \
+  --output tree.html
+
+# Generate LaTeX/TikZ dependency tree (requires udapi)
+python -m flexipipe process \
+  --backend udkanbun \
+  --data '不入虎穴不得虎子' \
+  --output-format latex \
+  --output tree.tex
+
 # Use UDPipe REST in raw mode with debug logging
 python -m flexipipe process \
   --backend udpipe \
@@ -206,7 +224,7 @@ Important switches:
 | `--language English` (SpaCy) | Without `--model`, flexiPipe auto-uses SpaCy's default core model (e.g., `en_core_web_sm`, if installed). |
 | `--download-model` | Auto-fetch SpaCy/Stanza/Flair models when missing. |
 | `--output-format` | `tei`, `conllu`, `conllu-ne`, `json`, or `svg`. Falls back to configuration default. |
-| `--svg-style` | SVG visualization style: `dep` (arrow-style) or `tree` (hierarchical tree). Default: `dep`. |
+| `--svg-style` | SVG visualization style. Base styles: `dep` (arrow-style, default), `tree` (hierarchical tree). Options can be comma-separated: `tree,boxes` (show boxes), `tree,root` (show root node), `tree,horizontal` (nodes in sentence order), `tree,flush_bottom` (flush words to bottom). Numeric options: `tree,node_width=100,level_height=150`. Backends may provide custom renderers. |
 | `--create-implicit-mwt` | Rebuilds implicit MWT ranges in output (default configurable). |
 ### Benchmarking
 
@@ -351,10 +369,16 @@ possible).
   wrappers for entity spans, and avoids redundant `_` attributes (except real
   underscores in lemma/form). TokIds are emitted as `xml:id`.
 * **SVG**: Dependency tree visualization in SVG format. Requires dependency relations (head and deprel).
-  * `--svg-style dep`: Arrow-style dependency visualization (default)
-  * `--svg-style tree`: Hierarchical tree-style visualization
+  * Base styles: `dep` (arrow-style using displacy, default), `displacy` (explicitly use displacy), `tree` (hierarchical tree)
+  * Options can be comma-separated: `tree,boxes` (show boxes around nodes), `tree,root` (show ROOT indicator), `tree,horizontal` (nodes in sentence order), `tree,flush_bottom` (flush words to bottom), `dep,displacy` (force displacy even if backend has native renderer)
+  * Numeric options: `tree,node_width=100,level_height=150` (customize spacing)
   * Works with any backend that provides dependency parsing (spacy, stanza, udkanbun, etc.)
-  * UD-Kanbun backend provides specialized Classical Chinese visualization when available
+  * Multiple renderers available: `displacy` (default), `udapi`, `conllview`, `graphviz`. Use `flexipipe info renderers` to list all available renderers.
+  * To explicitly use displacy: `--svg-style displacy` or `--svg-style dep,displacy`
+  * UD-Kanbun backend: Uses spaCy's displacy renderer by default. If UD-Kanbun provides a native SVG renderer, it can be used by default for `dep` style, or forced with `--svg-style displacy`
+  * Backends can register custom SVG renderers via `document.meta["_svg_renderer"]` or by implementing `to_svg()` methods on spaCy Doc objects
+* **HTML**: Interactive dependency tree visualization using udapi (requires `udapi` package). Generates HTML with JavaScript-based SVG rendering that works in web browsers. Install with `flexipipe install udapi` or `pip install udapi`.
+* **LaTeX**: Dependency tree visualization in LaTeX/TikZ format using udapi (requires `udapi` package). Generates TikZ code compatible with the `tikz-dependency` package. Comments are automatically removed from `deptext` blocks to ensure proper rendering. For Unicode characters (e.g., Chinese), use `xelatex` or `lualatex` instead of `pdflatex`. Install with `flexipipe install udapi` or `pip install udapi`. See `dev/LATEX_USAGE.md` for detailed usage instructions.
 * **JSON**: Structured JSON output with full document representation.
 * **Intermediates**: `check` stores predicted and detagged corpora for auditing.
 
@@ -409,6 +433,9 @@ python -m flexipipe info tasks
 
 # List all supported languages
 python -m flexipipe info languages
+
+# List available SVG renderers
+python -m flexipipe info renderers
 ```
 
 ## Format Conversion

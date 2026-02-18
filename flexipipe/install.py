@@ -29,6 +29,7 @@ def run_install(args: argparse.Namespace) -> int:
     BACKEND_TO_PACKAGE = {
         "ctext": "ctextcore",
         "udkanbun": "udkanbun",
+        "udapi": "udapi",
     }
     
     all_backends = set(get_backend_choices())
@@ -47,17 +48,18 @@ def run_install(args: argparse.Namespace) -> int:
             backends_to_install_direct.extend(BACKEND_TO_PACKAGE.keys())
             continue
         
+        # Check if it's a direct package (like udapi) that's not a backend
+        # This check must come before the all_backends check
+        if backend_lower in BACKEND_TO_PACKAGE:
+            backends_to_install_direct.append(backend_lower)
+            continue
+        
         if backend_lower not in all_backends:
             invalid_backends.append(backend)
             continue
         
         # Get backend info to check install instructions
         backend_info = get_backend_info(backend_lower)
-        
-        # Check if backend installs a package directly via pip
-        if backend_lower in BACKEND_TO_PACKAGE:
-            backends_to_install_direct.append(backend_lower)
-            continue
         
         if backend_info and backend_info.install_instructions:
             # Check if install_instructions contains "pip install" - if so, we can extract and install
@@ -123,6 +125,7 @@ def run_install(args: argparse.Namespace) -> int:
         module_name_map = {
             "ctextcore": "ctextcore",
             "udkanbun": "udkanbun",
+            "udapi": "udapi",
         }
         module_name = module_name_map.get(package_name, package_name.replace("-", "_"))
         if _module_available(module_name):

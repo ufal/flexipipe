@@ -215,7 +215,11 @@ class UDKanbunBackend(BackendManager):
         
         # Store spaCy Docs in document meta for SVG output support
         # This allows calling to_svg() on the original spaCy Doc objects
+        # Note: Currently falls back to displacy if UD-Kanbun doesn't provide native SVG
         tagged_doc.meta["_udkanbun_spacy_docs"] = all_spacy_docs
+        
+        # If UD-Kanbun provides a custom SVG renderer, it can be registered here:
+        # tagged_doc.meta["_svg_renderer"] = lambda: udkanbun_native_svg_renderer(all_spacy_docs)
         
         # Debug: Check converted document structure (only with --debug)
         if self._debug and tagged_doc.sentences:

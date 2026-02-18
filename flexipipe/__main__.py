@@ -2228,15 +2228,20 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--output-format",
         "--output-form",
-        choices=["teitok", "conllu", "conllu-ne", "json", "svg"],
+        choices=["teitok", "conllu", "conllu-ne", "json", "svg", "html", "latex"],
         default=None,
-        help="Output format (default: from config, or teitok). SVG requires dependency relations and spaCy (for displacy).",
+        help="Output format (default: from config, or teitok). SVG requires dependency relations and spaCy (for displacy). HTML uses udapi for interactive visualization (requires udapi package). LaTeX uses udapi's TikZ format for dependency trees (requires udapi package).",
     )
     process_parser.add_argument(
         "--svg-style",
-        choices=["dep", "tree"],
         default="dep",
-        help="SVG visualization style: 'dep' for arrow-style dependency relations (default), 'tree' for tree-style visualization.",
+        help="SVG visualization style. Base styles: 'dep' (arrow-style using displacy, default), "
+             "'displacy' (explicitly use displacy renderer), 'tree' (hierarchical tree). "
+             "Options can be comma-separated: 'tree,boxes' (show boxes), 'tree,root' (show root node), "
+             "'tree,horizontal' (nodes in sentence order), 'tree,flush_bottom' (flush words to bottom), "
+             "'dep,displacy' (force displacy even if backend has native renderer). "
+             "Numeric options: 'tree,node_width=100,level_height=150'. "
+             "Backends may provide custom renderers via document metadata.",
     )
     process_parser.add_argument(
         "--unicode-normalize",
@@ -2659,6 +2664,19 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[parent_parser],
     )
     tasks_parser.add_argument(
+        "--output-format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table). Use 'json' for machine-readable output.",
+    )
+    
+    # info renderers
+    renderers_parser = info_subparsers.add_parser(
+        "renderers",
+        help="List all available SVG renderers",
+        parents=[parent_parser],
+    )
+    renderers_parser.add_argument(
         "--output-format",
         choices=["table", "json"],
         default="table",
@@ -7150,210 +7168,222 @@ def _write_document(
         return
 
     if fmt == "svg":
-        # SVG output requires spaCy's displacy module
+        # Use the new SVG renderer system
+        from .svg_renderers import render_document_svg, parse_svg_style, register_optional_renderers
+        
+        # Register optional renderers (deplacy, graphviz) if available
+        register_optional_renderers()
+        
+        # Parse style to check if displacy is explicitly requested
+        renderer_name, options = parse_svg_style(svg_style)
+        force_displacy = options.get("displacy", False) or renderer_name == "displacy"
+        
+        # Check if backend provides a custom renderer function
+        # Only use backend renderer if displacy is NOT explicitly requested
+        backend_renderer_func = None
+        if not force_displacy:
+            spacy_docs = document.meta.get("_udkanbun_spacy_docs")
+            if spacy_docs:
+                # UD-Kanbun: try to use its native SVG rendering if available
+                def udkanbun_renderer():
+                    svg_parts = []
+                    for spacy_doc in spacy_docs:
+                        svg_content = None
+                        
+                        # Try UD-Kanbun's native methods first
+                        # UD-Kanbun may provide visualization through various methods
+                        if hasattr(spacy_doc, "to_svg"):
+                            try:
+                                svg_content = spacy_doc.to_svg()
+                                if svg_content and "<svg" in svg_content:
+                                    svg_parts.append(svg_content)
+                                    continue
+                            except Exception:
+                                pass
+                        
+                        # Try UD-Kanbun's _repr_html_ or other visualization methods
+                        if hasattr(spacy_doc, "_repr_html_"):
+                            try:
+                                html_content = spacy_doc._repr_html_()
+                                # Check if it contains SVG
+                                if html_content and "<svg" in html_content:
+                                    # Extract SVG from HTML
+                                    import re
+                                    svg_match = re.search(r'<svg[^>]*>.*?</svg>', html_content, re.DOTALL)
+                                    if svg_match:
+                                        svg_content = svg_match.group(0)
+                                        if svg_content:
+                                            svg_parts.append(svg_content)
+                                            continue
+                            except Exception:
+                                pass
+                        
+                        # Try accessing UD-Kanbun's visualization module directly
+                        # UD-Kanbun might have a separate visualization module
+                        try:
+                            import udkanbun
+                            # Check for visualization methods in udkanbun module
+                            if hasattr(udkanbun, "visualize"):
+                                try:
+                                    viz_result = udkanbun.visualize(spacy_doc)
+                                    if viz_result and "<svg" in str(viz_result):
+                                        svg_content = str(viz_result)
+                                        if svg_content:
+                                            svg_parts.append(svg_content)
+                                            continue
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        
+                        # Fallback: use spaCy's displacy
+                        if not svg_content:
+                            try:
+                                from spacy import displacy
+                                svg_content = displacy.render(spacy_doc, style="dep", jupyter=False)
+                            except Exception:
+                                pass
+                        
+                        if svg_content:
+                            svg_parts.append(svg_content)
+                    
+                    if svg_parts:
+                        return "\n".join(svg_parts)
+                    return None
+                
+                # Use UD-Kanbun's renderer for "dep" style, or if explicitly requested via "kanbun" style
+                if renderer_name == "dep" or renderer_name == "kanbun":
+                    backend_renderer_func = udkanbun_renderer
+        
+        # Check for other backend-specific renderers in metadata
+        if not backend_renderer_func:
+            custom_renderer_func = document.meta.get("_svg_renderer")
+            if custom_renderer_func and callable(custom_renderer_func):
+                backend_renderer_func = custom_renderer_func
+        
+        # If displacy is explicitly requested, normalize style to "dep" (displacy's style)
+        if force_displacy and renderer_name == "displacy":
+            svg_style = "dep"
+        
+        # Render SVG
         try:
-            from spacy import displacy
-        except ImportError:
-            raise SystemExit("SVG output requires spaCy. Install it with: pip install spacy")
-        
-        # Check if we have UD-Kanbun spaCy Docs (preferred - uses to_svg() if available)
-        # But only use it for dep style; for tree style, use our own renderer
-        spacy_docs = document.meta.get("_udkanbun_spacy_docs")
-        if spacy_docs and svg_style == "dep":
-            # Use UD-Kanbun's spaCy Docs directly for arrow-style visualization
-            svg_parts = []
-            for spacy_doc in spacy_docs:
-                svg_content = None
-                # Try UD-Kanbun's to_svg() method first (if available)
-                if hasattr(spacy_doc, "to_svg"):
-                    try:
-                        svg_content = spacy_doc.to_svg()
-                    except Exception:
-                        pass
-                
-                # Fallback: use spaCy's displacy
-                if not svg_content:
-                    try:
-                        svg_content = displacy.render(spacy_doc, style="dep", jupyter=False)
-                    except Exception:
-                        pass
-                
-                if svg_content:
-                    svg_parts.append(svg_content)
-            
-            if svg_parts:
-                svg_text = "\n".join(svg_parts)
-                if output:
-                    Path(output).write_text(svg_text, encoding="utf-8")
-                else:
-                    sys.stdout.write(svg_text)
-                return
-        
-        # General case: convert flexipipe Document to displacy format
-        # Check if document has dependency relations
-        has_dependencies = False
-        for sent in document.sentences:
-            for token in sent.tokens:
-                if token.head or token.deprel:
-                    has_dependencies = True
-                    break
-            if has_dependencies:
-                break
-        
-        if not has_dependencies:
-            raise SystemExit("SVG output requires dependency relations (head and deprel). The document does not have dependency parsing.")
-        
-        # Convert each sentence to displacy format
-        svg_parts = []
-        for sent in document.sentences:
-            if not sent.tokens:
-                continue
-            
-            # Build displacy options dict
-            # Format: dict with "words", "arcs", "title" (optional)
-            # words: list of dicts with "text", "tag"
-            # arcs: list of dicts with "start", "end", "label", "dir" (optional)
-            words = []
-            arcs = []
-            
-            # Build token index mapping (token.id -> list index)
-            token_id_to_idx = {}
-            for idx, token in enumerate(sent.tokens):
-                token_id_to_idx[token.id] = idx
-                words.append({
-                    "text": token.form,
-                    "tag": token.upos or token.xpos or "",
-                })
-            
-            # Build arcs (dependency relations)
-            for idx, token in enumerate(sent.tokens):
-                if token.head and token.head > 0 and token.deprel:
-                    # Find head token index
-                    head_idx = token_id_to_idx.get(token.head)
-                    if head_idx is not None and head_idx != idx:
-                        arcs.append({
-                            "start": min(idx, head_idx),
-                            "end": max(idx, head_idx),
-                            "label": token.deprel,
-                            "dir": "left" if head_idx < idx else "right",
-                        })
-            
-            if svg_style == "tree":
-                # Tree-style visualization: hierarchical tree layout
-                svg_content = _render_tree_style(sent, token_id_to_idx)
-                if svg_content:
-                    svg_parts.append(svg_content)
-            else:
-                # Arrow-style (dep) visualization using displacy
-                displacy_data = {
-                    "words": words,
-                    "arcs": arcs,
-                }
-                
-                # Render SVG using manual format
-                try:
-                    svg_content = displacy.render(displacy_data, style="dep", jupyter=False, manual=True)
-                    if svg_content:
-                        svg_parts.append(svg_content)
-                except Exception as e:
-                    # Skip sentences that fail to render
-                    if not svg_parts:  # Only raise if this is the first sentence
-                        raise SystemExit(f"SVG output failed: {e}")
-        
-        if not svg_parts:
-            raise SystemExit("SVG output failed: could not generate SVG from document")
-        
-        # Combine multiple SVGs into a single valid SVG document
-        import re
-        if len(svg_parts) == 1:
-            svg_text = svg_parts[0]
-        else:
-            # Multiple sentences: combine into a single SVG with proper structure
-            # Extract dimensions and content from each SVG
-            svg_contents = []
-            max_width = 0
-            total_height = 0
-            spacing = 50  # Space between sentence visualizations
-            
-            for svg_part in svg_parts:
-                # Extract content between <svg> and </svg> tags
-                # Handle both standalone SVG and SVG wrapped in <g> (from tree style)
-                content_match = re.search(r'<svg[^>]*>(.*)</svg>', svg_part, re.DOTALL)
-                if not content_match:
-                    # Try extracting from <g> wrapper (for tree style that was already wrapped)
-                    g_match = re.search(r'<g[^>]*>(.*)</g>', svg_part, re.DOTALL)
-                    if g_match:
-                        svg_content = g_match.group(1)
-                        # Try to extract dimensions from viewBox or attributes
-                        width_val = 1000
-                        height_val = 500
-                        svg_contents.append((svg_content, height_val))
-                        total_height += height_val + spacing
-                        continue
-                    continue
-                
-                svg_content = content_match.group(1)
-                
-                # Extract width and height
-                width_match = re.search(r'width="([^"]+)"', svg_part)
-                height_match = re.search(r'height="([^"]+)"', svg_part)
-                viewbox_match = re.search(r'viewBox="([^"]+)"', svg_part)
-                
-                width_val = 1000  # Default
-                height_val = 500  # Default
-                
-                if width_match:
-                    try:
-                        width_val = float(width_match.group(1).replace('px', ''))
-                    except ValueError:
-                        pass
-                
-                if height_match:
-                    try:
-                        height_val = float(height_match.group(1).replace('px', ''))
-                    except ValueError:
-                        pass
-                elif viewbox_match:
-                    # Extract from viewBox: "0 0 width height"
-                    try:
-                        parts = viewbox_match.group(1).split()
-                        if len(parts) >= 4:
-                            height_val = float(parts[3])
-                    except (ValueError, IndexError):
-                        pass
-                
-                max_width = max(max_width, width_val)
-                svg_contents.append((svg_content, height_val))
-                total_height += height_val
-            
-            # Add spacing between sentences (not after the last one)
-            if len(svg_contents) > 1:
-                total_height += spacing * (len(svg_contents) - 1)
-            
-            # Build combined SVG
-            combined_content = []
-            y_offset = 0
-            for i, (svg_content, height) in enumerate(svg_contents):
-                # Wrap in a group and translate vertically
-                combined_content.append(f'<g transform="translate(0, {y_offset})">{svg_content}</g>')
-                y_offset += height
-                # Add spacing after this sentence (but not after the last one)
-                if i < len(svg_contents) - 1:
-                    y_offset += spacing
-            
-            # Create single SVG root element
-            svg_text = (
-                f'<svg xmlns="http://www.w3.org/2000/svg" '
-                f'xmlns:xlink="http://www.w3.org/1999/xlink" '
-                f'width="{max_width}" height="{total_height}" '
-                f'viewBox="0 0 {max_width} {total_height}">\n'
-                + "\n".join(combined_content) + "\n</svg>"
-            )
+            svg_text = render_document_svg(document, style=svg_style, backend_renderer=backend_renderer_func)
+        except SystemExit:
+            raise
+        except Exception as e:
+            raise SystemExit(f"SVG rendering failed: {e}")
         
         if output:
             Path(output).write_text(svg_text, encoding="utf-8")
         else:
             sys.stdout.write(svg_text)
+        return
+
+    if fmt == "html":
+        # Use udapi's HTML output for interactive visualization
+        try:
+            from udapi.core.document import Document as UdapiDocument
+            from udapi.block.write import html as udapi_html
+            from .conllu import document_to_conllu
+            import io
+        except ImportError:
+            raise SystemExit(
+                "HTML output format requires the 'udapi' package. "
+                "Install it with: pip install udapi"
+            )
+        
+        # Convert flexipipe Document to CoNLL-U
+        conllu_text = document_to_conllu(document, model_info=None, create_implicit_mwt=False)
+        
+        # Load into udapi
+        udapi_doc = UdapiDocument()
+        udapi_doc.from_conllu_string(conllu_text)
+        
+        # Generate HTML using udapi's HTML writer
+        html_writer = udapi_html.Html()
+        
+        # Capture HTML output
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            html_writer.process_document(udapi_doc)
+            html_output = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_stdout
+        
+        if output:
+            Path(output).write_text(html_output, encoding="utf-8")
+        else:
+            sys.stdout.write(html_output)
+        return
+
+    if fmt == "latex":
+        # Use udapi's TikZ output for LaTeX dependency trees
+        try:
+            from udapi.core.document import Document as UdapiDocument
+            from udapi.block.write import tikz as udapi_tikz
+            from .conllu import document_to_conllu
+            import io
+        except ImportError:
+            raise SystemExit(
+                "LaTeX output format requires the 'udapi' package. "
+                "Install it with: pip install udapi"
+            )
+        
+        # Convert flexipipe Document to CoNLL-U
+        conllu_text = document_to_conllu(document, model_info=None, create_implicit_mwt=False)
+        
+        # Load into udapi
+        udapi_doc = UdapiDocument()
+        udapi_doc.from_conllu_string(conllu_text)
+        
+        # Generate LaTeX/TikZ using udapi's TikZ writer
+        # Set print_preambule=False since we're outputting fragments, not complete documents
+        # Users will include \usepackage{tikz-dependency} in their own LaTeX documents
+        # Disable sent_id and text comments to avoid breaking deptext rendering
+        tikz_writer = udapi_tikz.Tikz(
+            print_preambule=False,
+            print_sent_id=False,
+            print_text=False
+        )
+        
+        # Capture TikZ output
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            tikz_writer.process_document(udapi_doc)
+            latex_output = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_stdout
+        
+        # Remove any remaining comments from inside deptext blocks
+        # Comments inside deptext can break LaTeX rendering
+        import re
+        lines = latex_output.split('\n')
+        cleaned_lines = []
+        in_deptext = False
+        
+        for line in lines:
+            if '\\begin{deptext}' in line:
+                in_deptext = True
+                cleaned_lines.append(line)
+            elif '\\end{deptext}' in line:
+                in_deptext = False
+                cleaned_lines.append(line)
+            elif in_deptext and line.strip().startswith('%'):
+                # Skip comment lines inside deptext
+                continue
+            else:
+                cleaned_lines.append(line)
+        
+        latex_output = '\n'.join(cleaned_lines)
+        
+        if output:
+            Path(output).write_text(latex_output, encoding="utf-8")
+        else:
+            sys.stdout.write(latex_output)
         return
 
     raise SystemExit(f"Unsupported output format '{fmt}'")
