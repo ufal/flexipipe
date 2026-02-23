@@ -12,13 +12,59 @@ from .dependency_utils import _run_pip_install, _module_available
 from .backend_registry import get_backend_choices, get_backend_info
 
 
+def _build_c_launcher(repo_scripts: Path) -> bool:
+    """If scripts/flexipipe_launcher.c exists, try to build the binary. Return True if binary exists."""
+    launcher_c = repo_scripts / "flexipipe_launcher.c"
+    launcher_bin = repo_scripts / "flexipipe_launcher"
+    if not launcher_c.is_file():
+        return launcher_bin.is_file()
+    makefile = repo_scripts / "Makefile"
+    if makefile.is_file():
+        r = subprocess.run(
+            ["make", "flexipipe_launcher"],
+            cwd=repo_scripts,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            print("[flexipipe] Could not build C launcher (make failed). Using shell wrapper.", file=sys.stderr)
+            if r.stderr:
+                print(r.stderr, file=sys.stderr)
+            return False
+        print("[flexipipe] Built C launcher for faster startup.")
+    else:
+        r = subprocess.run(
+            ["cc", "-O2", "-o", "flexipipe_launcher", "flexipipe_launcher.c"],
+            cwd=repo_scripts,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            print("[flexipipe] Could not build C launcher (cc failed). Using shell wrapper.", file=sys.stderr)
+            if r.stderr:
+                print(r.stderr, file=sys.stderr)
+            return False
+        print("[flexipipe] Built C launcher for faster startup.")
+    return launcher_bin.is_file() and launcher_bin.stat().st_size > 0
+
+
 def _install_wrapper_script(args: argparse.Namespace) -> int:
-    """Install the flexipipe wrapper script so you can run 'flexipipe' instead of 'python -m flexipipe'."""
+    """Install the flexipipe wrapper so you can run 'flexipipe' instead of 'python -m flexipipe'.
+    Builds the C launcher from scripts/flexipipe_launcher.c when present (faster startup); else uses the shell script."""
+    repo_scripts = Path(__file__).parent.parent / "scripts"
+    launcher_bin = repo_scripts / "flexipipe_launcher"
     script_path = Path(__file__).parent / "data" / "flexipipe_wrapper.sh"
-    if not script_path.exists():
-        print("[flexipipe] Wrapper script not found in package (expected at data/flexipipe_wrapper.sh).", file=sys.stderr)
+    # Try to build C launcher if source exists (e.g. development repo)
+    if (repo_scripts / "flexipipe_launcher.c").is_file():
+        _build_c_launcher(repo_scripts)
+    use_launcher_bin = launcher_bin.is_file() and launcher_bin.stat().st_size > 0
+    if not use_launcher_bin and not script_path.exists():
+        print("[flexipipe] Wrapper not found (expected data/flexipipe_wrapper.sh or scripts/flexipipe_launcher).", file=sys.stderr)
         return 1
-    script_content = script_path.read_text()
+    if use_launcher_bin:
+        script_content = None
+    else:
+        script_content = script_path.read_text()
 
     install_path = getattr(args, "wrapper_path", None)
     use_sudo = False
@@ -66,11 +112,15 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
 
     try:
         if use_sudo:
-            import subprocess
             import tempfile
-            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh") as tmp:
-                tmp.write(script_content)
-                tmp_path = tmp.name
+            if use_launcher_bin:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+                    tmp.write(launcher_bin.read_bytes())
+                    tmp_path = tmp.name
+            else:
+                with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh") as tmp:
+                    tmp.write(script_content)
+                    tmp_path = tmp.name
             result = subprocess.run(["sudo", "cp", tmp_path, str(install_path)], capture_output=True, text=True)
             Path(tmp_path).unlink(missing_ok=True)
             if result.returncode != 0:
@@ -78,9 +128,13 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
                 return 1
             subprocess.run(["sudo", "chmod", "+x", str(install_path)], check=True)
         else:
-            install_path.write_text(script_content)
+            if use_launcher_bin:
+                install_path.write_bytes(launcher_bin.read_bytes())
+            else:
+                install_path.write_text(script_content)
             install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
-        print(f"[flexipipe] ✓ Wrapper script installed to: {install_path}")
+        kind = "C launcher" if use_launcher_bin else "Wrapper script"
+        print(f"[flexipipe] ✓ {kind} installed to: {install_path}")
         if install_path.parent == Path.home() / "bin":
             print("[flexipipe] Ensure ~/bin is on your PATH (e.g. export PATH=\"$HOME/bin:$PATH\" in ~/.bashrc or ~/.zshrc).")
         return 0

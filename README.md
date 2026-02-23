@@ -6,21 +6,19 @@ backends (SpaCy, Stanza, Flair, UDPipe REST, UDMorph REST, and UD-Kanbun).  It c
 existing annotations, and exports CoNLL-U (with optional implicit MWTs
 and IOB NER), TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures, SVG dependency tree visualizations, HTML interactive trees, and LaTeX/TikZ dependency trees.
 
-The CLI centers around several workflows:
+The CLI centers around several workflows. If you have installed the wrapper (see [Optional: Install a `flexipipe` wrapper script](#optional-install-a-flexipipe-wrapper-script)), you can run `flexipipe` instead of `python -m flexipipe`.
 
 | Command | Purpose |
 | --- | --- |
-| `python -m flexipipe process` | Tag/parse/normalize input with any backend |
-| `python -m flexipipe benchmark` | Evaluate backends against gold treebanks |
-| `python -m flexipipe train` | Train flexitag or (where implemented) neural backends |
-| `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
-| `python -m flexipipe info` | List backends, models, examples, tasks, languages, or renderers |
-| `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
-| `python -m flexipipe install` | Install optional backend dependencies (e.g., `flexipipe install udkanbun`, `flexipipe install udapi`), or `flexipipe install wrapper` for the launcher script, or `flexipipe install update` to upgrade flexipipe |
+| `flexipipe process` | Tag/parse/normalize input with any backend |
+| `flexipipe benchmark` | Evaluate backends against gold treebanks |
+| `flexipipe train` | Train flexitag or (where implemented) neural backends |
+| `flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
+| `flexipipe info` | List backends, models, examples, tasks, languages, renderers, or installation details |
+| `flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
+| `flexipipe install` | Install optional backends (`flexipipe install udkanbun`, `flexipipe install udapi`), install the launcher (`flexipipe install wrapper`), or upgrade flexipipe (`flexipipe install update`) |
 
-Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`,
-`python -m flexipipe info examples`, `python -m flexipipe info tasks`, `python -m flexipipe info languages`, `python -m flexipipe info renderers`, or `python -m flexipipe info installation` to explore
-available integrations, models, example texts, supported tasks, languages, SVG renderers, and installation details (version, source type, paths).
+Use `flexipipe info backends`, `flexipipe info models --backend <name>`, `flexipipe info examples`, `flexipipe info tasks`, `flexipipe info languages`, `flexipipe info renderers`, or `flexipipe info installation` to explore available integrations, models, example texts, supported tasks, languages, SVG renderers, and installation details (version, package location, source type, Python path, config and models dirs).
 
 ---
 
@@ -123,7 +121,7 @@ This will skip the wrapper script installation prompt and install silently with 
 
 ### Optional: Install a `flexipipe` wrapper script
 
-You can run the CLI as `flexipipe` (instead of `python -m flexipipe`) by installing a small wrapper script that switches to the right virtual environment and invokes the module.
+You can run the CLI as `flexipipe` (instead of `python -m flexipipe`) by installing a launcher that finds Python and invokes the module.
 
 - **During `pip install`**: If you run `pip install` interactively (and do not set `FLEXIPIPE_NONINTERACTIVE` or `FLEXIPIPE_QUIET_INSTALL`), you will be **asked** whether to install the wrapper and where (e.g. `/usr/local/bin`, `~/bin`, or a custom path). You can skip (default) or choose a location.
 - **Anytime after install**: Run `flexipipe install wrapper`; you will be prompted for the install location, or pass a path directly:
@@ -132,11 +130,12 @@ You can run the CLI as `flexipipe` (instead of `python -m flexipipe`) by install
   flexipipe install wrapper --path ~/bin       # install to ~/bin/flexipipe
   flexipipe install wrapper --path /usr/local/bin   # install to /usr/local/bin/flexipipe (may need sudo)
   ```
+  **C launcher (faster startup):** When you run `flexipipe install wrapper`, if the C launcher source is present (e.g. in a development clone at `scripts/flexipipe_launcher.c`), the command will try to **build** it (using `make` or `cc`) and install the compiled binary. That launcher starts only one Python process instead of two, which can save about 1–2 seconds per run. If the build fails or no compiler is available, the shell script wrapper is installed instead. The launcher respects `VENV_PATH`, `VIRTUAL_ENV`, and `FLEXIPIPE_REPO_PATH` (for development installs).
 - **Non-interactive / CI**: Set `FLEXIPIPE_INSTALL_WRAPPER=1` (and optionally `FLEXIPIPE_WRAPPER_DIR` or `FLEXIPIPE_VENV_PATH`) when running `pip install` to install the wrapper without prompting.
 
-To upgrade flexipipe to the latest version from PyPI, run `flexipipe install update`. (If you use an editable install, it will remind you to pull and run `pip install -e .` in the repo.)
+To upgrade flexipipe to the latest version from PyPI, run **`flexipipe install update`**. (If you use an editable install, it will remind you to pull and run `pip install -e .` in the repo.)
 
-Ensure the chosen directory is on your `PATH`. Then you can run `flexipipe --version`, `flexipipe process ...`, etc. The version output will show `flexipipe 0.1.0` (or your installed version) without the `python -m flexipipe` prefix.
+Ensure the chosen directory is on your `PATH`. Then you can run `flexipipe --version`, `flexipipe process ...`, etc. Version output shows only `flexipipe X.Y.Z` (no `python -m` prefix).
 
 ### Optional Extras Behaviour
 
@@ -437,23 +436,28 @@ possible).
 
 ```bash
 # List all available backends
-python -m flexipipe info backends
+flexipipe info backends
 
 # List available models for a backend
-python -m flexipipe info models --backend transformers
+flexipipe info models --backend transformers
 
 # List available example texts (UDHR)
-python -m flexipipe info examples
+flexipipe info examples
 
 # List all supported tasks
-python -m flexipipe info tasks
+flexipipe info tasks
 
 # List all supported languages
-python -m flexipipe info languages
+flexipipe info languages
 
 # List available SVG renderers
-python -m flexipipe info renderers
+flexipipe info renderers
+
+# Show installation details (version, package location, source type, Python path, config and models dirs)
+flexipipe info installation
 ```
+
+Use **`flexipipe info installation`** to see the installed version, where the package lives, whether it is an editable install, the Python executable in use, and the config and models directories.
 
 ## Format Conversion
 
