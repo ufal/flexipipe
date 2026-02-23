@@ -2,7 +2,7 @@
 
 flexiPipe is a modular NLP pipeline for Universal Dependencies data: rule-based components, the flexitag tagger, and multiple neural backends (SpaCy, Stanza, Flair, UDPipe, UDMorph, UD-Kanbun, etc.). It ingests raw text, CoNLL-U, and TEITOK XML and exports CoNLL-U, TEITOK, SVG/HTML/LaTeX trees, and more.
 
-**Full documentation:** [GitHub Wiki](https://github.com/ufal/flexipipe/wiki) — installation, backends, quick start, CLI reference, and configuration.
+**Full documentation:** see the [wiki/](wiki/) folder — [wiki/README.md](wiki/README.md) is the index; installation, backends, quick start, and reference are in the linked pages.
 
 ---
 
@@ -15,7 +15,7 @@ flexipipe install spacy
 flexipipe install udapi   # for HTML/LaTeX output
 ```
 
-Then run `flexipipe config --wizard` to pick defaults. To run as `flexipipe` instead of `python -m flexipipe`, install the wrapper: `python -m flexipipe install wrapper` (see [Wiki: Installation](https://github.com/ufal/flexipipe/wiki/Installation)).
+Then run `flexipipe config --wizard` to pick defaults. To run as `flexipipe` instead of `python -m flexipipe`, install the wrapper: `python -m flexipipe install wrapper` (see [Installation](wiki/Installation.md)).
 
 ---
 
@@ -56,6 +56,6 @@ Use **`flexipipe <subcommand> --help`** for full options. Use **`flexipipe info 
 - `flexipipe/` — main package (CLI, backends, converters)
 - `flexitag/` — C++ flexitag sources and bindings
 - `README_CPP.md` — native build instructions
-- `wiki/` — wiki page sources; sync to GitHub Wiki with `scripts/sync-wiki.sh`
+- `wiki/` — full documentation (Markdown); [wiki/README.md](wiki/README.md) is the index.
 
-See [Contributing](https://github.com/ufal/flexipipe/wiki/Contributing) on the Wiki for development notes.
+See [Contributing](wiki/Contributing.md) for development notes.
