@@ -3,68 +3,78 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .dependency_utils import _run_pip_install, _module_available
 from .backend_registry import get_backend_choices, get_backend_info
 
 
-def _build_c_launcher(repo_scripts: Path) -> bool:
-    """If scripts/flexipipe_launcher.c exists, try to build the binary. Return True if binary exists."""
-    launcher_c = repo_scripts / "flexipipe_launcher.c"
-    launcher_bin = repo_scripts / "flexipipe_launcher"
-    if not launcher_c.is_file():
-        return launcher_bin.is_file()
-    makefile = repo_scripts / "Makefile"
-    if makefile.is_file():
-        r = subprocess.run(
-            ["make", "flexipipe_launcher"],
-            cwd=repo_scripts,
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            print("[flexipipe] Could not build C launcher (make failed). Using shell wrapper.", file=sys.stderr)
-            if r.stderr:
-                print(r.stderr, file=sys.stderr)
-            return False
-        print("[flexipipe] Built C launcher for faster startup.")
-    else:
-        r = subprocess.run(
-            ["cc", "-O2", "-o", "flexipipe_launcher", "flexipipe_launcher.c"],
-            cwd=repo_scripts,
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            print("[flexipipe] Could not build C launcher (cc failed). Using shell wrapper.", file=sys.stderr)
-            if r.stderr:
-                print(r.stderr, file=sys.stderr)
-            return False
-        print("[flexipipe] Built C launcher for faster startup.")
-    return launcher_bin.is_file() and launcher_bin.stat().st_size > 0
+def _get_install_time_venv_base() -> Path | None:
+    """Return the venv base path if we're running inside a virtual environment, else None."""
+    base = getattr(sys, "base_prefix", None) or getattr(sys, "real_prefix", None) or sys.prefix
+    if sys.prefix != base:
+        return Path(sys.prefix)
+    return None
+
+
+def _inject_venv_into_wrapper_script(script_content: str, venv_base: Path) -> str:
+    """Inject VENV_PATH at install time so the wrapper uses this Python even when venv is not activated."""
+    line = f'VENV_PATH="{venv_base}"  # set at install time (use this Python)\n'
+    marker = "# Function to find Python executable"
+    if marker in script_content:
+        return script_content.replace(marker, line + marker, 1)
+    return script_content.replace("find_python() {", line + "find_python() {", 1)
 
 
 def _install_wrapper_script(args: argparse.Namespace) -> int:
     """Install the flexipipe wrapper so you can run 'flexipipe' instead of 'python -m flexipipe'.
-    Builds the C launcher from scripts/flexipipe_launcher.c when present (faster startup); else uses the shell script."""
-    repo_scripts = Path(__file__).parent.parent / "scripts"
-    launcher_bin = repo_scripts / "flexipipe_launcher"
-    script_path = Path(__file__).parent / "data" / "flexipipe_wrapper.sh"
-    # Try to build C launcher if source exists (e.g. development repo)
-    if (repo_scripts / "flexipipe_launcher.c").is_file():
-        _build_c_launcher(repo_scripts)
-    use_launcher_bin = launcher_bin.is_file() and launcher_bin.stat().st_size > 0
+    Builds the C launcher from package data (data/flexipipe_launcher.c) when present; else uses the shell script."""
+    pkg_dir = Path(__file__).parent
+    script_path = pkg_dir / "data" / "flexipipe_wrapper.sh"
+    pkg_data_c = pkg_dir / "data" / "flexipipe_launcher.c"
+    launcher_bytes = None
+
+    # Build C launcher from package data (shipped with the package; works for pip install and dev)
+    if pkg_data_c.is_file():
+        build_temp_dir = tempfile.mkdtemp(prefix="flexipipe_launcher_")
+        try:
+            build_dir = Path(build_temp_dir)
+            dest_c = build_dir / "flexipipe_launcher.c"
+            shutil.copy(pkg_data_c, dest_c)
+            r = subprocess.run(
+                ["cc", "-O2", "-o", "flexipipe_launcher", "flexipipe_launcher.c"],
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode == 0:
+                built = build_dir / "flexipipe_launcher"
+                if built.is_file() and built.stat().st_size > 0:
+                    launcher_bytes = built.read_bytes()
+                    print("[flexipipe] Built C launcher for faster startup.")
+            else:
+                print("[flexipipe] Could not build C launcher (cc failed). Using shell wrapper.", file=sys.stderr)
+                if r.stderr:
+                    print(r.stderr, file=sys.stderr)
+        finally:
+            shutil.rmtree(build_temp_dir, ignore_errors=True)
+
+    use_launcher_bin = launcher_bytes is not None
     if not use_launcher_bin and not script_path.exists():
-        print("[flexipipe] Wrapper not found (expected data/flexipipe_wrapper.sh or scripts/flexipipe_launcher).", file=sys.stderr)
+        print("[flexipipe] Wrapper not found (expected data/flexipipe_wrapper.sh or data/flexipipe_launcher.c).", file=sys.stderr)
         return 1
+    venv_base = _get_install_time_venv_base()
     if use_launcher_bin:
         script_content = None
     else:
         script_content = script_path.read_text()
+        if venv_base is not None:
+            script_content = _inject_venv_into_wrapper_script(script_content, venv_base)
 
     install_path = getattr(args, "wrapper_path", None)
     use_sudo = False
@@ -110,12 +120,15 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
             print("[flexipipe] Invalid choice.", file=sys.stderr)
             return 1
 
+    def _launcher_bytes():
+        return launcher_bytes
+
     try:
         if use_sudo:
-            import tempfile
             if use_launcher_bin:
+                lb = _launcher_bytes()
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
-                    tmp.write(launcher_bin.read_bytes())
+                    tmp.write(lb)
                     tmp_path = tmp.name
             else:
                 with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh") as tmp:
@@ -127,12 +140,25 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
                 print(f"[flexipipe] Error: {result.stderr or result.stdout}", file=sys.stderr)
                 return 1
             subprocess.run(["sudo", "chmod", "+x", str(install_path)], check=True)
+            if use_launcher_bin and venv_base is not None:
+                venv_file = install_path.parent / (install_path.name + ".venv")
+                with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".venv") as tf:
+                    tf.write(str(venv_base))
+                    vpath = tf.name
+                subprocess.run(["sudo", "cp", vpath, str(venv_file)], capture_output=True)
+                Path(vpath).unlink(missing_ok=True)
         else:
             if use_launcher_bin:
-                install_path.write_bytes(launcher_bin.read_bytes())
+                install_path.write_bytes(_launcher_bytes())
             else:
                 install_path.write_text(script_content)
             install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
+        if use_launcher_bin and venv_base is not None:
+            venv_file = install_path.parent / (install_path.name + ".venv")
+            try:
+                venv_file.write_text(str(venv_base))
+            except Exception:
+                pass
         kind = "C launcher" if use_launcher_bin else "Wrapper script"
         print(f"[flexipipe] ✓ {kind} installed to: {install_path}")
         if install_path.parent == Path.home() / "bin":

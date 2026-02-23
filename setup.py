@@ -330,7 +330,8 @@ def install_wrapper_script():
         return
 
     if noninteractive or quiet_install:
-        # Skip interactive wrapper script installation
+        # Skip interactive wrapper script installation; suggest installing later
+        print("\n[flexipipe] To add the 'flexipipe' command to your PATH, run: python -m flexipipe install wrapper", file=sys.stderr)
         return
 
     print("\n" + "="*70)
@@ -364,7 +365,7 @@ def install_wrapper_script():
     
     if choice == "4":
         print("Skipping wrapper script installation.")
-        print("You can install it manually later by copying scripts/flexipipe to your PATH.")
+        print("You can install it later with: python -m flexipipe install wrapper")
         return
     
     # Prefer script bundled in package (single source of truth); fall back to repo scripts/
@@ -392,6 +393,7 @@ def install_wrapper_script():
         use_sudo = False
     else:
         print("Invalid choice, skipping installation.")
+        print("You can install it later with: python -m flexipipe install wrapper")
         return
     
     # Read the script and customize it
@@ -465,7 +467,10 @@ class FlexiInstall(install):
                 print("\n\nWrapper script installation cancelled.")
             except Exception as e:
                 print(f"\nError during wrapper script installation: {e}")
-                print("You can install it manually later.")
+                print("You can install it later with: python -m flexipipe install wrapper")
+        else:
+            # No TTY (e.g. pip install from git in some environments): suggest wrapper
+            print("\n[flexipipe] To add the 'flexipipe' command to your PATH, run: python -m flexipipe install wrapper", file=sys.stderr)
 
 
 setup(
@@ -483,6 +488,7 @@ setup(
             "flexitag_py*.so",
             "flexitag_py*.pyd",
             "data/flexipipe_wrapper.sh",
+            "data/flexipipe_launcher.c",
         ],
         "": ["flexitag/build/flexitag_py*.so", "flexitag/build/flexitag_py*.pyd"],  # Include from flexitag/build
     },

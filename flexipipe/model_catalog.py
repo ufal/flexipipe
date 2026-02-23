@@ -76,7 +76,7 @@ def build_unified_catalog(
         print("[flexipipe] Building unified model catalog...")
     
     from .backend_registry import get_backend_info, get_model_entries
-    from .__main__ import _get_language_backend_priority
+    from ._cli import _get_language_backend_priority
     
     catalog: Dict[str, Dict[str, Any]] = {}
     
@@ -316,7 +316,7 @@ def _apply_preference_rules(catalog: Dict[str, Dict[str, Any]]) -> None:
        - Smaller models (sm > md > lg) for speed
     3. Backend priority: flexitag > spacy > stanza > others
     """
-    from .__main__ import _get_language_backend_priority
+    from ._cli import _get_language_backend_priority
     
     # Group by language+backend combination (prefer one model per language+backend)
     by_language_backend: Dict[tuple[str, str], List[tuple[str, Dict[str, Any]]]] = {}
@@ -435,7 +435,7 @@ def get_preferred_model_for_language(
         return None
     
     # Sort by: preferred flag, then available, then backend priority
-    from .__main__ import _get_language_backend_priority
+    from ._cli import _get_language_backend_priority
     backend_priority_list = _get_language_backend_priority()
     backend_priority = {name: idx for idx, name in enumerate(backend_priority_list) if name}
     

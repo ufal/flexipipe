@@ -1985,6 +1985,16 @@ class CustomArgumentParser(argparse.ArgumentParser):
             raise
 
 
+def _backend_choice(value: str) -> str:
+    """Validate --backend value; avoid hardcoding the list in help."""
+    choices = get_backend_choices()
+    if value in choices:
+        return value
+    raise argparse.ArgumentTypeError(
+        f"Unknown backend '{value}'. Use 'flexipipe info backends' to see available backends."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Get version from package
     try:
@@ -1995,8 +2005,9 @@ def build_parser() -> argparse.ArgumentParser:
         version = "1.0.0"
     
     parser = CustomArgumentParser(
-        prog="python -m flexipipe",
+        prog="flexipipe",
         description="Flexipipe pipeline",
+        epilog="Get more help on a subcommand: flexipipe <subcommand> --help (e.g. flexipipe config --help, flexipipe process --help).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,  # Disable prefix matching to prevent --teitok from matching --teitok-settings
     )
@@ -2026,14 +2037,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Add global arguments (available in all subcommands)
     parser.add_argument(
         "--backend",
-        choices=get_backend_choices(),
+        type=_backend_choice,
         default=None,
-        help="Backend type (for use in tasks; default: flexitag)",
+        metavar="BACKEND",
+        help="Backend type (default: flexitag). Use 'flexipipe info backends' to see available backends; more can be installed separately (e.g. flexipipe install spacy).",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable verbose debug logging and show execution timing",
+        help=argparse.SUPPRESS,  # Developer aid; keep out of main help
     )
     parser.add_argument(
         "--verbose",
@@ -2044,7 +2056,7 @@ def build_parser() -> argparse.ArgumentParser:
     
     # Create a parent parser with common arguments that all subcommands inherit
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    parent_parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging and show execution timing")
+    parent_parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     parent_parser.add_argument("--verbose", action="store_true", help="Print high-level progress messages")
     
     def add_logging_args(p: argparse.ArgumentParser) -> None:
@@ -2110,9 +2122,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--backend",
-        choices=get_backend_choices(),
+        type=_backend_choice,
         default=None,
-        help="Backend to use (default: flexitag)",
+        metavar="BACKEND",
+        help="Backend to use (default: flexitag). Use 'flexipipe info backends' to see available backends.",
     )
     process_parser.add_argument(
         "--model",

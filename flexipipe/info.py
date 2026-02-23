@@ -238,10 +238,23 @@ def list_sessions(args: argparse.Namespace) -> int:
 
 def list_models(args: argparse.Namespace) -> int:
     """List available models for the specified backend."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r".*\[W095\].*", category=UserWarning)
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*may not be 100% compatible with the current version.*",
+            category=UserWarning,
+        )
+        return _list_models_impl(args)
+
+
+def _list_models_impl(args: argparse.Namespace) -> int:
+    """Implementation of list_models (SpaCy compat warnings suppressed by list_models)."""
     import time
-    from .__main__ import _load_backend_entries, _display_language_filtered_models, _get_language_backend_priority
+    from ._cli import _load_backend_entries, _display_language_filtered_models, _get_language_backend_priority
     from .language_utils import LANGUAGE_FIELD_ISO, LANGUAGE_FIELD_NAME
-    
+
     start_time = time.time()
     debug = getattr(args, "debug", False)
     backend_type = getattr(args, "backend", None)
@@ -279,7 +292,7 @@ def list_models(args: argparse.Namespace) -> int:
             if not models:
                 # No exact matches found - suggest similar languages using fuzzy matching (for display only)
                 from .language_utils import resolve_language_query
-                from .__main__ import _suggest_similar_languages
+                from ._cli import _suggest_similar_languages
                 query = resolve_language_query(language_filter)
                 try:
                     # Rebuild catalog only if we need it for suggestions (use expired cache for speed)
@@ -1137,14 +1150,13 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
             settings_path = found_path
     
     if not settings_path or not settings_path.exists():
-        print("Error: Could not find settings.xml file.", file=sys.stderr)
+        print("TEITOK settings info is only available when run from a TEITOK project folder.", file=sys.stderr)
         print("", file=sys.stderr)
-        print("Options:", file=sys.stderr)
-        print("  --teitok            Enable TEITOK mode (looks for tmp/cqpsettings.xml or ./Resources/settings.xml)", file=sys.stderr)
+        print("Run this command from a directory that contains Resources/settings.xml (or tmp/cqpsettings.xml), or use:", file=sys.stderr)
+        print("  --teitok            Look for tmp/cqpsettings.xml or ./Resources/settings.xml in the current directory", file=sys.stderr)
         print("  --settings PATH     Specify path to settings.xml", file=sys.stderr)
-        print("  --corpus PATH       Specify corpus directory (will search for settings.xml)", file=sys.stderr)
-        print("  Run from a TEITOK corpus directory (searches Resources/settings.xml)", file=sys.stderr)
-        return 1
+        print("  --corpus PATH       Specify corpus directory (will search for settings.xml there)", file=sys.stderr)
+        return 0
     
     # Load settings
     settings = load_teitok_settings(settings_path=settings_path)
@@ -1481,7 +1493,7 @@ def run_info_cli(args: argparse.Namespace) -> int:
     """Run the info subcommand."""
     # Handle --detect-language if provided
     if getattr(args, "detect_language", False):
-        from .__main__ import _run_detect_language_standalone
+        from ._cli import _run_detect_language_standalone
         # Build argv for detect-language
         detect_argv = ["--detect-language"]
         if hasattr(args, "text") and args.text:

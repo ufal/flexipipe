@@ -1,542 +1,61 @@
 # flexiPipe
 
-flexiPipe is a modular NLP pipeline for Universal Dependencies data that glues
-rule-based components, the legacy flexitag tagger, and multiple neural
-backends (SpaCy, Stanza, Flair, UDPipe REST, UDMorph REST, and UD-Kanbun).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
-existing annotations, and exports CoNLL-U (with optional implicit MWTs
-and IOB NER), TEITOK with nested `<tok>`/`<dtok>`/`<name>` structures, SVG dependency tree visualizations, HTML interactive trees, and LaTeX/TikZ dependency trees.
+flexiPipe is a modular NLP pipeline for Universal Dependencies data: rule-based components, the flexitag tagger, and multiple neural backends (SpaCy, Stanza, Flair, UDPipe, UDMorph, UD-Kanbun, etc.). It ingests raw text, CoNLL-U, and TEITOK XML and exports CoNLL-U, TEITOK, SVG/HTML/LaTeX trees, and more.
 
-The CLI centers around several workflows. If you have installed the wrapper (see [Optional: Install a `flexipipe` wrapper script](#optional-install-a-flexipipe-wrapper-script)), you can run `flexipipe` instead of `python -m flexipipe`.
+**Full documentation:** [GitHub Wiki](https://github.com/ufal/flexipipe/wiki) — installation, backends, quick start, CLI reference, and configuration.
+
+---
+
+## Install
+
+```bash
+pip install flexipipe
+# Optional backends (use flexipipe info backends to see all):
+flexipipe install spacy
+flexipipe install udapi   # for HTML/LaTeX output
+```
+
+Then run `flexipipe config --wizard` to pick defaults. To run as `flexipipe` instead of `python -m flexipipe`, install the wrapper: `python -m flexipipe install wrapper` (see [Wiki: Installation](https://github.com/ufal/flexipipe/wiki/Installation)).
+
+---
+
+## Quick start
+
+```bash
+# Tag text (default backend)
+echo "Don't even think he wouldn't do it." | flexipipe process --input -
+
+# With a backend and model
+flexipipe process --backend spacy --model en_core_web_sm --input file.txt --output out.conllu
+
+# See available backends and subcommand help
+flexipipe info backends
+flexipipe process --help
+```
+
+---
+
+## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `flexipipe process` | Tag/parse/normalize input with any backend |
-| `flexipipe benchmark` | Evaluate backends against gold treebanks |
-| `flexipipe train` | Train flexitag or (where implemented) neural backends |
-| `flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
-| `flexipipe info` | List backends, models, examples, tasks, languages, renderers, or installation details |
-| `flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
-| `flexipipe install` | Install optional backends (`flexipipe install udkanbun`, `flexipipe install udapi`), install the launcher (`flexipipe install wrapper`), or upgrade flexipipe (`flexipipe install update`) |
+| `flexipipe process` | Tag/parse/normalize input |
+| `flexipipe benchmark` | Evaluate backends on gold data |
+| `flexipipe train` | Train flexitag or backend models |
+| `flexipipe convert` | Convert formats (e.g. TEITOK → CoNLL-U) |
+| `flexipipe info` | List backends, models, examples, tasks, languages, installation |
+| `flexipipe config` | Set defaults (backend, output format, models dir) |
+| `flexipipe install` | Install optional backends or the launcher; upgrade flexipipe |
 
-Use `flexipipe info backends`, `flexipipe info models --backend <name>`, `flexipipe info examples`, `flexipipe info tasks`, `flexipipe info languages`, `flexipipe info renderers`, or `flexipipe info installation` to explore available integrations, models, example texts, supported tasks, languages, SVG renderers, and installation details (version, package location, source type, Python path, config and models dirs).
-
----
-
-## Key Features
-
-* **Multi-backend orchestration**
-  * `flexitag` (built-in Viterbi model with rule-based sentence segmentation & UD-style tokenization)
-  * `spacy` (full [SpaCy](http://spacy.io) pipeline, TEI/CoNLL conversions, automatic model discovery, optional downloads)
-  * `stanza` ([Stanza](https://stanfordnlp.github.io/stanza/) with raw or tokenized input, package selection, download-on-demand, suppressed logging)
-  * `flair` ([Flair](https://flairnlp.github.io/) multi-tagger with confidence scores, automatic contraction handling)
-  * `transformers` ([HuggingFace Transformers](https://huggingface.co/) token-classification models for POS & NER with detailed metadata)
-  * `udpipe` ([UDPIPE](https://lindat.mff.cuni.cz/services/udpipe) REST backends with batching, debug logging, and URL overrides)
-  * `udmorph` ([UDMorph](https://lindat.mff.cuni.cz/services/teitok-live/udmorph/) REST backends with batching, and debug logging)
-  * `udkanbun` ([UD-Kanbun](https://koichiyasuoka.github.io/UD-Kanbun/) for Classical Chinese with dependency parsing, gloss annotations, and specialized visualization)
-* **Input flexibility**: auto-detects format or accepts `--input-format` (`auto`, `conllu`, `tei`, `raw`).
-  Raw mode can read from STDIN (use `--input -` or pipe text).
-* **Backend chaining**: Pipe output from one backend to another to combine different tools (e.g., UDPipe for tagging/parsing, then NameTag for NER).
-* **Document representation**:
-  * Supports multi-word tokens with subtokens, tokids, `space_after`, and alignment metadata.
-  * Named entities stored per-sentence and exported as CoNLL-U `Entity=B-ORG` and TEITOK `<name>` spans.
-  * Confidence slots (`upos_confidence`, `lemma_confidence`, etc.) allow neural fallbacks.
-* **Output control**:
-  * CoNLL-U writer can append implicit MWT ranges and selective `TokId` output.
-  * TEITOK writer emits `<dtok/>` without extra whitespace, nests `<name>` blocks, and respects `_` skipping rules.
-  * SVG dependency tree visualization with arrow-style (`dep`) or hierarchical tree-style (`tree`) layouts, with multiple renderer options (displacy, udapi, conllview, graphviz).
-  * HTML interactive dependency trees using udapi (requires `udapi` package).
-  * LaTeX/TikZ dependency trees using udapi's TikZ writer (requires `udapi` package, use `xelatex`/`lualatex` for Unicode characters).
-  * Configure default output format and implicit MWT behaviour via `flexipipe config`.
-* **Evaluation tooling (`check`)**
-  * Aligns tokens via tokids and SequenceMatcher fallbacks.
-  * Computes UPOS/XPOS/FEATS/lemma/UAS/LAS, splitting stats, and partial-feats accuracy.
-  * Optional debug dumps: duplication warnings, tokenization diff samples, backend metadata.
-* **Centralised model storage**
-  * Models live under `~/.flexipipe/models/<backend>/` (overridable via `FLEXIPIPE_MODELS_DIR` or `config --set-models-dir`).
-  * Environment helpers ensure SpaCy/Stanza/Flair look inside the shared directory first.
-* **Rich configuration**
-  * `config.json` (created automatically) tracks:
-    * `models_dir`
-    * default backend (used when `--backend` is omitted)
-    * default output format (`tei` or `conllu`)
-    * default `create_implicit_mwt` flag
-    * default `language_detector` backend (e.g., `fasttext`, `none`)
-  * `flexipipe config --show` prints the active settings and where they originate.
-  * `--list-models` caches per-backend model catalogs under `~/.flexipipe/cache/`; refresh anytime with `--refresh-cache`.
+Use **`flexipipe <subcommand> --help`** for full options. Use **`flexipipe info backends`** to see available backends (more can be installed via `flexipipe install <name>`).
 
 ---
 
-## Installation & Requirements
+## Project layout
 
-1. **Python 3.8+** (Python 3.11 recommended)
-2. Install Python requirements:
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
-   Note: `torch>=2.6.0` is required for security (CVE-2025-32434). The transformers backend will check this at runtime.
-3. Install backend extras when needed (keeps the default install small):
-   ```bash
-   pip install "flexipipe[spacy]"         # SpaCy backend
-   pip install "flexipipe[stanza]"        # Stanza backend
-   pip install "flexipipe[classla]"       # Classla backend
-   pip install "flexipipe[flair]"         # Flair backend
-   pip install "flexipipe[transformers]"  # Transformers backend (installs torch, datasets, etc.)
-   pip install "flexipipe[udkanbun]"      # UD-Kanbun backend (Classical Chinese)
-   pip install "flexipipe[all]"           # Everything
-   
-   # Or install via flexipipe's install command
-   flexipipe install udkanbun
-   flexipipe install udapi                 # For HTML and LaTeX output formats
-   ```
-   Additional upstream options (only when needed):
-   ```bash
-   python -m pip install "spacy[transformers]"  # Enables SpaCy's transformer components
-   ```
-4. Build the native flexitag modules (`flexitag`, `viterbi_cpp`) if needed via CMake
-   (see `README_CPP.md` for details).
-   
-   **Note**: C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build. No manual installation needed.
+- `flexipipe/` — main package (CLI, backends, converters)
+- `flexitag/` — C++ flexitag sources and bindings
+- `README_CPP.md` — native build instructions
+- `wiki/` — wiki page sources; sync to GitHub Wiki with `scripts/sync-wiki.sh`
 
-After installation, run the guided setup to pick defaults:
-
-```bash
-python -m flexipipe config --wizard
-```
-
-### Non-Interactive Installation
-
-For automated installations (e.g., from PHP scripts or CI/CD), set the `FLEXIPIPE_NONINTERACTIVE` or `FLEXIPIPE_QUIET_INSTALL` environment variable to skip interactive prompts:
-
-```bash
-FLEXIPIPE_NONINTERACTIVE=1 pip install git+https://github.com/ufal/flexipipe.git
-```
-
-Or:
-
-```bash
-FLEXIPIPE_QUIET_INSTALL=1 pip install git+https://github.com/ufal/flexipipe.git
-```
-
-This will skip the wrapper script installation prompt and install silently with defaults.
-
-### Optional: Install a `flexipipe` wrapper script
-
-You can run the CLI as `flexipipe` (instead of `python -m flexipipe`) by installing a launcher that finds Python and invokes the module.
-
-- **During `pip install`**: If you run `pip install` interactively (and do not set `FLEXIPIPE_NONINTERACTIVE` or `FLEXIPIPE_QUIET_INSTALL`), you will be **asked** whether to install the wrapper and where (e.g. `/usr/local/bin`, `~/bin`, or a custom path). You can skip (default) or choose a location.
-- **Anytime after install**: Run `flexipipe install wrapper`; you will be prompted for the install location, or pass a path directly:
-  ```bash
-  flexipipe install wrapper                    # prompts: 1=/usr/local/bin, 2=~/bin, 3=custom, 4=cancel
-  flexipipe install wrapper --path ~/bin       # install to ~/bin/flexipipe
-  flexipipe install wrapper --path /usr/local/bin   # install to /usr/local/bin/flexipipe (may need sudo)
-  ```
-  **C launcher (faster startup):** When you run `flexipipe install wrapper`, if the C launcher source is present (e.g. in a development clone at `scripts/flexipipe_launcher.c`), the command will try to **build** it (using `make` or `cc`) and install the compiled binary. That launcher starts only one Python process instead of two, which can save about 1–2 seconds per run. If the build fails or no compiler is available, the shell script wrapper is installed instead. The launcher respects `VENV_PATH`, `VIRTUAL_ENV`, and `FLEXIPIPE_REPO_PATH` (for development installs).
-- **Non-interactive / CI**: Set `FLEXIPIPE_INSTALL_WRAPPER=1` (and optionally `FLEXIPIPE_WRAPPER_DIR` or `FLEXIPIPE_VENV_PATH`) when running `pip install` to install the wrapper without prompting.
-
-To upgrade flexipipe to the latest version from PyPI, run **`flexipipe install update`**. (If you use an editable install, it will remind you to pull and run `pip install -e .` in the repo.)
-
-Ensure the chosen directory is on your `PATH`. Then you can run `flexipipe --version`, `flexipipe process ...`, etc. Version output shows only `flexipipe X.Y.Z` (no `python -m` prefix).
-
-### Optional Extras Behaviour
-
-flexiPipe can install extras automatically the first time you use a backend:
-
-```bash
-python -m flexipipe config --set-auto-install-extras true
-```
-
-By default, flexipipe will prompt before installing extras in interactive shells. Disable prompts (for batch environments) with:
-
-```bash
-python -m flexipipe config --set-prompt-install-extras false
-```
-
-### Language Detection Backends
-
-Language identification is pluggable. The default detector is `fasttext`, but you can switch (or turn it off) via:
-
-```bash
-python -m flexipipe config --set-language-detector fasttext
-python -m flexipipe config --set-language-detector none      # disable auto-detection entirely
-```
-
-The interactive wizard (`python -m flexipipe config --wizard`) now asks which detector to use and only offers to download the fastText `lid.176.ftz` model when `fasttext` is selected.
-
-For fastText users, download or refresh the model at any time with:
-
-```bash
-python -m flexipipe config --download-language-model
-```
-
----
-
-## Quick Start
-
-### Tagging
-
-```bash
-# Raw text via STDIN, using default backend and output config
-echo "Don't even think he wouldn't do it." | python -m flexipipe process --input -
-
-# Process a CoNLL-U file with SpaCy and export TEITOK XML
-python -m flexipipe process \
-  --input data/en.conllu \
-  --backend spacy \
-  --model en_core_web_md \
-  --output-format tei \
-  --output out.xml
-
-# Generate SVG dependency tree visualization
-python -m flexipipe process \
-  --backend udkanbun \
-  --data '不入虎穴不得虎子' \
-  --output-format svg \
-  --svg-style tree \
-  --output tree.svg
-
-# Generate arrow-style dependency visualization
-python -m flexipipe process \
-  --language nld \
-  --example udhr \
-  --backend spacy \
-  --output-format svg \
-  --svg-style dep \
-  --output dependencies.svg
-
-# Generate HTML interactive dependency tree (requires udapi)
-python -m flexipipe process \
-  --backend udkanbun \
-  --data '不入虎穴不得虎子' \
-  --output-format html \
-  --output tree.html
-
-# Generate LaTeX/TikZ dependency tree (requires udapi)
-python -m flexipipe process \
-  --backend udkanbun \
-  --data '不入虎穴不得虎子' \
-  --output-format latex \
-  --output tree.tex
-
-# Use UDPipe REST in raw mode with debug logging
-python -m flexipipe process \
-  --backend udpipe \
-  --udpipe-model english-ewt-ud-2.15-241121 \
-  --input-format raw \
-  --debug \
-  --input story.txt
-
-# Chain backends: use UDPipe for tagging/parsing, then NameTag for NER
-echo "Mary bought a new bicycle in Germany." | \
-  python -m flexipipe process --backend udpipe | \
-  python -m flexipipe process --backend nametag --output-format conllu-ne
-```
-
-Important switches:
-
-| Flag | Description |
-| --- | --- |
-| `--backend` | Selects backend (`flexitag`, `spacy`, `stanza`, `flair`, `udpipe`, `udmorph`, `nametag`, `udkanbun`) |
-| `--model` / `--language` | Backend-specific model hint. SpaCy resolves installed/downloadable names. |
-| `--language English` (SpaCy) | Without `--model`, flexiPipe auto-uses SpaCy's default core model (e.g., `en_core_web_sm`, if installed). |
-| `--download-model` | Auto-fetch SpaCy/Stanza/Flair models when missing. |
-| `--output-format` | `tei`, `conllu`, `conllu-ne`, `json`, or `svg`. Falls back to configuration default. |
-| `--svg-style` | SVG visualization style. Base styles: `dep` (arrow-style, default), `tree` (hierarchical tree). Options can be comma-separated: `tree,boxes` (show boxes), `tree,root` (show root node), `tree,horizontal` (nodes in sentence order), `tree,flush_bottom` (flush words to bottom). Numeric options: `tree,node_width=100,level_height=150`. Backends may provide custom renderers. |
-| `--create-implicit-mwt` | Rebuilds implicit MWT ranges in output (default configurable). |
-### Benchmarking
-
-```bash
-# Run a single backend/model evaluation (quick validation)
-python -m flexipipe benchmark --test \
-  --test-file UD_English-EWT/en_ewt-ud-test.conllu \
-  --backend spacy \
-  --model en_core_web_trf \
-  --mode tokenized \
-  --verbose --debug
-
-# Run benchmark sweep across languages/backends
-python -m flexipipe benchmark --run \
-  --languages en nl de \
-  --backends spacy stanza
-
-# Show stored benchmark results
-python -m flexipipe benchmark --show \
-  --sort-by upos
-```
-
-* Accepts the same backend selection flags as `process`.
-* `--mode` chooses how the gold data is fed to the backend (`raw`, `tokenized`,
-  `split`, or `auto`).
-* `--test` runs a single evaluation (replaces the old `check` command).
-* `--run` performs a benchmark sweep across multiple languages/backends.
-* `--show` displays stored benchmark results with various sorting options.
-
-### Training
-
-```bash
-# Train flexitag on a UD treebank
-python -m flexipipe train \
-  --backend flexitag \
-  --ud-data /path/to/UD_English-EWT \
-  --output-dir models/flexitag-en
-
-# Kick off backend-owned training (where implemented)
-python -m flexipipe train \
-  --backend spacy \
-  --model en_core_web_md \
-  --train-data data/train.conllu \
-  --dev-data data/dev.conllu \
-  --output-dir models/spacy-en
-```
-
-Flexitag training supports UD treebank directories (`--ud-data`) with automatic
-tag-attribute selection. Neural training delegates to the backend’s own API;
-some backends will raise `NotImplementedError` until training hooks are fully
-implemented.
-
-### Configuration
-
-```bash
-# Pick default backend/output, move models to an external drive, and enable implicit MWTs
-python -m flexipipe config \
-  --set-models-dir /Volumes/Data2/Flexipipe \
-  --set-default-backend spacy \
-  --set-default-output-format conllu \
-  --set-default-create-implicit-mwt true
-
-# Inspect the resulting config.json
-python -m flexipipe config --show
-```
-
----
-
-## Backends Overview
-
-| Backend | Mode(s) | Highlights | Notes |
-| --- | --- | --- | --- |
-| `flexitag` | Raw / tokenized | Built-in Viterbi tagger, rule-based segmentation, lexicon-aware | Requires flexitag model (`model_vocab.json`). |
-| `spacy` | Raw + tokenized | NER, dependency parsing, automatic model discovery & download, centralized model dir support | Pre-tokenized mode preserves tokids/MWTs; raw mode hands segmentation to SpaCy. |
-| `stanza` | Raw + tokenized | Full UD pipeline, package selection (e.g., `cs_cac`), SpaceAfter inference, suppressed INFO logging | Set `--download-model` or provide `--model`/`--language`. |
-| `flair` | Raw-focused | Multi-task taggers (POS + NER), confidence scores, contraction alignment | Works best in raw mode; auto-converts results back to original tokens. |
-| `transformers` | Raw + tokenized | HuggingFace Transformers POS/NER with detailed model metadata (tasks, base model, training data, techniques) | Requires `--model <huggingface_id>` plus optional `--transformers-task`, `--transformers-device`, etc. |
-| `udpipe` | Raw + tokenized | REST integration with batching, curl debug output, token/parse tasks, default Lindat endpoint | Provide `--udpipe-model`, optional `--udpipe-param KEY=VALUE`. |
-| `udmorph` | Tokenized | REST morph-only tagging, curl debug output, language-sorted model listing | Requires `--udmorph-model`. |
-| `treetagger` | Tokenized | Local TreeTagger binary for lemma + XPOS tagging (English, German, French, Old French manifests) | Install TreeTagger separately; use `--treetagger-model` or `--treetagger-model-path`, optional `--treetagger-binary`. Works best with `--pretokenize` (e.g., `echo 'Carles li reis …' \| python -m flexipipe --backend treetagger --language fro --download-model --pretokenize`). |
-| `nametag` | Raw + tokenized | REST NER service, supports 21 languages, NameTag 3 (default), curl debug output | Provide `--nametag-model` or `--language`, optional `--nametag-version` (1/2/3), `--nametag-param KEY=VALUE`. |
-| `udkanbun` | Raw | [UD-Kanbun](https://koichiyasuoka.github.io/UD-Kanbun/) for Classical Chinese with dependency parsing, gloss annotations, and specialized visualization | Uses spaCy integration. Install via `flexipipe install udkanbun` or `pip install udkanbun`. Supports `--svg-style` for tree visualization. |
-### HuggingFace Transformers backend
-
-The new `transformers` backend plugs flexiPipe directly into HuggingFace token-classification
-models (POS tagging or NER). Models are described in the transformers registry with extra
-metadata—tasks, base model, training corpora, and training techniques—so `python -m flexipipe info models --backend transformers`
-shows not just names but what each model actually does.
-
-Usage example:
-
-```bash
-echo "Why do we need an Old French model?" | \
-  python -m flexipipe process \
-    --backend transformers \
-    --model Davlan/bert-base-multilingual-cased-ner-hrl \
-    --transformers-device cpu \
-    --output-format conllu
-```
-
-Key CLI switches:
-
-| Flag | Purpose |
-| --- | --- |
-| `--model` | Required HuggingFace repo/model ID (e.g., `vblagoje/bert-english-uncased-finetuned-pos`). |
-| `--transformers-task` | Override automatic task detection (`tag` or `ner`). |
-| `--transformers-device` | Choose runtime device (`cpu`, `cuda`, `cuda:0`, `mps`, ...). |
-| `--transformers-adapter` | Load a specific adapters hub adapter (if the model exposes adapters). |
-| `--transformers-revision` | Pin a specific revision/tag/commit. |
-| `--transformers-trust-remote-code` | Allow custom model code (required for some community repos). |
-
-The backend aligns sub-word predictions back to document tokens, fills `upos` or
-sentence-level NER spans, and records per-token confidence scores. Training hooks
-will follow later (multi-task fine-tuning over arbitrary corpora).
-
-Each backend exposes `list_*_models_display()` used by `--list-models` to show
-installed vs available models, languages, and statuses (deduplicated where
-possible).
-
----
-
-## Input & Output Details
-
-### Input Formats
-
-* **CoNLL-U**: `--input-format conllu` or auto-detected via `.conllu`.
-* **TEITOK XML**: `--input-format tei`. The reader converts `<tok>` and
-  `<dtok>` to the internal document representation (preserving TokId).
-* **Raw text / STDIN**: `--input-format raw` or `--input -`. When using
-  flexitag, raw text is segmented/tokenized before tagging. For neural
-  backends, raw text is passed through untouched so the backend can handle
-  segmentation itself.
-* **Tokenized CoNLL-U predictions**: `check` can operate in `tokenized` mode,
-  merging UD MWTs as needed before evaluation.
-
-### Output Formats
-
-* **CoNLL-U**: `document_to_conllu` adds `Entity=` entries, writes
-  TokId only when it originates from input, and can rebuild implicit MWT ranges.
-* **CoNLL-U with NER**: `--output-format conllu-ne` exports CoNLL-U with named entity annotations.
-* **TEITOK**: `dump_teitok` produces clean `<dtok/>` blocks, adds `<name>`
-  wrappers for entity spans, and avoids redundant `_` attributes (except real
-  underscores in lemma/form). TokIds are emitted as `xml:id`.
-* **SVG**: Dependency tree visualization in SVG format. Requires dependency relations (head and deprel).
-  * Base styles: `dep` (arrow-style using displacy, default), `displacy` (explicitly use displacy), `tree` (hierarchical tree)
-  * Options can be comma-separated: `tree,boxes` (show boxes around nodes), `tree,root` (show ROOT indicator), `tree,horizontal` (nodes in sentence order), `tree,flush_bottom` (flush words to bottom), `dep,displacy` (force displacy even if backend has native renderer)
-  * Numeric options: `tree,node_width=100,level_height=150` (customize spacing)
-  * Works with any backend that provides dependency parsing (spacy, stanza, udkanbun, etc.)
-  * Multiple renderers available: `displacy` (default), `udapi`, `conllview`, `graphviz`. Use `flexipipe info renderers` to list all available renderers.
-  * To explicitly use displacy: `--svg-style displacy` or `--svg-style dep,displacy`
-  * UD-Kanbun backend: Uses spaCy's displacy renderer by default. If UD-Kanbun provides a native SVG renderer, it can be used by default for `dep` style, or forced with `--svg-style displacy`
-  * Backends can register custom SVG renderers via `document.meta["_svg_renderer"]` or by implementing `to_svg()` methods on spaCy Doc objects
-* **HTML**: Interactive dependency tree visualization using udapi (requires `udapi` package). Generates HTML with JavaScript-based SVG rendering that works in web browsers. Install with `flexipipe install udapi` or `pip install udapi`.
-* **LaTeX**: Dependency tree visualization in LaTeX/TikZ format using udapi (requires `udapi` package). Generates TikZ code compatible with the `tikz-dependency` package. Comments are automatically removed from `deptext` blocks to ensure proper rendering. For Unicode characters (e.g., Chinese), use `xelatex` or `lualatex` instead of `pdflatex`. Install with `flexipipe install udapi` or `pip install udapi`. See `dev/LATEX_USAGE.md` for detailed usage instructions.
-* **JSON**: Structured JSON output with full document representation.
-* **Intermediates**: `check` stores predicted and detagged corpora for auditing.
-
----
-
-## Named Entity Recognition
-
-* SpaCy and other NER-capable backends populate `Sentence.entities`.
-* CoNLL-U output encodes entities as `Entity=B-ORG`, `Entity=I-LOC`, etc.
-* TEITOK output wraps the affected `<tok>` elements in `<name type="ORG">`.
-* Entities can carry arbitrary attributes (copied to TEITOK `<name>` attributes).
-
----
-
-## Multi-Word Tokens (MWTs)
-
-* Existing MWTs are preserved via `tokid` alignment.
-* `_create_implicit_mwt` can synthesize MWT ranges for contractions (based on
-  `SpaceAfter=No`) even if the backend did not output them.
-* Enable per run with `--create-implicit-mwt` or set the default with
-  `flexipipe config --set-default-create-implicit-mwt true`.
-* TEITOK exporter keeps `<tok>` text content even when `<dtok>` children exist.
-
----
-
-## Model & Data Management
-
-* **Shared model directory**: `get_backend_models_dir(backend)` ensures each
-  backend uses a subdirectory under `~/.flexipipe/models`.
-* **Environment overrides**:
-  * `FLEXIPIPE_MODELS_DIR` – forces a different root.
-  * Backend-specific envs (e.g., Stanza’s `STANZA_RESOURCES_DIR`) are set to
-    refer to the shared directory before imports happen.
-* **`config.json`** lives in `~/.flexipipe/`. Editing via the CLI is preferred.
-
----
-
-## Information Commands
-
-```bash
-# List all available backends
-flexipipe info backends
-
-# List available models for a backend
-flexipipe info models --backend transformers
-
-# List available example texts (UDHR)
-flexipipe info examples
-
-# List all supported tasks
-flexipipe info tasks
-
-# List all supported languages
-flexipipe info languages
-
-# List available SVG renderers
-flexipipe info renderers
-
-# Show installation details (version, package location, source type, Python path, config and models dirs)
-flexipipe info installation
-```
-
-Use **`flexipipe info installation`** to see the installed version, where the package lives, whether it is an editable install, the Python executable in use, and the config and models directories.
-
-## Format Conversion
-
-The `convert` command supports multiple conversion types:
-
-### Convert TEITOK to UD-style CoNLL-U splits
-
-```bash
-# Convert TEITOK corpus to train/dev/test splits
-python -m flexipipe convert \
-  --type treebank \
-  --input /path/to/teitok/corpus \
-  --output /path/to/output \
-  --train-ratio 0.8 \
-  --dev-ratio 0.1 \
-  --test-ratio 0.1
-
-# Convert CoNLL-U file(s) to splits (handles missing sections)
-python -m flexipipe convert \
-  --type treebank \
-  --input test.conllu \
-  --output splits/
-
-# Rerunning preserves existing splits based on sent_id
-# (prevents test set contamination when data is updated)
-```
-
-**Features:**
-- **Longer sent_ids**: Includes source filename (e.g., `corpus-s1`, `article-s2`) for tracking
-- **Split preservation**: When rerunning, existing splits are preserved based on `sent_id` to avoid test contamination
-- **Handles missing sections**: Can split treebanks that only have test, or only train+test sections
-- **CoNLL-U input support**: Can convert from CoNLL-U files directly (not just TEITOK)
-
-### Using Example Texts
-
-```bash
-# Process UDHR example for a language
-python -m flexipipe process \
-  --backend classla \
-  --language bg \
-  --example udhr
-```
-
----
-
-## Evaluation & Debugging Tips
-
-* Use `--debug` for both `process` and `benchmark` to enable:
-  * Curl representations of REST payloads (UDPipe/UDMorph).
-  * Tokenization difference samples.
-  * Backend-specific log statements (e.g., SPD request durations).
-* `--verbose` prints high-level progress plus evaluation summaries.
-* `tmp/` directories (e.g., `tmp_spacy_raw/`) capture per-run artifacts for
-  manual inspection.
-
----
-
-## Project Layout
-
-```
-flexipipe/              # Main Python package (CLI, backends, converters)
-flexitag/               # C++ flexitag sources and bindings
-src/                    # Additional C++ helpers (tokenizer, TEITOK writer, etc.)
-README_CPP.md           # Native build instructions
-```
-
-**Note**: Third-party C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build and are not stored in the repository.
-
----
-
-## Contributing & Further Work
-
-* Ensure new features respect existing document structures (`tokid`,
-  `Sentence.entities`, `space_after`).
-* Keep README sections in sync when adding backends, CLI switches, or config
-  keys.
-* The transformers backend is fully implemented with model discovery and metadata support.
-* Training hooks are available for flexitag and some neural backends.
-
-Please open issues or start discussions if you bump into missing features,
-incomplete documentation, or ideas for new backend integrations.
-
+See [Contributing](https://github.com/ufal/flexipipe/wiki/Contributing) on the Wiki for development notes.

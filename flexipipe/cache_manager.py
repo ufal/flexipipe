@@ -92,7 +92,7 @@ def refresh_all_caches(
         Dictionary mapping cache keys to success status
     """
     from .backend_registry import get_backend_info, get_model_entries
-    from .__main__ import _get_language_backend_priority
+    from ._cli import _get_language_backend_priority
     from .model_catalog import build_unified_catalog
     
     results: Dict[str, bool] = {}

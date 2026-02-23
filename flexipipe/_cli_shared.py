@@ -19,7 +19,7 @@ TASK_CHOICES = (
 def get_parent_parser() -> argparse.ArgumentParser:
     """Minimal parent parser with --verbose and --debug only (no backend choices)."""
     p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    p.add_argument("--debug", action="store_true", help="Enable verbose debug logging and show execution timing")
+    p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="Print high-level progress messages")
     return p
 
