@@ -1,6 +1,6 @@
 """flexipipe – modular NLP pipeline combining BERT and flexitag."""
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 from .doc import Document, Sentence, Token, SubToken, apply_nlpform
 from .engine import FlexitagFallback
