@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 
 # Single source for --version output; release script updates this and __init__.py.
-_VERSION = "0.3.1"
+_VERSION = "0.3.2"
 
 # Handle --version / -V before any other imports (no I/O, no heavy modules).
 if "--version" in sys.argv or "-V" in sys.argv:
