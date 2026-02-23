@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from difflib import SequenceMatcher
 from dataclasses import dataclass
@@ -519,6 +520,7 @@ def evaluate_model(
     mode: str = "auto",
     create_implicit_mwt: bool = False,
     unicode_normalize: str = "none",
+    use_udapi_eval: Optional[bool] = None,  # None = auto-detect, True = force, False = disable
 ) -> Path:
     start_time = time.time()
     output_dir = output_dir.expanduser().resolve()
@@ -725,6 +727,70 @@ def evaluate_model(
     # The stripped_doc is only used for tagging, not for evaluation
     # In tokenized mode, we still compare at token level (not subtoken level) even if MWTs were merged for tagging
     eval_gold_doc = gold_doc
+    
+    # Check if we should use udapi evaluation
+    # Auto-detect: use udapi if available and dependencies are present
+    should_use_udapi = False
+    if use_udapi_eval is None:  # Auto-detect
+        # Check if udapi is available
+        try:
+            import udapi
+            udapi_available = True
+        except ImportError:
+            udapi_available = False
+        
+        # Check if dependencies are present (head and deprel)
+        has_dependencies = False
+        for sent in eval_gold_doc.sentences:
+            for tok in sent.tokens:
+                if tok.head is not None and tok.deprel:
+                    has_dependencies = True
+                    break
+            if has_dependencies:
+                break
+        
+        # Use udapi if available and dependencies are present
+        should_use_udapi = udapi_available and has_dependencies
+        if verbose and should_use_udapi:
+            print(f"[flexipipe] Using udapi evaluation (standardized metrics for dependency parsing)")
+    elif use_udapi_eval:
+        should_use_udapi = True
+        if verbose:
+            print(f"[flexipipe] Using udapi evaluation (explicitly requested)")
+    else:
+        should_use_udapi = False
+        if verbose:
+            print(f"[flexipipe] Using flexipipe native evaluation")
+    
+    # If using udapi, try to evaluate with it
+    if should_use_udapi:
+        try:
+            from .udapi_integration import evaluate_with_udapi
+            udapi_metrics = evaluate_with_udapi(pred_doc, eval_gold_doc, eval_type="parsing")
+            
+            # If udapi evaluation succeeded and returned meaningful metrics, use it
+            if udapi_metrics and ("uas" in udapi_metrics or "las" in udapi_metrics):
+                if verbose:
+                    print(f"[flexipipe] udapi evaluation completed successfully")
+                # Use udapi metrics for UAS/LAS, but still use native evaluation for other metrics
+                # that udapi might not provide (like custom fields)
+                use_udapi_for_parsing = True
+                udapi_uas = udapi_metrics.get("uas")
+                udapi_las = udapi_metrics.get("las")
+            else:
+                use_udapi_for_parsing = False
+                udapi_uas = None
+                udapi_las = None
+        except Exception as e:
+            if verbose or debug:
+                print(f"[flexipipe] Warning: udapi evaluation failed, falling back to native evaluation: {e}", file=sys.stderr)
+            use_udapi_for_parsing = False
+            udapi_uas = None
+            udapi_las = None
+    else:
+        use_udapi_for_parsing = False
+        udapi_uas = None
+        udapi_las = None
     
     # Align tokens using centralized alignment function
     # Use sentence boundaries for better alignment when tokenization differs
@@ -1211,8 +1277,9 @@ def evaluate_model(
             "part_form_accuracy": part_form_accuracy,
         },
         "segmentation": metrics["tokenization"].accuracy,
-        "uas": (uas_correct / parsing_total) if parsing_total > 0 else None,
-        "las": (las_correct / parsing_total) if parsing_total > 0 else None,
+        "uas": udapi_uas if use_udapi_for_parsing and udapi_uas is not None else ((uas_correct / parsing_total) if parsing_total > 0 else None),
+        "las": udapi_las if use_udapi_for_parsing and udapi_las is not None else ((las_correct / parsing_total) if parsing_total > 0 else None),
+        "eval_method": "udapi" if use_udapi_for_parsing else "native",
     }
 
     metrics_path = output_dir / "metrics.json"

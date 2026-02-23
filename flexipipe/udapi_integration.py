@@ -83,7 +83,7 @@ def apply_udapi_transform(
 def evaluate_with_udapi(
     predicted: "Document",
     gold: "Document",
-    eval_type: str = "f1",
+    eval_type: str = "parsing",  # Default to parsing for UAS/LAS
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Evaluate predicted document against gold using udapi evaluation blocks.
@@ -115,11 +115,81 @@ def evaluate_with_udapi(
     pred_conllu = document_to_conllu(predicted, create_implicit_mwt=False)
     gold_conllu = document_to_conllu(gold, create_implicit_mwt=False)
     
-    # Load into udapi
-    pred_udapi = UdapiDocument()
-    pred_udapi.from_conllu_string(pred_conllu)
+    # udapi evaluators expect both trees in the same bundle with different zones
+    # Load both documents separately, then merge them into a single document
+    # with both trees in the same bundle but different zones
     gold_udapi = UdapiDocument()
     gold_udapi.from_conllu_string(gold_conllu)
+    
+    pred_udapi = UdapiDocument()
+    pred_udapi.from_conllu_string(pred_conllu)
+    
+    # Create a new combined document
+    combined_udapi = UdapiDocument()
+    gold_zone = "gold"
+    pred_zone = "predicted"
+    
+    # Get number of sentences (should match)
+    gold_bundles = list(gold_udapi.bundles)
+    pred_bundles = list(pred_udapi.bundles)
+    
+    # Create bundles with both gold and predicted trees
+    for i, (gold_bundle, pred_bundle) in enumerate(zip(gold_bundles, pred_bundles)):
+        combined_bundle = combined_udapi.create_bundle()
+        
+        # Copy gold tree to combined bundle with zone
+        gold_tree = list(gold_bundle.trees)[0]
+        combined_gold_tree = combined_bundle.create_tree(zone=gold_zone)
+        # Copy nodes from gold_tree to combined_gold_tree
+        for gold_node in gold_tree.descendants:
+            new_node = combined_gold_tree.create_child(
+                form=gold_node.form,
+                lemma=gold_node.lemma,
+                upos=gold_node.upos,
+                xpos=gold_node.xpos,
+                feats=gold_node.feats,
+                deprel=gold_node.deprel,
+            )
+            # Set parent (will be set after all nodes are created)
+            if gold_node.parent and gold_node.parent.ord > 0:
+                # We'll set parent after creating all nodes
+                pass
+        
+        # Set parents for gold tree
+        gold_nodes_list = list(combined_gold_tree.descendants)
+        for idx, gold_node in enumerate(gold_tree.descendants):
+            if gold_node.parent and gold_node.parent.ord > 0:
+                parent_idx = gold_node.parent.ord - 1
+                if parent_idx < len(gold_nodes_list):
+                    gold_nodes_list[idx].parent = gold_nodes_list[parent_idx]
+            elif gold_node.parent and gold_node.parent.ord == 0:
+                # Root node
+                gold_nodes_list[idx].parent = combined_gold_tree
+        
+        # Copy predicted tree to combined bundle with zone
+        pred_tree = list(pred_bundle.trees)[0]
+        combined_pred_tree = combined_bundle.create_tree(zone=pred_zone)
+        # Copy nodes from pred_tree to combined_pred_tree
+        for pred_node in pred_tree.descendants:
+            new_node = combined_pred_tree.create_child(
+                form=pred_node.form,
+                lemma=pred_node.lemma,
+                upos=pred_node.upos,
+                xpos=pred_node.xpos,
+                feats=pred_node.feats,
+                deprel=pred_node.deprel,
+            )
+        
+        # Set parents for predicted tree
+        pred_nodes_list = list(combined_pred_tree.descendants)
+        for idx, pred_node in enumerate(pred_tree.descendants):
+            if pred_node.parent and pred_node.parent.ord > 0:
+                parent_idx = pred_node.parent.ord - 1
+                if parent_idx < len(pred_nodes_list):
+                    pred_nodes_list[idx].parent = pred_nodes_list[parent_idx]
+            elif pred_node.parent and pred_node.parent.ord == 0:
+                # Root node
+                pred_nodes_list[idx].parent = combined_pred_tree
     
     # Apply evaluation block
     eval_map = {
@@ -139,19 +209,52 @@ def evaluate_with_udapi(
     module_path, class_name = eval_map[eval_type].rsplit(".", 1)
     module = __import__(module_path, fromlist=[class_name])
     eval_class = getattr(module, class_name)
-    eval_block = eval_class(**kwargs)
     
-    # Process both documents
-    eval_block.process_document(gold_udapi)
-    eval_block.process_document(pred_udapi)
+    # Both F1 and Parsing evaluators need gold_zone
+    eval_block = eval_class(gold_zone=gold_zone, **kwargs)
     
-    # Extract metrics (udapi eval blocks store metrics internally)
-    # This is a simplified version - actual implementation would need to
-    # extract metrics from the eval_block object
-    return {
+    # Process the combined document (contains both gold and predicted trees)
+    eval_block.process_document(combined_udapi)
+    
+    # Extract metrics from eval_block
+    # udapi eval blocks store metrics in different ways depending on the type
+    metrics = {
         "eval_type": eval_type,
-        "note": "Metrics would be extracted from udapi eval_block object",
     }
+    
+    # For Parsing evaluator, extract UAS/LAS from internal counters
+    if eval_type == "parsing":
+        if hasattr(eval_block, 'total') and eval_block.total > 0:
+            if hasattr(eval_block, 'correct_uas'):
+                metrics['uas'] = eval_block.correct_uas / eval_block.total
+            if hasattr(eval_block, 'correct_las'):
+                metrics['las'] = eval_block.correct_las / eval_block.total
+            if hasattr(eval_block, 'correct_ulas'):
+                metrics['ulas'] = eval_block.correct_ulas / eval_block.total
+            metrics['total_nodes'] = eval_block.total
+    
+    # For F1 evaluator, extract token-level metrics
+    elif eval_type == "f1":
+        if hasattr(eval_block, 'correct') and hasattr(eval_block, 'pred') and hasattr(eval_block, 'gold'):
+            # F1 evaluator provides precision, recall, f1 as properties
+            if hasattr(eval_block, 'precision'):
+                metrics['precision'] = eval_block.precision
+            if hasattr(eval_block, 'recall'):
+                metrics['recall'] = eval_block.recall
+            if hasattr(eval_block, 'f1'):
+                metrics['f1'] = eval_block.f1
+            metrics['correct'] = eval_block.correct
+            metrics['predicted'] = eval_block.pred
+            metrics['gold'] = eval_block.gold
+    
+    # Try direct attribute access for common metrics (fallback)
+    for attr in ['uas', 'las', 'upos', 'xpos', 'lemma', 'feats', 'sentences', 'words', 'tokens']:
+        if attr not in metrics and hasattr(eval_block, attr):
+            value = getattr(eval_block, attr)
+            if value is not None:
+                metrics[attr] = value
+    
+    return metrics
 
 
 def list_udapi_features() -> Dict[str, List[str]]:

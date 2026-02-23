@@ -1360,6 +1360,123 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _get_installation_info() -> Dict[str, Any]:
+    """Gather version, location, and source type for the running flexipipe installation."""
+    from pathlib import Path
+    import sys
+
+    info: Dict[str, Any] = {
+        "version": None,
+        "package_location": None,
+        "source_type": None,
+        "source_detail": None,
+        "python_executable": sys.executable,
+        "installer": None,
+        "requires_python": None,
+        "config_dir": None,
+        "models_dir": None,
+    }
+
+    try:
+        version = __import__("flexipipe", fromlist=["__version__"]).__version__
+    except AttributeError:
+        try:
+            from importlib.metadata import version as _v
+            version = _v("flexipipe")
+        except Exception:
+            version = "unknown"
+    info["version"] = version
+
+    try:
+        import flexipipe
+        pkg_path = Path(flexipipe.__file__).resolve().parent
+        info["package_location"] = str(pkg_path)
+        path_str = str(pkg_path)
+        if "site-packages" in path_str or "dist-packages" in path_str:
+            info["source_type"] = "pip"
+            info["source_detail"] = "Installed from PyPI or wheel (standard site-packages)"
+        else:
+            info["source_type"] = "editable"
+            info["source_detail"] = "Editable install (pip install -e .); code loaded from source tree"
+    except Exception:
+        info["package_location"] = None
+        info["source_type"] = "unknown"
+        info["source_detail"] = "Could not determine package location"
+
+    try:
+        from importlib.metadata import distribution
+        d = distribution("flexipipe")
+        if d.metadata.get("Installer"):
+            info["installer"] = d.metadata["Installer"]
+        if not info["installer"]:
+            dist_path_attr = getattr(d, "_path", None)
+            if dist_path_attr:
+                for sys_path in sys.path:
+                    resolved = Path(sys_path).resolve() / dist_path_attr
+                    if resolved.exists():
+                        direct_url_file = resolved / "direct_url.json"
+                        if not direct_url_file.exists() and resolved.is_dir():
+                            for child in resolved.iterdir():
+                                if child.name == "direct_url.json":
+                                    direct_url_file = child
+                                    break
+                        if direct_url_file.exists():
+                            import json
+                            data = json.loads(direct_url_file.read_text())
+                            url = data.get("url") or data.get("vcs_info", {}).get("url")
+                            if url:
+                                if url.startswith("git+"):
+                                    info["source_type"] = "git"
+                                    info["source_detail"] = f"Installed from Git: {url}"
+                                elif url.startswith("file://"):
+                                    info["source_type"] = "editable"
+                                    if not info["source_detail"]:
+                                        info["source_detail"] = f"Editable/local: {url}"
+                                else:
+                                    info["source_detail"] = info["source_detail"] or url
+                        break
+        info["requires_python"] = d.metadata.get("Requires-Python")
+    except Exception:
+        pass
+
+    try:
+        from .model_storage import get_flexipipe_config_dir, get_flexipipe_models_dir
+        info["config_dir"] = str(get_flexipipe_config_dir(create=False))
+        info["models_dir"] = str(get_flexipipe_models_dir(create=False))
+    except Exception:
+        pass
+
+    return info
+
+
+def list_installation(args: argparse.Namespace) -> int:
+    """Show version, installation location, and how flexipipe was installed (pip, editable, git)."""
+    output_format = getattr(args, "output_format", "table")
+    info = _get_installation_info()
+
+    if output_format == "json":
+        print(json.dumps(info, indent=2, ensure_ascii=False), flush=True)
+        return 0
+
+    print("flexipipe installation")
+    print("=" * 50)
+    print(f"  Version:             {info['version']}")
+    print(f"  Package location:     {info['package_location'] or '—'}")
+    print(f"  Source type:          {info['source_type'] or '—'}")
+    print(f"  Source detail:        {info['source_detail'] or '—'}")
+    print(f"  Python executable:    {info['python_executable']}")
+    if info.get("requires_python"):
+        print(f"  Requires-Python:      {info['requires_python']}")
+    if info.get("installer"):
+        print(f"  Installer:            {info['installer']}")
+    if info.get("config_dir"):
+        print(f"  Config directory:     {info['config_dir']}")
+    if info.get("models_dir"):
+        print(f"  Models directory:     {info['models_dir']}")
+    print()
+    return 0
+
+
 def run_info_cli(args: argparse.Namespace) -> int:
     """Run the info subcommand."""
     # Handle --detect-language if provided
@@ -1386,7 +1503,7 @@ def run_info_cli(args: argparse.Namespace) -> int:
     # Require an action if detect-language not used
     if not hasattr(args, "info_action") or not args.info_action:
         print(
-            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, renderers, teitok, sessions, or --detect-language"
+            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, renderers, teitok, sessions, installation, or --detect-language"
         )
         return 1
     
@@ -1408,6 +1525,8 @@ def run_info_cli(args: argparse.Namespace) -> int:
         return list_teitok_settings(args)
     elif args.info_action == "sessions":
         return list_sessions(args)
+    elif args.info_action == "installation":
+        return list_installation(args)
     else:
         print(f"Error: Unknown info action '{args.info_action}'")
         return 1

@@ -2001,11 +2001,23 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,  # Disable prefix matching to prevent --teitok from matching --teitok-settings
     )
+    class VersionAction(argparse.Action):
+        """Print a clean 'flexipipe X.Y.Z' and exit (avoids 'python -m flexipipe' in output)."""
+        def __init__(self, option_strings, version_str, **kwargs):
+            super().__init__(option_strings, **kwargs)
+            self.version_str = version_str
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            print(self.version_str)
+            raise SystemExit(0)
+
     parser.add_argument(
         "--version",
         "-V",
-        action="version",
-        version=f"flexipipe {version}",
+        nargs=0,
+        action=VersionAction,
+        version_str=f"flexipipe {version}",
+        help="Show program version and exit.",
     )
     parser.add_argument(
         "--refresh-cache",
@@ -2683,6 +2695,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: table). Use 'json' for machine-readable output.",
     )
     
+    # info installation
+    installation_parser = info_subparsers.add_parser(
+        "installation",
+        help="Show version, package location, and how flexipipe was installed (pip, editable, git)",
+        parents=[parent_parser],
+    )
+    installation_parser.add_argument(
+        "--output-format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table). Use 'json' for machine-readable output.",
+    )
+    
     # info teitok
     teitok_parser = info_subparsers.add_parser(
         "teitok",
@@ -2876,13 +2901,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     
     # install ---------------------------------------------------------------
-    install_parser = subparsers.add_parser("install", help="Install optional backend dependencies", parents=[parent_parser])
+    install_parser = subparsers.add_parser("install", help="Install optional backend dependencies or the wrapper script", parents=[parent_parser])
     add_logging_args(install_parser)
     install_parser.add_argument(
         "backends",
         nargs="+",
         metavar="BACKEND",
-        help="Backend(s) to install dependencies for (e.g., spacy, stanza, transformers, all)",
+        help="Backend(s) to install (e.g., spacy, udapi, all), or 'wrapper' to install the flexipipe launcher script, or 'update' to upgrade flexipipe",
+    )
+    install_parser.add_argument(
+        "--path",
+        dest="wrapper_path",
+        metavar="DIR",
+        help="For 'flexipipe install wrapper': install the script into DIR (or DIR/flexipipe). Without this, you are prompted.",
     )
     
     # train ---------------------------------------------------------------
@@ -3281,6 +3312,16 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--model",
         help="Model name for --test command (alternative to --models BACKEND=MODEL). Example: --model en_core_news_sm",
+    )
+    benchmark_parser.add_argument(
+        "--use-udapi-eval",
+        action="store_true",
+        help="Use udapi for evaluation (standardized CoNLL metrics). Default: auto-detect (use udapi if available and dependencies are present).",
+    )
+    benchmark_parser.add_argument(
+        "--no-udapi-eval",
+        action="store_true",
+        help="Disable udapi evaluation, use flexipipe native evaluation instead.",
     )
     benchmark_parser.add_argument(
         "--treebank",
@@ -7379,6 +7420,10 @@ def _write_document(
                 cleaned_lines.append(line)
         
         latex_output = '\n'.join(cleaned_lines)
+        
+        # Add helpful comment at the top reminding users to include the package
+        # This comment is safe to add since we've already removed comments from deptext blocks
+        latex_output = '% Make sure to include \\usepackage{tikz-dependency} in your LaTeX document\n' + latex_output
         
         if output:
             Path(output).write_text(latex_output, encoding="utf-8")

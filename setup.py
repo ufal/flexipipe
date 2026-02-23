@@ -287,7 +287,7 @@ class FlexiBuildExt(build_ext):
 
 
 def install_wrapper_script():
-    """Interactive installation of the flexipipe wrapper script."""
+    """Install the flexipipe wrapper script (interactive or via env vars)."""
     import os
     import shutil
     import stat
@@ -296,11 +296,43 @@ def install_wrapper_script():
     # Check for non-interactive mode (for automated installs like from PHP)
     noninteractive = os.environ.get("FLEXIPIPE_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
     quiet_install = os.environ.get("FLEXIPIPE_QUIET_INSTALL", "").lower() in ("1", "true", "yes")
-    
-    if noninteractive or quiet_install:
-        # Skip wrapper script installation in non-interactive mode
+    install_wrapper = os.environ.get("FLEXIPIPE_INSTALL_WRAPPER", "").lower() in ("1", "true", "yes")
+    wrapper_dir = os.environ.get("FLEXIPIPE_WRAPPER_DIR", "").strip()
+    venv_from_env = os.environ.get("FLEXIPIPE_VENV_PATH", "").strip() or None
+
+    # Non-interactive opt-in: install wrapper to FLEXIPIPE_WRAPPER_DIR or ~/bin
+    if install_wrapper:
+        script_source = Path(__file__).parent / "flexipipe" / "data" / "flexipipe_wrapper.sh"
+        if not script_source.exists():
+            script_source = Path(__file__).parent / "scripts" / "flexipipe"
+        if not script_source.exists():
+            print(f"[flexipipe] Wrapper script not found at {script_source}", file=sys.stderr)
+            return
+        install_dir = Path(wrapper_dir).expanduser().resolve() if wrapper_dir else Path.home() / "bin"
+        install_path = install_dir / "flexipipe"
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        script_content = script_source.read_text()
+        if venv_from_env:
+            lines = script_content.split("\n")
+            insert_pos = 0
+            for i, line in enumerate(lines):
+                if line.startswith("# FLEXIPIPE_REPO_PATH") or line.startswith("# Optional: Set path"):
+                    insert_pos = i
+                    break
+            lines.insert(insert_pos, f'VENV_PATH="{venv_from_env}"')
+            script_content = "\n".join(lines)
+        try:
+            install_path.write_text(script_content)
+            install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
+            print(f"[flexipipe] Wrapper script installed to: {install_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[flexipipe] Error installing wrapper script: {e}", file=sys.stderr)
         return
-    
+
+    if noninteractive or quiet_install:
+        # Skip interactive wrapper script installation
+        return
+
     print("\n" + "="*70)
     print("Flexipipe Wrapper Script Installation")
     print("="*70)
@@ -335,10 +367,12 @@ def install_wrapper_script():
         print("You can install it manually later by copying scripts/flexipipe to your PATH.")
         return
     
-    # Determine installation path
-    script_source = Path(__file__).parent / "scripts" / "flexipipe"
+    # Prefer script bundled in package (single source of truth); fall back to repo scripts/
+    script_source = Path(__file__).parent / "flexipipe" / "data" / "flexipipe_wrapper.sh"
     if not script_source.exists():
-        print(f"Error: Wrapper script not found at {script_source}")
+        script_source = Path(__file__).parent / "scripts" / "flexipipe"
+    if not script_source.exists():
+        print(f"Error: Wrapper script not found (tried flexipipe/data/flexipipe_wrapper.sh and scripts/flexipipe)")
         return
     
     if choice == "1":
@@ -415,14 +449,16 @@ class FlexiInstall(install):
         # Run the standard install
         install.run(self)
         
-        # After installation, offer to install wrapper script
-        # Only prompt if running interactively (not in automated builds)
-        # Skip if FLEXIPIPE_NONINTERACTIVE or FLEXIPIPE_QUIET_INSTALL is set
+        # After installation, optionally install wrapper script
+        # - If FLEXIPIPE_INSTALL_WRAPPER=1: install non-interactively to FLEXIPIPE_WRAPPER_DIR or ~/bin
+        # - Else if running interactively: prompt (unless FLEXIPIPE_NONINTERACTIVE or FLEXIPIPE_QUIET_INSTALL)
         import os
+        install_wrapper = os.environ.get("FLEXIPIPE_INSTALL_WRAPPER", "").lower() in ("1", "true", "yes")
         noninteractive = os.environ.get("FLEXIPIPE_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
         quiet_install = os.environ.get("FLEXIPIPE_QUIET_INSTALL", "").lower() in ("1", "true", "yes")
-        
-        if sys.stdin.isatty() and not noninteractive and not quiet_install:
+        prompt_for_wrapper = sys.stdin.isatty() and not noninteractive and not quiet_install
+
+        if install_wrapper or prompt_for_wrapper:
             try:
                 install_wrapper_script()
             except KeyboardInterrupt:
@@ -443,7 +479,11 @@ setup(
     url="https://github.com/yourusername/flexipipe",
     packages=find_packages(),
     package_data={
-        "flexipipe": ["flexitag_py*.so", "flexitag_py*.pyd"],  # Include built flexitag_py module
+        "flexipipe": [
+            "flexitag_py*.so",
+            "flexitag_py*.pyd",
+            "data/flexipipe_wrapper.sh",
+        ],
         "": ["flexitag/build/flexitag_py*.so", "flexitag/build/flexitag_py*.pyd"],  # Include from flexitag/build
     },
     include_package_data=True,

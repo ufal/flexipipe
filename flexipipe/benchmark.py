@@ -140,6 +140,7 @@ class BenchmarkRunner:
         treebank_catalog: Optional[list[dict]] = None,
         download_models: bool = False,
         unicode_normalize: str = "none",
+        use_udapi_eval: Optional[bool] = None,  # None = auto-detect, True = force, False = disable
     ):
         self.storage = storage
         self.treebank_root = treebank_root.expanduser() if treebank_root else None
@@ -151,6 +152,7 @@ class BenchmarkRunner:
         self.dry_run = dry_run
         self.download_models = download_models
         self.unicode_normalize = unicode_normalize
+        self.use_udapi_eval = use_udapi_eval
         self.treebank_catalog = treebank_catalog or self._build_treebank_catalog()
 
     # ------------------------------------------------------------------ discovery
@@ -527,6 +529,7 @@ class BenchmarkRunner:
                     mode=job.mode,
                     create_implicit_mwt=False,
                     unicode_normalize=self.unicode_normalize,
+                    use_udapi_eval=getattr(self, 'use_udapi_eval', None),  # Pass through udapi eval preference
                 )
             except Exception as exc:
                 error_msg = str(exc)
@@ -1714,6 +1717,13 @@ def run_cli(args: argparse.Namespace) -> None:
     unicode_normalize = getattr(args, "unicode_normalize", None)
     if unicode_normalize is None:
         unicode_normalize = get_unicode_normalization()
+    # Determine udapi evaluation preference
+    use_udapi_eval = None  # None = auto-detect
+    if getattr(args, "use_udapi_eval", False):
+        use_udapi_eval = True
+    elif getattr(args, "no_udapi_eval", False):
+        use_udapi_eval = False
+    
     runner = BenchmarkRunner(
         storage,
         treebank_root=treebank_root,
@@ -1724,6 +1734,7 @@ def run_cli(args: argparse.Namespace) -> None:
         treebank_catalog=treebank_catalog,
         download_models=getattr(args, "download_models", False),
         unicode_normalize=unicode_normalize,
+        use_udapi_eval=use_udapi_eval,
     )
     if getattr(args, "export_treebanks", None) is not None:
         export_treebanks = getattr(args, "export_treebanks", None)

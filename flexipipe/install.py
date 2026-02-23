@@ -3,14 +3,140 @@
 from __future__ import annotations
 
 import argparse
+import stat
+import subprocess
 import sys
+from pathlib import Path
 
 from .dependency_utils import _run_pip_install, _module_available
 from .backend_registry import get_backend_choices, get_backend_info
 
 
+def _install_wrapper_script(args: argparse.Namespace) -> int:
+    """Install the flexipipe wrapper script so you can run 'flexipipe' instead of 'python -m flexipipe'."""
+    script_path = Path(__file__).parent / "data" / "flexipipe_wrapper.sh"
+    if not script_path.exists():
+        print("[flexipipe] Wrapper script not found in package (expected at data/flexipipe_wrapper.sh).", file=sys.stderr)
+        return 1
+    script_content = script_path.read_text()
+
+    install_path = getattr(args, "wrapper_path", None)
+    use_sudo = False
+    if install_path:
+        install_path = Path(install_path).expanduser().resolve()
+        if install_path.is_dir():
+            install_path = install_path / "flexipipe"
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        # Prompt interactively
+        print("\nInstall the wrapper script so you can run 'flexipipe' instead of 'python -m flexipipe'.")
+        print("  1. /usr/local/bin (system-wide, may require sudo)")
+        print("  2. ~/bin (user-local; ensure ~/bin is on your PATH)")
+        print("  3. Custom path")
+        print("  4. Cancel")
+        try:
+            choice = input("Choice [1-4] (default: 2): ").strip() or "2"
+        except EOFError:
+            print("[flexipipe] No input; skipping wrapper install.", file=sys.stderr)
+            return 0
+        if choice == "4":
+            return 0
+        if choice == "1":
+            install_path = Path("/usr/local/bin/flexipipe")
+            use_sudo = True
+        elif choice == "2":
+            install_path = Path.home() / "bin" / "flexipipe"
+            install_path.parent.mkdir(parents=True, exist_ok=True)
+            use_sudo = False
+        elif choice == "3":
+            try:
+                custom = input("Enter directory or full path: ").strip()
+            except EOFError:
+                return 0
+            if not custom:
+                return 0
+            install_path = Path(custom).expanduser().resolve()
+            if install_path.is_dir():
+                install_path = install_path / "flexipipe"
+            install_path.parent.mkdir(parents=True, exist_ok=True)
+            use_sudo = False
+        else:
+            print("[flexipipe] Invalid choice.", file=sys.stderr)
+            return 1
+
+    try:
+        if use_sudo:
+            import subprocess
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh") as tmp:
+                tmp.write(script_content)
+                tmp_path = tmp.name
+            result = subprocess.run(["sudo", "cp", tmp_path, str(install_path)], capture_output=True, text=True)
+            Path(tmp_path).unlink(missing_ok=True)
+            if result.returncode != 0:
+                print(f"[flexipipe] Error: {result.stderr or result.stdout}", file=sys.stderr)
+                return 1
+            subprocess.run(["sudo", "chmod", "+x", str(install_path)], check=True)
+        else:
+            install_path.write_text(script_content)
+            install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
+        print(f"[flexipipe] ✓ Wrapper script installed to: {install_path}")
+        if install_path.parent == Path.home() / "bin":
+            print("[flexipipe] Ensure ~/bin is on your PATH (e.g. export PATH=\"$HOME/bin:$PATH\" in ~/.bashrc or ~/.zshrc).")
+        return 0
+    except Exception as e:
+        print(f"[flexipipe] Error installing wrapper: {e}", file=sys.stderr)
+        return 1
+
+
+def _run_self_update(args: argparse.Namespace) -> int:
+    """Upgrade flexipipe to the latest version from PyPI (or reinstall if editable)."""
+    try:
+        from importlib.metadata import distribution, PackageNotFoundError
+        dist = distribution("flexipipe")
+        files = list(dist.files) if dist.files else []
+        is_editable = False
+        if files:
+            try:
+                first_file = files[0]
+                if hasattr(first_file, "locate"):
+                    path_str = str(Path(first_file.locate()).resolve())
+                    if "site-packages" not in path_str and "dist-packages" not in path_str:
+                        is_editable = True
+            except (OSError, ValueError, AttributeError):
+                pass
+    except (ImportError, PackageNotFoundError):
+        is_editable = False
+
+    if is_editable:
+        print("[flexipipe] You appear to be using an editable (development) install.")
+        print("[flexipipe] To update: pull the latest changes, then run 'pip install -e .' in the repo.")
+        return 0
+
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "flexipipe"]
+    if getattr(args, "verbose", False):
+        cmd.append("-v")
+    print(f"[flexipipe] Running: {' '.join(cmd)}")
+    try:
+        subprocess.check_call(cmd)
+        import importlib
+        importlib.invalidate_caches()
+        print("[flexipipe] ✓ flexipipe updated. Restart the shell or run 'flexipipe --version' to confirm.")
+        return 0
+    except subprocess.CalledProcessError as e:
+        print(f"[flexipipe] Upgrade failed: {e}", file=sys.stderr)
+        return 1
+
+
 def run_install(args: argparse.Namespace) -> int:
-    """Install optional backend dependencies."""
+    """Install optional backend dependencies or the wrapper script."""
+    # Special case: install wrapper script (flexipipe install wrapper [--path DIR])
+    if len(args.backends) == 1 and args.backends[0].lower() == "wrapper":
+        return _install_wrapper_script(args)
+    # Special case: upgrade flexipipe (flexipipe install update)
+    if len(args.backends) == 1 and args.backends[0].lower() == "update":
+        return _run_self_update(args)
+
     # Map backend names to their extra names (for pip install flexipipe[extra])
     BACKEND_TO_EXTRA = {
         "fasttext": "fasttext",

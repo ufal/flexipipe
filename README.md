@@ -16,11 +16,11 @@ The CLI centers around several workflows:
 | `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
 | `python -m flexipipe info` | List backends, models, examples, tasks, languages, or renderers |
 | `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
-| `python -m flexipipe install` | Install optional backend dependencies (e.g., `flexipipe install udkanbun`, `flexipipe install udapi`) |
+| `python -m flexipipe install` | Install optional backend dependencies (e.g., `flexipipe install udkanbun`, `flexipipe install udapi`), or `flexipipe install wrapper` for the launcher script, or `flexipipe install update` to upgrade flexipipe |
 
-Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`, 
-`python -m flexipipe info examples`, `python -m flexipipe info tasks`, `python -m flexipipe info languages`, or `python -m flexipipe info renderers` to explore
-available integrations, models, example texts, supported tasks, languages, and SVG renderers.
+Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`,
+`python -m flexipipe info examples`, `python -m flexipipe info tasks`, `python -m flexipipe info languages`, `python -m flexipipe info renderers`, or `python -m flexipipe info installation` to explore
+available integrations, models, example texts, supported tasks, languages, SVG renderers, and installation details (version, source type, paths).
 
 ---
 
@@ -120,6 +120,23 @@ FLEXIPIPE_QUIET_INSTALL=1 pip install git+https://github.com/ufal/flexipipe.git
 ```
 
 This will skip the wrapper script installation prompt and install silently with defaults.
+
+### Optional: Install a `flexipipe` wrapper script
+
+You can run the CLI as `flexipipe` (instead of `python -m flexipipe`) by installing a small wrapper script that switches to the right virtual environment and invokes the module.
+
+- **During `pip install`**: If you run `pip install` interactively (and do not set `FLEXIPIPE_NONINTERACTIVE` or `FLEXIPIPE_QUIET_INSTALL`), you will be **asked** whether to install the wrapper and where (e.g. `/usr/local/bin`, `~/bin`, or a custom path). You can skip (default) or choose a location.
+- **Anytime after install**: Run `flexipipe install wrapper`; you will be prompted for the install location, or pass a path directly:
+  ```bash
+  flexipipe install wrapper                    # prompts: 1=/usr/local/bin, 2=~/bin, 3=custom, 4=cancel
+  flexipipe install wrapper --path ~/bin       # install to ~/bin/flexipipe
+  flexipipe install wrapper --path /usr/local/bin   # install to /usr/local/bin/flexipipe (may need sudo)
+  ```
+- **Non-interactive / CI**: Set `FLEXIPIPE_INSTALL_WRAPPER=1` (and optionally `FLEXIPIPE_WRAPPER_DIR` or `FLEXIPIPE_VENV_PATH`) when running `pip install` to install the wrapper without prompting.
+
+To upgrade flexipipe to the latest version from PyPI, run `flexipipe install update`. (If you use an editable install, it will remind you to pull and run `pip install -e .` in the repo.)
+
+Ensure the chosen directory is on your `PATH`. Then you can run `flexipipe --version`, `flexipipe process ...`, etc. The version output will show `flexipipe 0.1.0` (or your installed version) without the `python -m flexipipe` prefix.
 
 ### Optional Extras Behaviour
 
