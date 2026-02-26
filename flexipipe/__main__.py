@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 
 # Single source for --version output; release script updates this and __init__.py.
-_VERSION = "0.3.6"
+_VERSION = "0.3.7"
 
 # Handle --version / -V before any other imports (no I/O, no heavy modules).
 if "--version" in sys.argv or "-V" in sys.argv:
@@ -12,6 +12,12 @@ if "--version" in sys.argv or "-V" in sys.argv:
     sys.exit(0)
 
 from ._cli_router import run
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for console_scripts (setup.py entry_points)."""
+    return run(argv)
+
 
 if __name__ == "__main__":
     raise SystemExit(run())

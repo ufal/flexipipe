@@ -54,3 +54,7 @@ Rerunning preserves splits by `sent_id`. Handles missing sections.
 * **`--verbose`**: High-level progress and evaluation summaries.
 * For troubleshooting, **`--debug`** (on `process` and `benchmark`) enables: curl-style REST payloads, tokenization diff samples, backend logs. Not shown in main help; for developer use.
 * `tmp/` directories can hold per-run artifacts for inspection.
+
+---
+
+↑ [Documentation index](README.md) · [Home](Home.md) · [Installation](Installation.md) · [Quick Start](Quick-Start.md) · [Backends](Backends.md) · [Contributing](Contributing.md)

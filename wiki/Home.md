@@ -35,8 +35,8 @@ Use `flexipipe info backends`, `flexipipe info models --backend <name>`, etc. to
 
 ## Wiki pages
 
-* [Installation](Installation) — requirements, pip install, wrapper, optional extras, language detection
-* [Quick Start](QuickStart.md) — tagging, benchmarking, training, configuration examples
-* [Backends](Backends) — backend overview table, Transformers backend details
-* [Reference](Reference) — input/output formats, NER, MWT, info commands, convert, evaluation tips
-* [Contributing](Contributing) — project layout, development notes
+* [Installation](Installation.md) — requirements, pip install, wrapper, optional extras, language detection
+* [Quick Start](Quick-Start.md) — tagging, benchmarking, training, configuration examples
+* [Backends](Backends.md) — backend overview table, Transformers backend details
+* [Reference](Reference.md) — input/output formats, NER, MWT, info commands, convert, evaluation tips
+* [Contributing](Contributing.md) — project layout, development notes

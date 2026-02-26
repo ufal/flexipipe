@@ -19,3 +19,7 @@ Third-party C++ dependencies (pugixml, rapidjson) are fetched via CMake FetchCon
 * The transformers backend is fully implemented with model discovery and metadata. Training hooks exist for flexitag and some neural backends.
 
 Please open issues or discussions for missing features, incomplete documentation, or new backend ideas.
+
+---
+
+↑ [Documentation index](README.md) · [Home](Home.md) · [Installation](Installation.md) · [Quick Start](Quick-Start.md) · [Backends](Backends.md) · [Reference](Reference.md)

@@ -74,3 +74,7 @@ flexipipe config --set-language-detector none
 ```
 
 The wizard (`flexipipe config --wizard`) asks which detector to use. Download fastText model: `flexipipe config --download-language-model`.
+
+---
+
+↑ [Documentation index](README.md) · [Home](Home.md) · [Quick Start](Quick-Start.md) · [Backends](Backends.md) · [Reference](Reference.md) · [Contributing](Contributing.md)
