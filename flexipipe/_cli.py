@@ -341,7 +341,7 @@ def _parse_tasks_argument(value: Optional[str]) -> set[str]:
         token = raw.strip().lower()
         if not token:
             continue
-        canonical = _TASK_LOOKUP.get(token)
+        canonical = TASK_LOOKUP.get(token)
         if not canonical:
             raise ValueError(f"Unknown task '{raw}'. Valid tasks: {', '.join(TASK_DEFAULTS)}")
         tasks.add(canonical)
@@ -2058,6 +2058,11 @@ def build_parser() -> argparse.ArgumentParser:
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parent_parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     parent_parser.add_argument("--verbose", action="store_true", help="Print high-level progress messages")
+    parent_parser.add_argument(
+        "--api",
+        action="store_true",
+        help="Emit a machine-readable JSON status summary on stdout (for API integration).",
+    )
     
     def add_logging_args(p: argparse.ArgumentParser) -> None:
         # --debug and --verbose are now in parent_parser, so we don't add them here
@@ -2116,6 +2121,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument("--input", default=None, help="Input file (TEITOK XML, CoNLL-U, or raw text). If not provided and STDIN has data, reads from STDIN.")
     process_parser.add_argument(
+        "input_file",
+        nargs="?",
+        default=None,
+        metavar="FILE",
+        help="Input file (optional; same as --input). Omit to read from STDIN.",
+    )
+    process_parser.add_argument(
         "--output",
         default=None,
         help="Output file (omit to write to stdout)",
@@ -2134,6 +2146,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--language",
+        "--lang",
+        dest="language",
         default=None,
         help="Language code for blank model (e.g., 'en', 'es')",
     )
@@ -2330,6 +2344,12 @@ def build_parser() -> argparse.ArgumentParser:
              "Defaults to all tasks.",
     )
     process_parser.add_argument(
+        "--strip-tags",
+        type=str,
+        help="Comma/space-separated list of tasks whose annotations should be removed from the result "
+             "(e.g., 'parse,normalize' to drop parse/normalization while preserving other layers).",
+    )
+    process_parser.add_argument(
         "--data",
         nargs="+",
         metavar="TEXT",
@@ -2367,6 +2387,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="Update the original TEITOK XML file in-place (only works when input and output are TEITOK XML). Preserves original structure and only updates annotation attributes.",
+    )
+    process_parser.add_argument(
+        "--writeback-insert-sentences",
+        action="store_true",
+        help="When using writeback on XML that had no <s> elements: insert <s> elements using sentence boundaries from the backend (e.g. UDPipe). Only applies when the original file had tokens but no sentences.",
     )
     process_parser.add_argument(
         "--tokenize",
@@ -4039,11 +4064,29 @@ def run_tag(args: argparse.Namespace) -> int:
     auto_selected = False
     teitok_settings_obj: Optional[TeitokSettings] = None
 
+    # Parse tasks as requested by the user (for header/reporting),
+    # before adding mandatory defaults. If --tasks was not provided,
+    # leave header_tasks_for_run as None so downstream code can fall
+    # back to heuristic detection.
+    raw_tasks_arg = getattr(args, "tasks", None)
     try:
-        requested_tasks = _parse_tasks_argument(getattr(args, "tasks", None))
+        requested_tasks = _parse_tasks_argument(raw_tasks_arg)
     except ValueError as exc:
         print(f"[flexipipe] {exc}", file=sys.stderr)
         return 1
+    header_tasks_for_run: Optional[set[str]] = None
+    if raw_tasks_arg is not None:
+        header_tasks_for_run = set(requested_tasks)
+
+    # Optional: strip specific annotation layers from the result document
+    strip_tasks: set[str] = set()
+    strip_arg = getattr(args, "strip_tags", None)
+    if strip_arg:
+        try:
+            strip_tasks = _parse_tasks_argument(strip_arg)
+        except ValueError as exc:
+            print(f"[flexipipe] {exc}", file=sys.stderr)
+            return 1
     mandatory_missing = TASK_MANDATORY - requested_tasks
     if mandatory_missing:
         if args.verbose or args.debug:
@@ -4636,14 +4679,25 @@ def run_tag(args: argparse.Namespace) -> int:
         else:
             # Check if file has tokens
             from .teitok import teitok_has_tokens, extract_teitok_plain_text
-            from .teitok import teitok_has_tokens, extract_teitok_plain_text
             has_tokens = teitok_has_tokens(args.input)
             
             if not has_tokens:
-                if not args.tokenize:
+                # Allow either explicit --tokenize or a tasks list that includes 'tokenize'
+                wants_tokenize = bool(getattr(args, "tokenize", False))
+                try:
+                    if not wants_tokenize:
+                        raw_tasks = getattr(args, "tasks", None)
+                        if raw_tasks is not None:
+                            requested_for_header = _parse_tasks_argument(raw_tasks)
+                            wants_tokenize = "tokenize" in requested_for_header
+                except Exception:
+                    # Fall back to requiring --tokenize on parse errors
+                    pass
+
+                if not wants_tokenize:
                     print(
                         f"Error: TEITOK XML file '{args.input}' has no <tok> elements. "
-                        f"Use --tokenize to enable tokenization mode.",
+                        f"Use --tokenize or include 'tokenize' in --tasks to enable tokenization mode.",
                         file=sys.stderr
                     )
                     return 1
@@ -5199,7 +5253,7 @@ def run_tag(args: argparse.Namespace) -> int:
             )
             # CLI flag has highest priority, but if TEITOK file has tokens, warn if trying to use raw text
             use_raw_text_cli = getattr(args, "use_raw_text", False)
-            if use_raw_text_cli and has_existing_tokens:
+            if use_raw_text_cli and has_existing_tokens and (args.verbose or args.debug):
                 print(
                     "[flexipipe] WARNING: --use-raw-text is set but TEITOK file has existing tokens. "
                     "The backend will retokenize the text, which may cause token misalignment with existing XML tokens. "
@@ -5214,6 +5268,18 @@ def run_tag(args: argparse.Namespace) -> int:
             )
             if backend_type_lower == "udmorph":
                 use_raw_text = True
+            # If the file already has tokens and the user did not request tokenize, use
+            # pretokenized mode so the backend does not retokenize. Otherwise we send
+            # reconstructed text, the backend retokenizes (possibly with different spacing,
+            # e.g. "senátuStále" -> "senátu Stále"), and writeback alignment fails.
+            if has_existing_tokens and "tokenize" not in requested_tasks and use_raw_text:
+                use_raw_text = False
+                if args.verbose or args.debug:
+                    print(
+                        "[flexipipe] Using pretokenized mode (tokenize not in --tasks); "
+                        "preserving existing tokenization for writeback.",
+                        file=sys.stderr
+                    )
             # Set create_implicit_mwt flag in document.meta so backend can use it when parsing CoNLL-U
             create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
             if create_implicit_mwt:
@@ -5553,6 +5619,16 @@ def run_tag(args: argparse.Namespace) -> int:
         # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
         # But defer this until we know if we're in writeback mode and updating existing tokens
         output_doc = result.document
+        # Record which tasks were requested for this run (as provided by the user),
+        # so downstream consumers (e.g. TEITOK header writer) can report what was
+        # asked for rather than inferring tasks from whatever annotations happen
+        # to be present. If the user did not provide --tasks, leave this unset so
+        # the header can fall back to heuristic detection.
+        try:
+            if header_tasks_for_run is not None:
+                output_doc.meta["_requested_tasks_for_run"] = sorted(header_tasks_for_run)
+        except Exception:
+            pass
         validator_source_doc = output_doc
         
         # Apply tag mapping if requested
@@ -5618,6 +5694,23 @@ def run_tag(args: argparse.Namespace) -> int:
                     direction_text = ", ".join(direction_desc) or "nothing"
                     print(f"[flexipipe] tag mapping ({direction_text}) updated {changes} tokens")
         
+        # Apply task-based filtering: keep only annotations for requested tasks,
+        # then drop any explicitly stripped tasks (if --strip-tags was used).
+        try:
+            from .task_registry import TASK_DESCRIPTIONS
+            # Start from requested tasks (already includes mandatory tasks).
+            keep_tasks = set(requested_tasks)
+            if strip_tasks:
+                keep_tasks -= strip_tasks
+            # Only pass known/recognized tasks to the filter.
+            known_tasks = set(TASK_DESCRIPTIONS.keys())
+            keep_tasks &= known_tasks
+            if keep_tasks:
+                _filter_document_by_tasks(output_doc, keep_tasks)
+        except Exception:
+            # Filtering is best-effort; never fail the pipeline because of it.
+            pass
+
         validator_source_doc = output_doc
         
         # Check if writeback should be used
@@ -5753,6 +5846,18 @@ def run_tag(args: argparse.Namespace) -> int:
                     # Determine if this was processed from raw text
                     # Check if use_raw_text was used (stored in document metadata)
                     processed_from_raw = output_doc.meta.get("_processed_from_raw_text", False)
+                    # Decide whether to insert <s> elements on writeback.
+                    # If the original TEITOK XML had tokens but no <s>, and the user
+                    # requested segmentation, auto-enable sentence insertion so that
+                    # backend sentence boundaries are reflected in the XML.
+                    auto_insert_sentences = getattr(args, "writeback_insert_sentences", False)
+                    if not auto_insert_sentences:
+                        # Safely check document metadata populated by load_teitok
+                        meta = getattr(output_doc, "meta", {}) or {}
+                        tokens_only_xml = bool(meta.get("_teitok_tokens_only_xml"))
+                        if tokens_only_xml and "segment" in requested_tasks:
+                            auto_insert_sentences = True
+                    
                     update_teitok(
                         output_doc,
                         str(target_writeback_path),
@@ -5761,6 +5866,8 @@ def run_tag(args: argparse.Namespace) -> int:
                         from_raw_text=processed_from_raw,
                         strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
                         unicode_normalization=output_unicode_normalize,
+                        insert_sentences=auto_insert_sentences,
+                        verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
                     )
                     if args.verbose or args.debug:
                         target = str(target_writeback_path) if not output_path else output_path
@@ -7530,6 +7637,11 @@ def main(argv: list[str] | None = None) -> int:
             pass
         raise
 
+    # When using "process", optional positional input_file sets args.input if --input was not given
+    if getattr(args, "task", None) == "process" and getattr(args, "input_file", None) is not None:
+        if getattr(args, "input", None) is None:
+            args.input = args.input_file
+
     # Global debug banner
     if getattr(args, "debug", False):
         print("[flexipipe] Running in debugging mode.", file=sys.stderr)
@@ -7556,7 +7668,30 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("No task specified. Use one of: " + ", ".join(TASK_CHOICES))
 
     if args.task == "process":
-        return run_tag(args)
+        rc = run_tag(args)
+        # In API mode, always emit a simple JSON status summary on stdout.
+        # Detailed human-readable messages (including errors) continue to go
+        # to stderr as usual.
+        if getattr(args, "api", False):
+            import json as _json
+            status = "ok" if rc == 0 else "error"
+            summary = {
+                "status": status,
+                "task": "process",
+                "backend": getattr(args, "backend", None),
+                "model": getattr(args, "model", None),
+                "language": getattr(args, "language", None),
+                "input": getattr(args, "input", None),
+                "output": getattr(args, "output", None),
+                "writeback": bool(getattr(args, "writeback", False)),
+                "exit_code": rc,
+            }
+            try:
+                print(_json.dumps(summary, ensure_ascii=False))
+            except Exception:
+                # Best effort; never break the CLI if JSON serialization fails
+                pass
+        return rc
     if args.task == "train":
         return run_train(args)
     if args.task == "convert":

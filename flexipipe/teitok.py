@@ -734,6 +734,40 @@ def _fix_duplicate_ids(root: ET.Element) -> None:
                 tok_node.set("id", new_tokid)
 
 
+def _remove_duplicate_tok_nodes(root: ET.Element) -> None:
+    """
+    Remove duplicate <tok> and <s> nodes so each id appears once (keep first in document order).
+    Call after _fix_duplicate_ids so duplicate ids have been renamed; this removes the
+    renamed duplicate nodes from the tree to avoid duplicate content in the output.
+    """
+    parent_map: Dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+    seen_tokids: Set[str] = set()
+    seen_sent_ids: Set[str] = set()
+    to_remove: List[ET.Element] = []
+    for node in root.iter():
+        if node.tag.endswith("}tok") or node.tag == "tok":
+            tokid = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
+            if tokid:
+                if tokid in seen_tokids:
+                    to_remove.append(node)
+                else:
+                    seen_tokids.add(tokid)
+        elif node.tag.endswith("}s") or node.tag == "s":
+            sent_id = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
+            if sent_id:
+                if sent_id in seen_sent_ids:
+                    to_remove.append(node)
+                else:
+                    seen_sent_ids.add(sent_id)
+    for node in to_remove:
+        parent = parent_map.get(node)
+        if parent is not None:
+            parent.remove(node)
+
+
 def _load_teitok_with_mappings(
     path: str,
     *,
@@ -820,9 +854,18 @@ def _load_teitok_with_mappings(
     parent_map: Dict[ET.Element, ET.Element] = {}
     _build_parent_map(root, parent_map)
     
-    # Find all sentence elements
+    # Build global id -> token element map so we can resolve <s sameAs="#w-15 #w-16 ...">
+    id_to_tok: Dict[str, ET.Element] = {}
+    for node in root.iter():
+        if node.tag.endswith("}tok") or node.tag == "tok":
+            tid = node.get("id") or node.get(f"{XML_NS}id") or node.get("xml:id") or ""
+            if tid:
+                id_to_tok[tid] = node
+    
+    # Find all sentence elements (with or without namespace, e.g. TEI)
     sentence_counter = 1
-    for s_elem in root.findall(".//s"):
+    s_elems = root.findall(".//{*}s") or root.findall(".//s")
+    for s_elem in s_elems:
         xml_sent_id = s_elem.get("id") or s_elem.get(f"{XML_NS}id", "") or ""
         sent_id_attr = s_elem.get("sent_id", "")
         assigned_id = xml_sent_id or sent_id_attr
@@ -845,9 +888,19 @@ def _load_teitok_with_mappings(
         )
         
         token_id = 1
-        # Get all token elements recursively (including those inside <name> elements)
-        # We need to find all tokens within the sentence, not just direct children
-        tok_elements = s_elem.findall(".//tok")
+        # Get token elements: from sameAs/corresp (sentence references tokens elsewhere) or from children
+        # Older TEITOK uses corresp; which attribute is used can be in settings.xml
+        ref_attr = s_elem.get("sameAs") or s_elem.get("sameas") or s_elem.get("corresp") or ""
+        from_same_as = False
+        if ref_attr and id_to_tok:
+            # Parse "#w-15 #w-16 #w-17" -> list of token elements in order
+            ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split()]
+            ref_ids = [i for i in ref_ids if i]
+            tok_elements = [id_to_tok[tid] for tid in ref_ids if tid in id_to_tok]
+            from_same_as = len(tok_elements) > 0
+        if not from_same_as:
+            # Get all token elements recursively (including those inside <name> elements)
+            tok_elements = s_elem.findall(".//{*}tok") or s_elem.findall(".//tok")
         
         # Build a map of token elements to their containing <name> elements
         # This will help us extract entity information
@@ -898,81 +951,59 @@ def _load_teitok_with_mappings(
                 form = (tok_elem.text or "").strip()
             
             # Infer space_after from XML structure
-            # Check if there's any whitespace (XML whitespace, not spaces inside tags) between
-            # the current token and the next token, regardless of where it appears in the structure.
-            # This handles cases like:
-            # - <tok>X</tok> <tok>Y</tok> (space in tail of first tok)
-            # - <name><tok>X</tok></name> <tok>Y</tok> (space in tail of name)
-            # - <name><tok>X</tok> <tok>Y</tok></name> <tok>Z</tok> (X has no space, Y has space from name's tail)
-            # - <name><tok>X</tok></name><s> <tok>Y</tok></s> (space in text of <s> element)
-            space_after = False
-            if tok_idx < len(tok_elements) - 1:
-                next_tok_elem = tok_elements[tok_idx + 1]
-                
-                # Helper function to check if a string contains whitespace
-                def has_whitespace(s: str) -> bool:
-                    return bool(s and (s.strip() or s[0].isspace()))
-                
-                # Check all possible locations for whitespace between current and next token:
-                
-                # 1. Tail of current token (text after </tok>)
-                if has_whitespace(tok_elem.tail or ""):
-                    space_after = True
-                
-                # 2. Walk up the parent chain from current token and check tails
-                if not space_after:
-                    p = parent_map.get(tok_elem)
-                    while p is not None and p != s_elem:
-                        if has_whitespace(p.tail or ""):
-                            space_after = True
-                            break
-                        p = parent_map.get(p)
-                
-                # 3. Check elements between current and next token in sentence's children
-                # Find the outermost parent elements that are direct children of the sentence
-                if not space_after:
-                    current_parent = parent_map.get(tok_elem)
-                    next_parent = parent_map.get(next_tok_elem)
+            # When sentence uses sameAs, tokens live elsewhere so use only each token's tail.
+            if from_same_as:
+                tail = tok_elem.tail or ""
+                space_after = bool(tok_idx < len(tok_elements) - 1 and tail and any(c.isspace() for c in tail))
+            else:
+                # Check if there's any whitespace between current and next token in the structure.
+                # Handles: <tok>X</tok> <tok>Y</tok>, <name><tok>X</tok></name> <tok>Y</tok>, etc.
+                space_after = False
+                if tok_idx < len(tok_elements) - 1:
+                    next_tok_elem = tok_elements[tok_idx + 1]
                     
-                    # Walk up to find the outermost parent that's a direct child of the sentence
-                    current_outermost = current_parent
-                    while current_outermost is not None and parent_map.get(current_outermost) != s_elem:
-                        current_outermost = parent_map.get(current_outermost)
+                    def has_whitespace(s: str) -> bool:
+                        return bool(s and (s.strip() or s[0].isspace()))
                     
-                    next_outermost = next_parent
-                    while next_outermost is not None and parent_map.get(next_outermost) != s_elem:
-                        next_outermost = parent_map.get(next_outermost)
-                    
-                    # If both are direct children, check elements between them
-                    if current_outermost is not None and next_outermost is not None:
-                        try:
-                            current_pos = all_children.index(current_outermost)
-                            next_pos = all_children.index(next_outermost)
-                            for i in range(current_pos + 1, next_pos):
-                                node = all_children[i]
-                                # Skip comments
-                                if callable(node.tag) or (hasattr(node.tag, '__name__') and 'Comment' in str(node.tag)):
-                                    continue
-                                # Check text content of intermediate elements (e.g., <s> <tok>Y</tok></s>)
-                                if hasattr(node, 'text') and has_whitespace(node.text or ""):
-                                    space_after = True
-                                    break
-                                # Check tail of intermediate elements
-                                if hasattr(node, 'tail') and has_whitespace(node.tail or ""):
-                                    space_after = True
-                                    break
-                        except (ValueError, AttributeError):
-                            pass
-                    
-                    # Also check if next token's parent has text before the token
-                    # (e.g., <s> <tok>Y</tok></s> where space is in <s>'s text)
-                    if not space_after and next_parent is not None:
-                        # Check if the next token is the first child of its parent
-                        # and if the parent has text before it
-                        parent_children = list(next_parent)
-                        if parent_children and parent_children[0] == next_tok_elem:
-                            if has_whitespace(next_parent.text or ""):
+                    if has_whitespace(tok_elem.tail or ""):
+                        space_after = True
+                    if not space_after:
+                        p = parent_map.get(tok_elem)
+                        while p is not None and p != s_elem:
+                            if has_whitespace(p.tail or ""):
                                 space_after = True
+                                break
+                            p = parent_map.get(p)
+                    if not space_after and all_children:
+                        current_parent = parent_map.get(tok_elem)
+                        next_parent = parent_map.get(next_tok_elem)
+                        current_outermost = current_parent
+                        while current_outermost is not None and parent_map.get(current_outermost) != s_elem:
+                            current_outermost = parent_map.get(current_outermost)
+                        next_outermost = next_parent
+                        while next_outermost is not None and parent_map.get(next_outermost) != s_elem:
+                            next_outermost = parent_map.get(next_outermost)
+                        if current_outermost is not None and next_outermost is not None:
+                            try:
+                                current_pos = all_children.index(current_outermost)
+                                next_pos = all_children.index(next_outermost)
+                                for i in range(current_pos + 1, next_pos):
+                                    node = all_children[i]
+                                    if callable(node.tag) or (hasattr(node.tag, '__name__') and 'Comment' in str(node.tag)):
+                                        continue
+                                    if hasattr(node, 'text') and has_whitespace(node.text or ""):
+                                        space_after = True
+                                        break
+                                    if hasattr(node, 'tail') and has_whitespace(node.tail or ""):
+                                        space_after = True
+                                        break
+                            except (ValueError, AttributeError):
+                                pass
+                        if not space_after and next_parent is not None:
+                            parent_children = list(next_parent)
+                            if parent_children and parent_children[0] == next_tok_elem:
+                                if has_whitespace(next_parent.text or ""):
+                                    space_after = True
             
             # Get other attributes with mappings
             # Only fall back to form/innerText if "form" is explicitly in the attribute list
@@ -1195,25 +1226,159 @@ def _load_teitok_with_mappings(
             )
             sentence.entities.append(entity)
         
-        # Reconstruct sentence text if missing, using actual spacing from XML
-        if not sentence.text:
+        # Sentence text: use exact character sequence from XML when tokens are under this <s>;
+        # when sentence uses sameAs, tokens live elsewhere so build from form+space_after.
+        if tok_elements and not from_same_as:
+            xml_parts = [s_elem.text or ""]
+            for te in tok_elements:
+                xml_parts.append(te.text or "")
+                xml_parts.append(te.tail or "")
+            sentence.text = "".join(xml_parts).strip()
+        elif sentence.tokens:
             parts = []
             for tok in sentence.tokens:
                 parts.append(tok.form)
                 if tok.space_after:
                     parts.append(" ")
             sentence.text = "".join(parts).strip()
+        elif not sentence.text:
+            pass
         else:
-            # If sentence.text exists (from @text attribute), use it to refine space_after values
-            # This allows @text to override XML structure if it's more accurate
+            # sentence.text from @text but no tokens: use it to refine space_after if we get tokens later
             temp_doc = Document(id="", sentences=[sentence])
             _infer_space_after_from_text(temp_doc)
-            # But still set last token to None
             if sentence.tokens:
                 sentence.tokens[-1].space_after = None
         
         document.sentences.append(sentence)
         sentence_counter += 1
+    
+    # If no <s> elements but we have <tok> elements, create sentence(s) from those tokens.
+    # Many TEITOK files have tokenized text without sentence boundaries; we group by block (p/div) or use one sentence.
+    if not document.sentences:
+        all_tok_elems = [n for n in root.iter() if n.tag.endswith("}tok") or n.tag == "tok"]
+        if all_tok_elems:
+            def _block_parent(tok_elem: ET.Element) -> ET.Element:
+                """Innermost ancestor that is p, div, body, or text; else root."""
+                p = parent_map.get(tok_elem)
+                block_tags = ("p", "div", "body", "text")
+                while p is not None and p != root:
+                    local = p.tag.split("}")[-1] if "}" in str(p.tag) else p.tag
+                    if local in block_tags:
+                        return p
+                    p = parent_map.get(p)
+                return root
+
+            sent_counter = 1
+            prev_block: Optional[ET.Element] = None
+            current_sentence: Optional[Sentence] = None
+            current_sentence_tok_elems: List[ET.Element] = []
+            global_tok_id = 1
+            for tok_elem in all_tok_elems:
+                form_attr = tok_elem.get("form", "")
+                if form_attr == "--":
+                    continue
+                block = _block_parent(tok_elem)
+                if block != prev_block:
+                    if current_sentence is not None:
+                        if current_sentence.tokens:
+                            current_sentence.tokens[-1].space_after = None
+                            if not current_sentence.text and current_sentence_tok_elems:
+                                # Exact text from XML so spacing matches the file
+                                xml_parts = [prev_block.text or ""]
+                                for te in current_sentence_tok_elems:
+                                    xml_parts.append(te.text or "")
+                                    xml_parts.append(te.tail or "")
+                                current_sentence.text = "".join(xml_parts).strip()
+                            elif not current_sentence.text:
+                                current_sentence.text = "".join(
+                                    t.form + (" " if t.space_after else "") for t in current_sentence.tokens
+                                ).strip()
+                        document.sentences.append(current_sentence)
+                    sent_id = f"s-{sent_counter}"
+                    sent_counter += 1
+                    current_sentence = Sentence(id=sent_id, sent_id=sent_id, source_id=sent_id, text="", tokens=[], attrs={})
+                    current_sentence_tok_elems = []
+                    prev_block = block
+
+                form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or (tok_elem.text or "").strip()
+                if not form:
+                    continue
+                tokid = tok_elem.get("id") or tok_elem.get(f"{XML_NS}id", "")
+                lemma = _get_attr_value_with_fallback(tok_elem, lemma_attrs, fallback_to_text=("form" in lemma_attrs))
+                if not lemma and "form" in lemma_attrs:
+                    lemma = form
+                xpos = _get_attr_value_with_fallback(tok_elem, xpos_attrs)
+                upos = _get_attr_value_with_fallback(tok_elem, ["upos"])
+                feats = _get_attr_value_with_fallback(tok_elem, ["feats"])
+                reg = _get_attr_value_with_fallback(tok_elem, reg_attrs, fallback_to_text=("form" in reg_attrs)) or (form if "form" in reg_attrs else "")
+                expan = _get_attr_value_with_fallback(tok_elem, expan_attrs, fallback_to_text=("form" in expan_attrs)) or (form if "form" in expan_attrs else "")
+                mod = _get_attr_value_with_fallback(tok_elem, ["mod"])
+                trslit = _get_attr_value_with_fallback(tok_elem, ["trslit"])
+                ltrslit = _get_attr_value_with_fallback(tok_elem, ["ltrslit"])
+                head_str = tok_elem.get("head", "")
+                head = int(head_str) if head_str and head_str.isdigit() else 0
+                deprel = tok_elem.get("deprel", "")
+                deps = tok_elem.get("deps", "")
+                misc = tok_elem.get("misc", "")
+                tok_attrs: Dict[str, str] = {}
+                if head_str and not head_str.isdigit():
+                    tok_attrs["head_tokid"] = head_str
+                for key, value in tok_elem.attrib.items():
+                    if key not in {"form", "lemma", "xpos", "upos", "feats", "reg", "expan", "mod", "trslit", "ltrslit", "id", "head", "deprel", "deps", "misc", f"{XML_NS}id"}:
+                        tok_attrs[key] = value
+                # Preserve space between tokens: tail " " must yield space_after=True (bool(" ".strip()) is False!)
+                tail = tok_elem.tail or ""
+                space_after = bool(tail and any(c.isspace() for c in tail))
+                subtokens = []
+                for dtok_elem in tok_elem.findall("dtok") or tok_elem.findall("{*}dtok"):
+                    if dtok_elem.get("form", "") == "--":
+                        continue
+                    dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or (dtok_elem.text or "").strip()
+                    subtokens.append(SubToken(id=len(subtokens) + 1, form=dtok_form, lemma="", xpos="", upos="", feats="", reg="", expan="", space_after=False, attrs={}))
+                token = Token(
+                    id=global_tok_id,
+                    form=form,
+                    lemma=lemma or "",
+                    xpos=xpos or "",
+                    upos=upos or "",
+                    feats=feats or "",
+                    reg=reg or "",
+                    expan=expan or "",
+                    mod=mod or "",
+                    trslit=trslit or "",
+                    ltrslit=ltrslit or "",
+                    tokid=tokid or None,
+                    head=head,
+                    deprel=deprel or "",
+                    deps=deps or "",
+                    misc=misc or "",
+                    is_mwt=len(subtokens) > 0,
+                    subtokens=subtokens,
+                    space_after=space_after,
+                    attrs=tok_attrs,
+                )
+                if subtokens:
+                    token.mwt_start = global_tok_id
+                    token.mwt_end = global_tok_id + len(subtokens) - 1
+                    token.parts = [st.form for st in subtokens]
+                global_tok_id += len(subtokens) if subtokens else 1
+                if current_sentence is not None:
+                    current_sentence.tokens.append(token)
+                    current_sentence_tok_elems.append(tok_elem)
+            if current_sentence is not None and current_sentence.tokens:
+                current_sentence.tokens[-1].space_after = None
+                if not current_sentence.text and current_sentence_tok_elems and prev_block is not None:
+                    xml_parts = [prev_block.text or ""]
+                    for te in current_sentence_tok_elems:
+                        xml_parts.append(te.text or "")
+                        xml_parts.append(te.tail or "")
+                    current_sentence.text = "".join(xml_parts).strip()
+                elif not current_sentence.text:
+                    current_sentence.text = "".join(
+                        t.form + (" " if t.space_after else "") for t in current_sentence.tokens
+                    ).strip()
+                document.sentences.append(current_sentence)
     
     # Post-process: convert head from tokid to ord if needed
     # Build tokid -> ord mapping for all tokens
@@ -1233,6 +1398,17 @@ def _load_teitok_with_mappings(
                     token.head = head_ord
                 # Remove the temporary head_tokid from attrs
                 del token.attrs["head_tokid"]
+    
+    # Record basic TEITOK structure metadata for later writeback decisions
+    try:
+        has_s_elements = bool(root.findall(".//{*}s") or root.findall(".//s"))
+        has_tok_elements = bool(root.findall(".//{*}tok") or root.findall(".//tok"))
+    except Exception:
+        has_s_elements = False
+        has_tok_elements = False
+    document.meta["_teitok_has_s_elements"] = has_s_elements
+    document.meta["_teitok_has_tok_elements"] = has_tok_elements
+    document.meta["_teitok_tokens_only_xml"] = bool(has_tok_elements and not has_s_elements)
     
     assign_doc_id_from_path(document, path)
     _apply_sentence_correspondence(document)
@@ -1644,50 +1820,62 @@ def _verify_character_level_alignment(
     import sys
     import re
     
-    # Reconstruct text from XML tokens (original) - use @text attribute from <s> nodes if available
-    # Match sentences by ID to ensure correct order
+    # Reconstruct text from XML tokens (original) - use @text from <s> or tokens (including sameAs)
     xml_text_parts = []
     
-    # Build a mapping of sentence IDs to sentence nodes
-    sentid_to_xml_node = {}
-    for s_node in xml_root.iter():
-        if s_node.tag.endswith("}s") or s_node.tag == "s":
-            sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id") or s_node.get("sent_id")
+    # Build sentence ID -> s node and tok id -> tok node
+    sentid_to_xml_node: Dict[str, ET.Element] = {}
+    id_to_tok: Dict[str, ET.Element] = {}
+    for node in xml_root.iter():
+        if node.tag.endswith("}s") or node.tag == "s":
+            sent_id = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id") or node.get("sent_id")
             if sent_id:
-                sentid_to_xml_node[sent_id] = s_node
+                sentid_to_xml_node[sent_id] = node
+        elif node.tag.endswith("}tok") or node.tag == "tok":
+            tid = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id") or node.get("xml:id") or ""
+            if tid:
+                id_to_tok[tid] = node
     
-    # Process sentences in document order (match by sentence ID from document)
-    # In raw text mode, we should compare sentence text directly (from @text attributes)
-    # rather than reconstructing from tokens, since the backend retokenizes and may change spacing
     for sent_idx, sent in enumerate(document.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = sentid_to_xml_node.get(sent_id) if sent_id else None
         
         if s_node is not None:
-            # First try to use sentence text attribute (most accurate, especially in raw text mode)
             sent_text = s_node.get("text", "")
             if sent_text:
                 xml_text_parts.append(sent_text)
-                # Add space between sentences (except last one)
                 if sent_idx < len(document.sentences) - 1:
                     xml_text_parts.append(" ")
             else:
-                # Fallback: reconstruct from tokens
-                # In raw text mode, spacing may differ due to retokenization, but we still need to reconstruct
-                sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                # Reconstruct from tokens: sameAs/corresp or children/descendants
+                # Insert space between sentences (e.g. across <p> boundaries) so XML text matches backend
+                if sent_idx > 0:
+                    xml_text_parts.append(" ")
+                ref_attr = s_node.get("sameAs") or s_node.get("sameas") or s_node.get("corresp") or ""
+                if ref_attr and id_to_tok:
+                    ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
+                    sent_tok_nodes = [id_to_tok[tid] for tid in ref_ids if tid in id_to_tok]
+                else:
+                    sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                    if not sent_tok_nodes:
+                        sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
                 for tok_idx, tok_node in enumerate(sent_tok_nodes):
-                    # Get form from text content or @form attribute
                     form = (tok_node.text or "").strip() or tok_node.get("form", "")
                     if form:
                         xml_text_parts.append(form)
-                        # Check SpaceAfter attribute
-                        space_after = tok_node.get("SpaceAfter", "Yes")
-                        # Don't add space after last token of last sentence
-                        if space_after and space_after.lower() != "no":
-                            if not (sent_idx == len(document.sentences) - 1 and tok_idx == len(sent_tok_nodes) - 1):
+                        is_last = sent_idx == len(document.sentences) - 1 and tok_idx == len(sent_tok_nodes) - 1
+                        if not is_last:
+                            tail = tok_node.tail or ""
+                            if tail and any(c.isspace() for c in tail):
                                 xml_text_parts.append(" ")
+                            else:
+                                space_after = tok_node.get("SpaceAfter", "Yes")
+                                if space_after and space_after.lower() != "no":
+                                    xml_text_parts.append(" ")
         else:
-            # If no matching XML node, reconstruct from document tokens
+            # No matching XML s_node: use backend tokens; still need space between sentences
+            if sent_idx > 0:
+                xml_text_parts.append(" ")
             for token_idx, token in enumerate(sent.tokens):
                 if token.form:
                     xml_text_parts.append(token.form)
@@ -1695,14 +1883,6 @@ def _verify_character_level_alignment(
                         xml_text_parts.append(" ")
     
     xml_text = "".join(xml_text_parts)
-    
-    # In raw text mode, normalize whitespace more aggressively since backend may change spacing
-    if from_raw_text:
-        # Remove all spaces around punctuation for comparison
-        xml_text_normalized = re.sub(r'\s*([.,!?;:])\s*', r'\1', xml_text)
-        xml_text_normalized = re.sub(r'\s+', ' ', xml_text_normalized.strip())
-    else:
-        xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
     
     # Reconstruct text from backend output (document) - use sentence text if available
     backend_text_parts = []
@@ -1735,13 +1915,18 @@ def _verify_character_level_alignment(
     
     backend_text = "".join(backend_text_parts)
     
-    # In raw text mode, normalize whitespace more aggressively since backend may change spacing
+    # Normalize for comparison. In raw text mode, treat punctuation/quote spacing as equivalent
+    # (e.g. ", " vs ",jen" with SpaceAfter=No; or ."To vs ." To after closing quote).
     if from_raw_text:
-        backend_text = re.sub(r'\s*([.,!?;:])\s*', r'\1', backend_text)
-    
-    # Normalize whitespace for comparison (collapse multiple spaces to single space, trim)
-    xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
-    backend_text_normalized = re.sub(r'\s+', ' ', backend_text.strip())
+        # Remove optional spaces around punctuation and quotes so both sides compare equal
+        _punct_quote = r"[.,!?;:\"']"
+        xml_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", xml_text)
+        xml_text_normalized = re.sub(r"\s+", " ", xml_text_normalized.strip())
+        backend_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", backend_text)
+        backend_text_normalized = re.sub(r"\s+", " ", backend_text_normalized.strip())
+    else:
+        xml_text_normalized = re.sub(r"\s+", " ", xml_text.strip())
+        backend_text_normalized = re.sub(r"\s+", " ", backend_text.strip())
     
     # Compare character-by-character
     if xml_text_normalized == backend_text_normalized:
@@ -1783,6 +1968,7 @@ def _add_change_to_tei_header(
     root: ET.Element,
     change_text: str,
     change_when: Optional[str] = None,
+    tasks: Optional[str] = None,
 ) -> None:
     """
     Add a <change> element to the <revisionDesc> in the TEI header.
@@ -1796,25 +1982,68 @@ def _add_change_to_tei_header(
         from datetime import datetime
         change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    # Find or create teiHeader
+    # NOTE: update_teitok may parse XML with either lxml.etree or xml.etree.ElementTree.
+    # We MUST NOT call xml.etree.ElementTree.SubElement on an lxml element, or vice versa.
+    # To stay type-safe, always create new elements using the correct factory:
+    # - lxml.etree.Element when root is an lxml element
+    # - xml.etree.ElementTree.Element otherwise
+    try:
+        # Detect if this is an lxml element
+        is_lxml = root.__class__.__module__.startswith("lxml")
+    except Exception:
+        is_lxml = False
+
+    if is_lxml:
+        try:
+            from lxml import etree as _LET  # type: ignore
+            ElementFactory = _LET.Element
+        except Exception:
+            # Fallback to stdlib ElementTree if lxml import unexpectedly fails
+            import xml.etree.ElementTree as _ET  # type: ignore
+            ElementFactory = _ET.Element
+    else:
+        import xml.etree.ElementTree as _ET  # type: ignore
+        ElementFactory = _ET.Element
+
+    # Find or create teiHeader (non-namespaced; TEITOK headers are usually flat)
     tei_header = root.find("teiHeader")
     if tei_header is None:
-        tei_header = ET.Element("teiHeader")
+        tei_header = ElementFactory("teiHeader")
         # Insert at the beginning (before <text>)
         root.insert(0, tei_header)
     
     # Find or create revisionDesc
     revision_desc = tei_header.find("revisionDesc")
     if revision_desc is None:
-        revision_desc = ET.SubElement(tei_header, "revisionDesc")
-    
+        revision_desc = ElementFactory("revisionDesc")
+        tei_header.append(revision_desc)
+
+    # If the latest existing <change> already has the same tasks and text,
+    # avoid adding another identical entry (prevents no-op cycles from
+    # cluttering the header when rerunning the same step).
+    if len(revision_desc):
+        last_change = None
+        # Find last element child named "change"
+        for child in reversed(list(revision_desc)):
+            tag_local = child.tag.split("}")[-1] if "}" in str(child.tag) else child.tag
+            if tag_local == "change":
+                last_change = child
+                break
+        if last_change is not None:
+            last_tasks = last_change.get("tasks", "")
+            last_text = (last_change.text or "").strip()
+            if (tasks or "") == last_tasks and (change_text or "").strip() == last_text:
+                return
+
     # Add change element
-    change_elem = ET.SubElement(
-        revision_desc,
-        "change",
-        {"when": change_when, "who": "flexipipe"},
-    )
+    change_attrs = {"when": change_when, "who": "flexipipe"}
+    # In TEITOK style, also store tasks as an attribute for downstream tools
+    # (machine-readable), in addition to the textual description.
+    if tasks:
+        change_attrs["tasks"] = tasks
+    change_elem = ElementFactory("change", change_attrs)
     change_elem.text = change_text
+    revision_desc.append(change_elem)
 
 
 def update_teitok(
@@ -1826,6 +2055,8 @@ def update_teitok(
     from_raw_text: bool = False,
     strict_alignment: bool = True,
     unicode_normalization: Optional[str] = None,
+    insert_sentences: bool = False,
+    verbose: bool = False,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
@@ -1843,9 +2074,9 @@ def update_teitok(
                       If False, expects 1:1 token alignment (pretokenized mode).
         strict_alignment: If True, refuse to write if alignment cannot be verified (default: True).
                          If False, allow partial alignment with warnings.
-    
-    Raises:
-        RuntimeError: If strict_alignment=True and alignment cannot be verified (too many mismatches).
+        insert_sentences: If True and the XML had no <s> elements (tokens-only), insert <s> elements
+                         using sentence boundaries from the document (e.g. from UDPipe).
+        verbose: If True, print token mismatch and alignment summary to stderr.
     """
     try:
         from lxml import etree as ET
@@ -1868,6 +2099,9 @@ def update_teitok(
     else:
         tree = ET.parse(str(original_path_obj))
         root = tree.getroot()
+    
+    # Remove duplicate <tok>/<s> nodes (same id) so each id appears once; keep first in document order
+    _remove_duplicate_tok_nodes(root)
     
     # Build ID mappings: tokid -> XML node, sent_id -> XML node
     tokid_to_node: Dict[str, ET.Element] = {}
@@ -1970,6 +2204,9 @@ def update_teitok(
             if tokid:
                 tokid_to_node[tokid] = dtok_node
     
+    # When XML has no <s> elements but has <tok> (tokens-only), we will match by tokid in the first pass below
+    tokens_only_mode = bool(not sentid_to_node and tokid_to_node)
+    
     # Update nodes from tagged Document
     sanitized = _sanitize_document(document)
     matched_tokens = 0
@@ -2030,6 +2267,13 @@ def update_teitok(
                 pass
     
     # Pre-assign tokids to all tokens that don't have them yet
+    # Ensure every token has an id (backends may omit it in raw-text mode), so we can assign tokids and match in tokens_only_mode
+    global_ord = 1
+    for sent in sanitized.sentences:
+        for token in sent.tokens:
+            if not token.id:
+                token.id = global_ord
+            global_ord += 1
     for sent in sanitized.sentences:
         for token in sent.tokens:
             if token.id and not token.tokid:
@@ -2039,6 +2283,14 @@ def update_teitok(
             # Build initial mapping
             if token.id and token.tokid:
                 global_ord_to_tokid[token.id] = token.tokid
+    
+    if tokens_only_mode:
+        for sent_idx, sent in enumerate(sanitized.sentences):
+            for token_idx, token in enumerate(sent.tokens):
+                if token.tokid:
+                    tok_node = tokid_to_node.get(token.tokid)
+                    if tok_node is not None:
+                        global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
     
     for sent_idx, sent in enumerate(sanitized.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
@@ -2052,12 +2304,30 @@ def update_teitok(
         if s_node is None and sent_idx < len(sentence_nodes_ordered):
             s_node = sentence_nodes_ordered[sent_idx]
         
-        if s_node is None:
+        if s_node is None and not tokens_only_mode:
             continue  # Skip for now, will handle in main loop
+        if tokens_only_mode:
+            continue  # Already filled global_token_to_tok_node by tokid; skip s_node matching
         
         # Match tokens to XML nodes and build mapping
-        # Only get direct <tok> children, not all descendants (performance optimization)
-        sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+        # Get tok nodes: direct children or from sameAs/corresp (sentence references tokens elsewhere)
+        attrs_to_try = getattr(settings, "sentence_tokref_attributes", None) if settings else None
+        if not attrs_to_try:
+            attrs_to_try = ["sameAs", "sameas", "corresp"]
+        ref_attr = ""
+        for a in attrs_to_try:
+            v = s_node.get(a)
+            if v:
+                ref_attr = v
+                break
+        if ref_attr and tokid_to_node:
+            ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
+            sent_tok_nodes = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
+        else:
+            sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+            if not sent_tok_nodes:
+                # Include tokens from descendants (e.g. inside <name>)
+                sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
         
         # Build form-based index for smart alignment (for raw text mode with splits/joins)
         # Track which XML nodes have been matched to avoid double-matching
@@ -2657,23 +2927,31 @@ def update_teitok(
             s_node = sentence_nodes_ordered[sent_idx]
         
         if s_node is None:
-            # Sentence not found - skip
-            skipped_sentences += 1
-            continue
+            # Sentence node not found in XML.
+            # Some backends can introduce empty trailing sentences (e.g. from extra newlines).
+            # Do not count sentences with no real tokens against alignment.
+            if not tokens_only_mode:
+                has_real_tokens = any((not is_comment_line_token(t)) for t in sent.tokens)
+                if not has_real_tokens:
+                    continue
+                skipped_sentences += 1
+                continue
+            # tokens_only_mode: no <s> in XML; still update tokens by tokid
         matched_sentences += 1
         
-        # Ensure sentence has an ID - assign one if missing
-        if not s_node.get("id") and not s_node.get("{http://www.w3.org/XML/1998/namespace}id"):
-            # Generate sentence ID
-            sent_id = f"s-{sent_idx + 1}"
-            s_node.set("id", sent_id)
-            sentid_to_node[sent_id] = s_node
+        # Ensure sentence has an ID - assign one if missing (only when we have an s_node)
+        if s_node is not None:
+            if not s_node.get("id") and not s_node.get("{http://www.w3.org/XML/1998/namespace}id"):
+                # Generate sentence ID
+                sent_id = f"s-{sent_idx + 1}"
+                s_node.set("id", sent_id)
+                sentid_to_node[sent_id] = s_node
         
-        # Update sentence-level attributes if needed
-        if sent.text and not s_node.get("text"):
-            s_node.set("text", sent.text)
-        if sent.corr and not s_node.get("corr"):
-            s_node.set("corr", sent.corr)
+            # Update sentence-level attributes if needed
+            if sent.text and not s_node.get("text"):
+                s_node.set("text", sent.text)
+            if sent.corr and not s_node.get("corr"):
+                s_node.set("corr", sent.corr)
         
         # Update tokens using pre-built mapping
         # Track which XML nodes have been updated and which backend tokens are part of splits
@@ -2684,10 +2962,11 @@ def update_teitok(
             tok_node = global_token_to_tok_node.get((sent_idx, token_idx))
             if tok_node is None:
                 skipped_tokens += 1
-                # Debug output for mismatched tokens
-                import sys
-                sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s-{sent_idx+1}"
-                print(f"[flexipipe] update_teitok: Token mismatch - sent {sent_idx+1} (id={sent_id_str}), token {token_idx+1} (ord={token.id}, tokid={token.tokid}, form='{token.form}') has no matching XML node", file=sys.stderr)
+                # Debug output for mismatched tokens (only when verbose)
+                if verbose:
+                    import sys
+                    sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s-{sent_idx+1}"
+                    print(f"[flexipipe] update_teitok: Token mismatch - sent {sent_idx+1} (id={sent_id_str}), token {token_idx+1} (ord={token.id}, tokid={token.tokid}, form='{token.form}') has no matching XML node", file=sys.stderr)
                 continue
             
             # Check if this backend token is part of a split sequence (will be handled as dtok)
@@ -2782,13 +3061,15 @@ def update_teitok(
             
             if not is_split:
                 # Not a split token - set attributes normally on <tok>
-                # Only write @form if it's different from inner text or if there are children
-                if token.form:
-                    if has_children or token.form != inner_text:
-                        tok_node.set("form", _normalize_annotation_attr(token.form, unicode_normalization))
-                    elif tok_node.get("form") and token.form == inner_text:
-                        # Remove @form if it matches inner text and there are no children
-                        tok_node.attrib.pop("form", None)
+                # In tokens_only_mode preserve original XML form (do not overwrite with backend); only add lemma, xpos, etc.
+                if not tokens_only_mode:
+                    # Only write @form if it's different from inner text or if there are children
+                    if token.form:
+                        if has_children or token.form != inner_text:
+                            tok_node.set("form", _normalize_annotation_attr(token.form, unicode_normalization))
+                        elif tok_node.get("form") and token.form == inner_text:
+                            # Remove @form if it matches inner text and there are no children
+                            tok_node.attrib.pop("form", None)
                 
                 # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
                 ord_val = token.attrs.get("ord") or (str(token.id) if token.id else "")
@@ -3259,8 +3540,11 @@ def update_teitok(
     token_match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
     
     # Determine if alignment is acceptable
-    # For pretokenized mode (from_raw_text=False), we require near-perfect alignment (1:1 mapping)
-    # For raw text mode (from_raw_text=True), we allow some flexibility but still need reasonable alignment
+    # For pretokenized mode (from_raw_text=False), we require near-perfect alignment (1:1 mapping).
+    # For raw text mode (from_raw_text=True), we allow some flexibility but still need reasonable
+    # alignment – with one important exception: if token alignment is perfect, we accept the
+    # alignment even when sentence boundaries differ (common with NER-only or punctuation splits).
+    perfect_token_alignment = (total_tokens > 0 and token_match_rate >= 0.999 and skipped_tokens == 0)
     if from_raw_text:
         # Raw text mode: allow some token splitting/merging, but still need >80% alignment
         min_sentence_rate = 0.95  # 95% of sentences must match
@@ -3273,12 +3557,12 @@ def update_teitok(
         mode_str = "pretokenized"
     
     alignment_acceptable = (
-        sentence_match_rate >= min_sentence_rate and
-        token_match_rate >= min_token_rate
+        (sentence_match_rate >= min_sentence_rate and token_match_rate >= min_token_rate)
+        or (from_raw_text and perfect_token_alignment)
     )
     
-    # Print alignment summary
-    if skipped_tokens > 0 or skipped_sentences > 0 or not alignment_acceptable:
+    # Print alignment summary (only when verbose or when there were skips/failures)
+    if verbose or skipped_tokens > 0 or skipped_sentences > 0 or not alignment_acceptable:
         if skipped_sentences > 0:
             # Show what IDs we have vs what we're looking for
             doc_sent_ids = [f"{s.sent_id or s.id or s.source_id or 'NO_ID'}" for s in sanitized.sentences]
@@ -3293,6 +3577,11 @@ def update_teitok(
     char_alignment_valid, char_error_msg = _verify_character_level_alignment(
         sanitized, root, global_token_to_tok_node, from_raw_text
     )
+    
+    # In raw-text mode, if character-level comparison passes (after punctuation/quote normalization),
+    # treat alignment as acceptable even when token match rate is low (e.g. punctuation attached vs separate).
+    if from_raw_text and char_alignment_valid:
+        alignment_acceptable = True
     
     # Refuse to write if alignment is unacceptable and strict_alignment is enabled
     if strict_alignment and not alignment_acceptable:
@@ -3328,6 +3617,91 @@ def update_teitok(
             file=sys.stderr
         )
     
+    # When original XML had no <s> and --writeback-insert-sentences: wrap tok nodes in <s> using backend sentence boundaries
+    if insert_sentences and tokens_only_mode and sanitized.sentences and all_tok_nodes:
+        # Map each tok node to its sentence index
+        node_to_sent: Dict[ET.Element, int] = {}
+        for (sent_idx, token_idx), node in global_token_to_tok_node.items():
+            node_to_sent[node] = sent_idx
+        # Group consecutive tok nodes in document order by sentence
+        groups: List[Tuple[int, List[ET.Element]]] = []
+        current_sent: Optional[int] = None
+        current_list: List[ET.Element] = []
+        for node in all_tok_nodes:
+            sent_idx = node_to_sent.get(node)
+            if sent_idx is None:
+                continue
+            if sent_idx != current_sent:
+                if current_list:
+                    groups.append((current_sent, current_list))
+                current_sent = sent_idx
+                current_list = [node]
+            else:
+                current_list.append(node)
+        if current_list:
+            groups.append((current_sent, current_list))
+        # Strategy 1: If all tok nodes share the same parent, wrap each group in an <s> and move toks into it
+        if groups:
+            parent = get_parent(groups[0][1][0])
+            same_parent = parent is not None and all(
+                get_parent(node) is parent for _, tok_list in groups for node in tok_list
+            )
+            if same_parent:
+                for sent_idx, tok_list in groups:
+                    sent = sanitized.sentences[sent_idx] if sent_idx < len(sanitized.sentences) else None
+                    sent_id = f"s-{sent_idx + 1}"
+                    # Build sentence text from token forms and space_after so spacing is correct
+                    if sent and sent.tokens:
+                        sent_text = "".join(
+                            t.form + (" " if (t.space_after and i < len(sent.tokens) - 1) else "")
+                            for i, t in enumerate(sent.tokens)
+                        ).strip()
+                    else:
+                        sent_text = sent.text if sent and sent.text else ""
+                    s_elem = ET.Element("s")
+                    s_elem.set("id", sent_id)
+                    if sent_text:
+                        s_elem.set("text", sent_text)
+                    idx = list(parent).index(tok_list[0])
+                    parent.insert(idx, s_elem)
+                    for tok in tok_list:
+                        s_elem.append(tok)
+            else:
+                # Strategy 2: Tokens have different parents - insert empty <s> with @corresp pointing to token IDs (TEITOK convention)
+                for sent_idx, tok_list in groups:
+                    sent = sanitized.sentences[sent_idx] if sent_idx < len(sanitized.sentences) else None
+                    sent_id = f"s-{sent_idx + 1}"
+                    # Build sentence text from token forms and space_after so spacing is correct
+                    if sent and sent.tokens:
+                        sent_text = "".join(
+                            t.form + (" " if (t.space_after and i < len(sent.tokens) - 1) else "")
+                            for i, t in enumerate(sent.tokens)
+                        ).strip()
+                    else:
+                        sent_text = sent.text if sent and sent.text else ""
+                    corresp_ids = []
+                    for tok in tok_list:
+                        tid = tok.get("id") or tok.get("{http://www.w3.org/XML/1998/namespace}id")
+                        if tid:
+                            corresp_ids.append(f"#{tid}")
+                    if not corresp_ids:
+                        continue
+                    s_elem = ET.Element("s")
+                    s_elem.set("id", sent_id)
+                    if sent_text:
+                        s_elem.set("text", sent_text)
+                    s_elem.set("corresp", " ".join(corresp_ids))
+                    first_tok = tok_list[0]
+                    insert_parent = get_parent(first_tok)
+                    if insert_parent is not None:
+                        try:
+                            insert_idx = list(insert_parent).index(first_tok)
+                        except ValueError:
+                            insert_idx = 0
+                        insert_parent.insert(insert_idx, s_elem)
+                    else:
+                        root.append(s_elem)
+    
     # Add change element to TEI header
     # Extract change information from document metadata
     from datetime import datetime
@@ -3350,30 +3724,40 @@ def update_teitok(
     change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
     
     # Detect performed tasks
-    tasks = set()
-    if document.meta.get("_tokenized", False):
-        tasks.add("tokenize")
-    if document.meta.get("_segmented", False):
-        tasks.add("segment")
-    if any(t.lemma for s in document.sentences for t in s.tokens):
-        tasks.add("lemmatize")
-    if any(t.xpos or t.upos for s in document.sentences for t in s.tokens):
-        tasks.add("tag")
-    if any(t.head for s in document.sentences for t in s.tokens):
-        tasks.add("parse")
-    # NER is stored in sentence.entities, not on tokens
-    if getattr(document, "spans", None) and document.spans.get("ner"):
-        tasks.add("ner")
-    elif any(s.entities for s in document.sentences):
-        tasks.add("ner")
-    # Normalization is detected from various token attributes
-    if any(t.reg or t.expan or t.mod or t.trslit or t.ltrslit or t.corr or t.lex or (t.misc and t.misc != "_") for s in document.sentences for t in s.tokens):
-        tasks.add("normalize")
+    # Prefer tasks explicitly requested for this run (stored in document.meta)
+    # so the revision header reflects what the user asked for, not everything
+    # that happens to be present afterwards.
+    meta_tasks = document.meta.get("_requested_tasks_for_run")
+    if isinstance(meta_tasks, (list, tuple, set)):
+        tasks = set(str(t) for t in meta_tasks)
+    else:
+        tasks = set()
+        if document.meta.get("_tokenized", False):
+            tasks.add("tokenize")
+        if document.meta.get("_segmented", False):
+            tasks.add("segment")
+        if any(t.lemma for s in document.sentences for t in s.tokens):
+            tasks.add("lemmatize")
+        if any(t.xpos or t.upos for s in document.sentences for t in s.tokens):
+            tasks.add("tag")
+        if any(t.head for s in document.sentences for t in s.tokens):
+            tasks.add("parse")
+        # NER is stored in sentence.entities, not on tokens
+        if getattr(document, "spans", None) and document.spans.get("ner"):
+            tasks.add("ner")
+        elif any(s.entities for s in document.sentences):
+            tasks.add("ner")
+        # Normalization is detected from explicit normalization attributes only
+        # (reg/expan/mod/trslit/ltrslit/corr/lex). SpaceAfter and other layout flags
+        # in MISC are NOT treated as normalization.
+        if any(t.reg or t.expan or t.mod or t.trslit or t.ltrslit or t.corr or t.lex
+               for s in document.sentences for t in s.tokens):
+            tasks.add("normalize")
     
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
     change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
     
-    _add_change_to_tei_header(root, change_text, change_when)
+    _add_change_to_tei_header(root, change_text, change_when, tasks_summary_str)
     
     # Write updated XML
     if preserve_comments:

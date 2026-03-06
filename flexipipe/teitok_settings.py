@@ -92,6 +92,9 @@ class TeitokSettings:
         self.defined_token_attributes: Set[str] = set()
         self.form_hierarchy: Dict[str, Optional[str]] = {}  # form_name -> parent_form_name (None for base)
         self.default_form: str = "form"  # Default form attribute name
+        # Attribute names to try on <s> for "sentence references these token IDs" (sameAs vs corresp)
+        # Order: first non-empty wins. Older TEITOK uses corresp.
+        self.sentence_tokref_attributes: List[str] = ["sameAs", "sameas", "corresp"]
     
     @classmethod
     def load(cls, settings_path: Path) -> TeitokSettings:
@@ -387,6 +390,27 @@ class TeitokSettings:
                 if text_value in TRUTHY_VALUES:
                     self.use_raw_text = True
         
+        # sentence-tokref: attribute name(s) on <s> for token-ID list (sameAs vs corresp; order tried)
+        sentence_tokref_value = (
+            flexipipe_elem.get("sentence-tokref")
+            or flexipipe_elem.get("sentence_tokref")
+        )
+        if sentence_tokref_value:
+            names = [n.strip() for n in sentence_tokref_value.split() if n.strip()]
+            if names:
+                # Prefer listed names first, then add any default not already present
+                default_order = ["sameAs", "sameas", "corresp"]
+                self.sentence_tokref_attributes = names + [a for a in default_order if a not in names]
+        else:
+            tokref_elem = flexipipe_elem.find("sentence-tokref") or flexipipe_elem.find("sentence_tokref")
+            if tokref_elem is not None:
+                text_value = (tokref_elem.text or tokref_elem.get("value") or "").strip()
+                if text_value:
+                    names = [n.strip() for n in text_value.split() if n.strip()]
+                    if names:
+                        default_order = ["sameAs", "sameas", "corresp"]
+                        self.sentence_tokref_attributes = names + [a for a in default_order if a not in names]
+
         # download-model
         download_model_value = (
             flexipipe_elem.get("download-model")
