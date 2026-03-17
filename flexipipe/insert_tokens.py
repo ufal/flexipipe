@@ -31,6 +31,78 @@ except ImportError:
     from flexipipe.doc import Document, Token, Sentence
 
 
+def _teitok_local_tag(elem: ET.Element) -> str:
+    """Local tag name (no namespace)."""
+    t = elem.tag
+    if not isinstance(t, str):
+        return ""
+    return t.split("}")[-1].lower()
+
+
+def _teitok_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
+    """Build parent map for all elements under root."""
+    pm: Dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            pm[child] = parent
+    return pm
+
+
+def _teitok_move_tokens_into_s(root: ET.Element, block_elements_set: Set[str]) -> None:
+    """
+    Move following siblings into each <s> until next <s> or block (per xmltokenize.pl).
+    Ensures tokens end up inside <s>...</s> for indexing and sameAs.
+    """
+    parent_map = _teitok_parent_map(root)
+    for s in list(root.iter()):
+        if _teitok_local_tag(s) != "s":
+            continue
+        parent = parent_map.get(s)
+        if parent is None:
+            continue
+        children = list(parent)
+        try:
+            i = children.index(s)
+        except ValueError:
+            continue
+        to_move: List[ET.Element] = []
+        for j in range(i + 1, len(children)):
+            c = children[j]
+            tag = _teitok_local_tag(c)
+            if tag == "s" or tag in block_elements_set:
+                break
+            to_move.append(c)
+        for c in to_move:
+            parent.remove(c)
+            s.append(c)
+
+
+def _teitok_set_sameas_on_s(root: ET.Element) -> None:
+    """Set sameAs on each <s> to #first_tok_id for CQP/indexing."""
+    for s in root.iter():
+        if _teitok_local_tag(s) != "s":
+            continue
+        first_tok = None
+        for n in s.iter():
+            if _teitok_local_tag(n) == "tok":
+                first_tok = n
+                break
+        if first_tok is not None:
+            tok_id = first_tok.get("id") or first_tok.get("{http://www.w3.org/XML/1998/namespace}id")
+            if tok_id:
+                s.set("sameAs", "#" + tok_id)
+
+
+def _teitok_set_form_deleted(root: ET.Element) -> None:
+    """Set form=\"--\" for every <tok> inside <del> (deleted words; -- = no form, not indexed in CQP)."""
+    for elem in root.iter():
+        if _teitok_local_tag(elem) != "del":
+            continue
+        for tok in elem.iter():
+            if _teitok_local_tag(tok) == "tok":
+                tok.set("form", "--")
+
+
 def insert_tokens_into_teitok(
     document: Document,
     original_path: str,
@@ -40,14 +112,24 @@ def insert_tokens_into_teitok(
     block_elements: Optional[List[str]] = None,
     extract_elements: Optional[List[str]] = None,
     settings: Optional[Any] = None,
+    use_minidom_rebuild: bool = False,
+    use_string_rebuild: bool = False,
+    use_teitok_rebuild: bool = False,
 ) -> None:
     """
     Insert tokens and sentences into a non-tokenized TEITOK XML file.
-    
-    This function uses a standoff representation approach:
+
     1. Extract plain text with standoff markup
     2. Map tokens/sentences to character positions
     3. Rebuild XML with <s> and <tok> elements inserted at correct positions
+
+    Rebuild engine (one of):
+    - default: in-place lxml/ET (standoff).
+    - use_minidom_rebuild: minidom, text as #text nodes (no .tail).
+    - use_string_rebuild: serialize block to string (spacing already correct),
+      map plaintext positions to XML positions with a simple scan, insert tags,
+      re-parse. No .tail handling and no regex for XML structure.
+    - use_teitok_rebuild: Python port of TEITOK's xmltokenize.pl (regex/line-based).
     """
     # Set defaults
     if block_elements is None:
@@ -60,7 +142,113 @@ def insert_tokens_into_teitok(
         raise FileNotFoundError(f"Original TEITOK file not found: {original_path}")
     
     output_path_obj = Path(output_path) if output_path else original_path_obj
-    
+
+    # TEITOK-style engine: string/regex tokenizer (port of xmltokenize.pl)
+    if use_teitok_rebuild:
+        from .insert_tokens_teitok import tokenize_teitok_style
+        from .teitok import _add_change_to_tei_header
+        from datetime import datetime
+        raw_xml = original_path_obj.read_text(encoding="utf-8")
+        notok = "|".join(extract_elements) if extract_elements else "note|desc|gap|pb|fw|rdg"
+        tokenized = tokenize_teitok_style(
+            raw_xml,
+            text_tag="text",
+            block_elements=block_elements,
+            notok_elements=notok,
+            split_sentences=True,
+            keep_ns=False,
+        )
+        # Parse tokenized XML and merge backend token attributes (lemma, upos, etc.)
+        # Pass bytes so the parser accepts the encoding declaration (Unicode + declaration raises)
+        root = ET.fromstring(tokenized.encode("utf-8"))
+        block_elements_set = {e.lower() for e in (block_elements or [])}
+        # DOM move: put following siblings into each <s> until next <s> or block (per xmltokenize.pl)
+        _teitok_move_tokens_into_s(root, block_elements_set)
+        # sameAs on <s>: point to first token id for CQP/indexing
+        _teitok_set_sameas_on_s(root)
+        # All <tok> in document order (handle optional namespace)
+        def _is_tok(elem: ET.Element) -> bool:
+            t = elem.tag
+            if t == "tok":
+                return True
+            return isinstance(t, str) and t.endswith("}tok")
+        tok_elems = [e for e in root.iter() if _is_tok(e)]
+        backend_tokens = [t for s in document.sentences for t in s.tokens]
+        if tok_elems and backend_tokens:
+            def _resolve_attr(internal: str) -> str:
+                if settings:
+                    return getattr(settings, "resolve_xml_attribute", lambda a, **kw: a)(internal, default=internal) or internal
+                return internal
+            def _set_attr_teitok(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
+                target = _resolve_attr(internal_attr)
+                if value and value != "_":
+                    node.set(target, value)
+                elif default_empty:
+                    node.attrib.pop(target, None)
+            ord_to_tokid: Dict[int, str] = {}
+            n = min(len(tok_elems), len(backend_tokens))
+            for i in range(n):
+                tok_elem = tok_elems[i]
+                token = backend_tokens[i]
+                tok_id = tok_elem.get("id") or tok_elem.get("{http://www.w3.org/XML/1998/namespace}id") or f"w-{i+1}"
+                if token.id:
+                    ord_to_tokid[token.id] = tok_id if tok_id.startswith("w-") else f"w-{i+1}"
+            for i in range(n):
+                tok_elem = tok_elems[i]
+                token = backend_tokens[i]
+                tok_elem.set("form", token.form)
+                _set_attr_teitok(tok_elem, "lemma", token.lemma or "", default_empty=True)
+                _set_attr_teitok(tok_elem, "xpos", token.xpos or "")
+                _set_attr_teitok(tok_elem, "upos", token.upos or "")
+                _set_attr_teitok(tok_elem, "feats", token.feats or "")
+                if token.id:
+                    _set_attr_teitok(tok_elem, "ord", str(token.id))
+                head_ord = token.head
+                if head_ord is not None and head_ord > 0:
+                    head_tokid = ord_to_tokid.get(head_ord)
+                    if head_tokid:
+                        _set_attr_teitok(tok_elem, "head", head_tokid)
+                    else:
+                        _set_attr_teitok(tok_elem, "head", str(head_ord))
+                else:
+                    _set_attr_teitok(tok_elem, "head", "", default_empty=True)
+                _set_attr_teitok(tok_elem, "deprel", token.deprel or "", default_empty=True)
+                if token.misc:
+                    _set_attr_teitok(tok_elem, "misc", token.misc)
+        # Tokens inside <del> get form="--" (deleted words are not "written"; -- avoids inheriting from innerText, CQP does not index)
+        _teitok_set_form_deleted(root)
+        # Add revision to TEI header
+        change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        backends_used = document.meta.get("_backends_used", []) or ["flexipipe"]
+        file_level_attrs = document.meta.get("_file_level_attrs", {})
+        model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+        model_str = file_level_attrs[model_keys[0]] if model_keys else None
+        change_source = ", ".join(b.upper() for b in backends_used) if len(backends_used) > 1 else (model_str or (backends_used[0].upper() if backends_used else "flexipipe"))
+        tasks = set()
+        if document.meta.get("_tokenized", False):
+            tasks.add("tokenize")
+        if document.meta.get("_segmented", False):
+            tasks.add("segment")
+        if any(t.lemma for s in document.sentences for t in s.tokens):
+            tasks.add("lemmatize")
+        if any(t.xpos or t.upos for s in document.sentences for t in s.tokens):
+            tasks.add("tag")
+        if any(t.head for s in document.sentences for t in s.tokens):
+            tasks.add("parse")
+        if getattr(document, "spans", None) and document.spans.get("ner"):
+            tasks.add("ner")
+        elif any(getattr(s, "entities", None) for s in document.sentences):
+            tasks.add("ner")
+        tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
+        change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+        _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
+        tree = ET.ElementTree(root)
+        if HAS_LXML:
+            tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True, pretty_print=False)
+        else:
+            tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
+        return
+
     # Parse original XML
     if HAS_LXML:
         parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
@@ -153,7 +341,11 @@ def insert_tokens_into_teitok(
         for child in text_node:
             if is_block_element(child):
                 block_elems.append(child)
-        
+        # If no direct block children but single child is body/div, use its children (e.g. <p> per paragraph)
+        if not block_elems and len(text_node) == 1:
+            single = text_node[0]
+            if get_tag_name(single) in ('body', 'div'):
+                block_elems = list(single)
         if not block_elems:
             # No block elements, process text_node directly
             block_elems = [text_node]
@@ -274,6 +466,53 @@ def insert_tokens_into_teitok(
                             if not remaining_plaintext:
                                 break
             
+            # Only rebuild if we matched the full block plaintext; otherwise skip to avoid
+            # clearing the block and leaving it partially filled (structure would differ).
+            matched_text_norm = re.sub(r'\s+', ' ', accumulated_text).strip() if accumulated_text else ""
+            plaintext_norm_check = re.sub(r'\s+', ' ', plaintext_norm).strip()
+            len_diff = abs(len(matched_text_norm) - len(plaintext_norm_check))
+            # Allow when equal, or when the only difference is leading/trailing whitespace, or 1-char prefix/suffix
+            allow_rebuild = matched_text_norm == plaintext_norm_check
+            if not allow_rebuild and len_diff <= 2:
+                if matched_text_norm.strip() == plaintext_norm_check.strip():
+                    allow_rebuild = True
+                elif plaintext_norm_check.startswith(matched_text_norm) or matched_text_norm.startswith(plaintext_norm_check):
+                    allow_rebuild = True
+                # One extra/missing char at end: longer[:len(shorter)] == shorter
+                elif len_diff == 1:
+                    if len(matched_text_norm) > len(plaintext_norm_check):
+                        allow_rebuild = matched_text_norm[: len(plaintext_norm_check)] == plaintext_norm_check
+                    else:
+                        allow_rebuild = plaintext_norm_check[: len(matched_text_norm)] == matched_text_norm
+                # Single-char difference in the middle (e.g. backend has space where XML has letter): if removing
+                # that character from the longer string makes it equal to the shorter, allow rebuild.
+                if not allow_rebuild and len_diff == 1:
+                    diff_pos = None
+                    for i, (a, b) in enumerate(zip(matched_text_norm, plaintext_norm_check)):
+                        if a != b:
+                            diff_pos = i
+                            break
+                    if diff_pos is not None and len(matched_text_norm) > len(plaintext_norm_check):
+                        trimmed = matched_text_norm[:diff_pos] + matched_text_norm[diff_pos + 1:]
+                        if trimmed == plaintext_norm_check:
+                            allow_rebuild = True
+                    elif diff_pos is None and len_diff == 1:
+                        allow_rebuild = matched_text_norm[: len(plaintext_norm_check)] == plaintext_norm_check
+            if not allow_rebuild:
+                msg = (
+                    f"\nWARNING: Matched text does not cover full block plaintext (matched {len(matched_text_norm)} vs {len(plaintext_norm_check)} chars), skipping block to preserve structure. "
+                    "A small length difference is often due to spacing or encoding; the block is left unchanged."
+                )
+                if len_diff == 1:
+                    for i, (a, b) in enumerate(zip(matched_text_norm, plaintext_norm_check)):
+                        if a != b:
+                            msg += f" First difference at position {i}: matched {a!r} vs plaintext {b!r}."
+                            break
+                    else:
+                        msg += " (Lengths differ by 1; difference is at end of string.)"
+                print(msg)
+                continue
+            
             # Create a temporary document with matched sentences
             temp_document = Document(id=document.id)
             temp_document.sentences = matched_sentences
@@ -291,24 +530,64 @@ def insert_tokens_into_teitok(
             )
             
             # Rebuild XML with <s> and <tok> elements
-            # Pass current counters and update them with the return value
-            tokens_used, sentences_used = rebuild_xml_with_tokens(
-                block_elem,
-                plaintext,
-                adjusted_markup,
-                token_positions,
-                sentence_positions,
-                temp_document,  # Use temp_document instead of full document
-                block_elements_set,
-                extract_elements_set,
-                note_content_map,
-                start_tok_id=global_tok_id,
-                start_sent_idx=global_sent_idx,
-                settings=settings
-            )
-            # Update global counters for next block element
-            global_tok_id += tokens_used
-            global_sent_idx += sentences_used
+            if use_string_rebuild:
+                tokens_used, sentences_used = rebuild_xml_with_tokens_string_based(
+                    block_elem,
+                    plaintext,
+                    adjusted_markup,
+                    token_positions,
+                    sentence_positions,
+                    temp_document,
+                    block_elements_set,
+                    extract_elements_set,
+                    note_content_map,
+                    start_tok_id=global_tok_id,
+                    start_sent_idx=global_sent_idx,
+                    settings=settings,
+                )
+                global_tok_id += tokens_used
+                global_sent_idx += sentences_used
+            elif use_minidom_rebuild:
+                from .insert_tokens_minidom import rebuild_block_xml_minidom
+                block_xml_string = ET.tostring(block_elem, encoding="unicode")
+                _original_tail = block_elem.tail
+                new_xml_string, tokens_used, sentences_used = rebuild_block_xml_minidom(
+                    block_xml_string,
+                    plaintext,
+                    token_positions,
+                    sentence_positions,
+                    start_tok_id=global_tok_id,
+                    start_sent_idx=global_sent_idx,
+                )
+                if HAS_LXML:
+                    new_elem = ET.fromstring(new_xml_string.encode("utf-8"))
+                else:
+                    new_elem = ET.fromstring(new_xml_string)
+                block_elem.clear()
+                block_elem.attrib.update(dict(new_elem.attrib))
+                for child in list(new_elem):
+                    block_elem.append(child)
+                if _original_tail is not None:
+                    block_elem.tail = _original_tail
+                global_tok_id += tokens_used
+                global_sent_idx += sentences_used
+            else:
+                tokens_used, sentences_used = rebuild_xml_with_tokens(
+                    block_elem,
+                    plaintext,
+                    adjusted_markup,
+                    token_positions,
+                    sentence_positions,
+                    temp_document,  # Use temp_document instead of full document
+                    block_elements_set,
+                    extract_elements_set,
+                    note_content_map,
+                    start_tok_id=global_tok_id,
+                    start_sent_idx=global_sent_idx,
+                    settings=settings
+                )
+                global_tok_id += tokens_used
+                global_sent_idx += sentences_used
             
             # Mark these sentences as used
             for sent_idx in matched_sentence_indices:
@@ -384,7 +663,7 @@ def insert_tokens_into_teitok(
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
     change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
     
-    _add_change_to_tei_header(root, change_text, change_when)
+    _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
     
     # Write updated XML (without pretty-printing)
     if HAS_LXML:
@@ -592,6 +871,90 @@ def build_standoff_representation(
     return plaintext, markup
 
 
+def extract_plaintext_for_teitok_backend(
+    path: str,
+    textnode_xpath: str = ".//text",
+    include_notes: bool = False,
+    block_elements: Optional[List[str]] = None,
+    extract_elements: Optional[List[str]] = None,
+) -> str:
+    """
+    Extract plain text from TEITOK XML using the same block structure and
+    build_standoff_representation logic as insert_tokens_into_teitok.
+
+    This ensures the text sent to the backend is byte-for-byte identical to
+    the per-block plaintext we use when matching and rebuilding XML, avoiding
+    the 1-char mismatches (e.g. extra space) that come from using a different
+    extractor (extract_teitok_plain_text) for loading.
+    """
+    if block_elements is None:
+        block_elements = ['div', 'head', 'p', 'u', 'speaker']
+    if extract_elements is None:
+        extract_elements = ['note', 'desc', 'gap', 'pb', 'fw', 'rdg']
+
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"TEITOK file not found: {path}")
+
+    if HAS_LXML:
+        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
+        tree = ET.parse(str(path_obj), parser)
+        root = tree.getroot()
+    else:
+        tree = ET.parse(str(path_obj))
+        root = tree.getroot()
+
+    block_elements_set = {elem.lower() for elem in block_elements}
+    extract_elements_set = {elem.lower() for elem in extract_elements}
+
+    def get_tag_name(elem: ET.Element) -> str:
+        tag = elem.tag
+        if '}' in tag:
+            tag = tag.split('}')[1]
+        return tag.lower()
+
+    def is_block_element(elem: ET.Element) -> bool:
+        return get_tag_name(elem) in block_elements_set
+
+    def is_self_closing_element(elem: ET.Element) -> bool:
+        tag_name = get_tag_name(elem)
+        self_closing_tags = {'lb', 'pb', 'milestone', 'anchor', 'gap', 'fw'}
+        return tag_name in self_closing_tags
+
+    try:
+        text_nodes = root.findall(textnode_xpath.replace(".//", ".//{*}"))
+        if not text_nodes:
+            text_nodes = root.findall(textnode_xpath)
+    except (SyntaxError, ValueError):
+        text_nodes = root.findall(textnode_xpath)
+
+    if not text_nodes:
+        text_nodes = [root]
+
+    all_plaintexts: List[str] = []
+    for text_node in text_nodes:
+        block_elems = [child for child in text_node if is_block_element(child)]
+        if not block_elems and len(text_node) == 1:
+            single = text_node[0]
+            if get_tag_name(single) in ('body', 'div'):
+                block_elems = list(single)
+        if not block_elems:
+            block_elems = [text_node]
+        for block_elem in block_elems:
+            plaintext, _ = build_standoff_representation(
+                block_elem,
+                block_elements_set,
+                extract_elements_set,
+                include_notes,
+                is_self_closing_element,
+            )
+            all_plaintexts.append(plaintext)
+
+    # Join with double newline so backend can segment on paragraph boundaries;
+    # block boundaries then align with what we use when matching per block.
+    return "\n\n".join(p for p in all_plaintexts if p)
+
+
 def _split_markup_for_sentence_boundaries(
     markup: List[Dict[str, Any]],
     sentence_positions: List[Tuple[int, int, Sentence]],
@@ -617,19 +980,27 @@ def _split_markup_for_sentence_boundaries(
     if not split_positions:
         return markup
 
-    never_break = set(block_elements) | set(extract_elements)
+    # Do not split inline/mixed-content elements at sentence boundaries; splitting
+    # would change structure (e.g. one <hi> becomes </hi><hi>) and fail structure verification.
+    inline_never_break = {'hi', 'emph', 'b', 'i', 'u', 'span', 'ref', 'name', 'lb', 'pb'}
+    never_break = set(block_elements) | set(extract_elements) | inline_never_break
     result: List[Dict[str, Any]] = []
 
     for entry in markup:
         tag_name = entry.get("name")
         start = entry.get("start")
         end = entry.get("end")
+        tag_lower = (tag_name or "").lower() if isinstance(tag_name, str) else ""
+        # Never split when tag name is missing or empty (preserve structure)
+        if not tag_lower:
+            result.append(entry)
+            continue
 
         if (
             not isinstance(start, int)
             or not isinstance(end, int)
             or start >= end
-            or tag_name in never_break
+            or tag_lower in never_break
         ):
             result.append(entry)
             continue
@@ -1067,6 +1438,9 @@ def rebuild_xml_with_tokens(
     self_closing_elements = {}  # (start_pos, end_pos) -> element
     # Track token state when markup elements open while a token is active
     markup_token_state: Dict[ET.Element, Dict[str, Any]] = {}
+    # When closing markup with token spanning boundary, we may inject plaintext into reopened elem;
+    # skip adding those characters in the character loop.
+    skip_char_until: Optional[int] = None
     # Build parent map for xml.etree.ElementTree compatibility
     parent_map = {c: p for p in block_elem.iter() for c in p}
     
@@ -1086,7 +1460,8 @@ def rebuild_xml_with_tokens(
     initial_sent_idx = start_sent_idx  # Use the provided start index
     for char_pos in range(len(plaintext) + 1):  # +1 to handle closing at end
         char = plaintext[char_pos] if char_pos < len(plaintext) else None
-        
+        tail_elem = None  # Element whose tail this char belongs to (if any), reset each iteration
+
         # Close elements that end at this position (before opening new ones)
         # Close in reverse order: markup first (innermost), then tokens, then sentences (outermost)
         if char_pos in closes_at:
@@ -1142,6 +1517,23 @@ def rebuild_xml_with_tokens(
                             open_m['end'] == m['end'] and
                             open_m['name'] == m['name']):
                             # Close this element
+                            # If a split continuation (another segment with same tag opening at this position)
+                            # exists in markup, do a simple close so opens_at will open it and characters go to it.
+                            m_name = (m.get('name') or '').lower() if isinstance(m.get('name'), str) else ''
+                            has_split_continuation = bool(
+                                m_name and any(
+                                    m2 is not m
+                                    and (m2.get('name') or '').lower() == m_name
+                                    and m2.get('start') == char_pos
+                                    and m2.get('end', 0) > char_pos
+                                    for m2 in markup
+                                )
+                            )
+                            if has_split_continuation:
+                                markup_token_state.pop(open_elem, None)
+                                current_elem = parent_map.get(open_elem, block_elem)
+                                open_markup_stack.pop(i)
+                                break
                             # If we're inside a token, we need to handle crossing XML
                             # The element should close, and the token will continue outside
                             if current_tok_elem is not None:
@@ -1168,7 +1560,7 @@ def rebuild_xml_with_tokens(
                                             parent_children = list(parent_of_element)
                                             elem_index = parent_children.index(open_elem) if open_elem in parent_children else len(parent_children) - 1
                                             parent_of_element.insert(elem_index + 1, current_tok_elem)
-                                            parent_map[current_tok_elem] = parent_of_element
+                                            parent_map[current_tok_elem] = parent_of_element  # keep parent_map correct
                                         
                                         # Determine portion of the token captured while this markup was open
                                         state = markup_token_state.get(open_elem)
@@ -1183,6 +1575,15 @@ def rebuild_xml_with_tokens(
                                         moved_children = list(current_tok_elem)[children_count_before:]
                                         for child in moved_children:
                                             current_tok_elem.remove(child)
+                                        
+                                        # When token spans the boundary, ensure the reopened element gets
+                                        # the text from plaintext[char_pos:tok_end] and skip adding those
+                                        # chars again in the character loop.
+                                        if tok_end is not None and tok_end > char_pos:
+                                            suffix = plaintext[char_pos:tok_end]
+                                            if suffix:
+                                                moved_text = (moved_text or "") + suffix
+                                                skip_char_until = tok_end
                                         
                                         if moved_text or moved_children:
                                             reopened_elem = ET.Element(open_elem.tag, dict(open_elem.attrib))
@@ -1223,9 +1624,9 @@ def rebuild_xml_with_tokens(
         # Open elements that start at this position
         if char_pos in opens_at:
             # Sort to ensure correct nesting:
-            # 1. Longest elements first (sentences should be longer than tokens)
-            # 2. Type as tie-breaker (sentences before tokens)
-            # 3. Level/order for markup
+            # 1. Sentences and tokens: longest first (so sentence opens before token at same position)
+            # 2. Markup: document order first so sibling elements (e.g. <hi><lb/></hi><hi>V</hi>)
+            #    open in original order, not by length (which would put outer/longer first and reverse order)
             def get_open_key(item):
                 item_type, item_data = item
                 if item_type == 'sentence':
@@ -1236,13 +1637,13 @@ def rebuild_xml_with_tokens(
                     start_pos, end_pos = item_data[0], item_data[1]
                     length = end_pos - start_pos
                     return (-length, 1, -end_pos)  # Longest first, type 1 (token), then by end position
-                else:  # markup
+                else:  # markup: preserve document order (order) so siblings open in original sequence
                     end_pos = item_data['end']
                     start_pos = item_data['start']
                     length = end_pos - start_pos
                     level = item_data.get('level', 0)
                     order = item_data.get('order', 0)
-                    return (-length, 2, -end_pos, level, order)  # Longest first, type 2 (markup), then by end position, level, order
+                    return (2, order, -length, -end_pos, level)  # Type 2, then document order, then length/end/level
             
             to_open = sorted(opens_at[char_pos], key=get_open_key)
             
@@ -1489,6 +1890,11 @@ def rebuild_xml_with_tokens(
         
         # Add character to current element (if we're inside a token)
         if char is not None:
+            # Skip characters that were already added via a reopened element (markup boundary + token span)
+            if skip_char_until is not None:
+                if char_pos < skip_char_until:
+                    continue
+                skip_char_until = None
             # Check if this character belongs to a self-closing element's tail
             # This is character-by-character routing based on position
             # First, check if we're inside a token and if char_pos is in any tail range
@@ -1749,6 +2155,76 @@ def rebuild_xml_with_tokens(
     return (tokens_used, sentences_used)
 
 
+def _plaintext_to_xml_positions(xml_str: str, plaintext: str) -> List[Tuple[int, int, int, int]]:
+    """
+    Map plaintext character ranges to positions in the serialized XML string.
+    Single pass: skip tags (from < to >, respecting quoted attrs). Each run of
+    text in XML maps to a contiguous span of plaintext. Spacing is preserved.
+    Returns list of (plaintext_start, plaintext_end, xml_start, xml_end).
+    """
+    spans: List[Tuple[int, int, int, int]] = []
+    xml_pos = 0
+    plaintext_pos = 0
+    n_plain = len(plaintext)
+    n_xml = len(xml_str)
+    in_tag = False
+    run_plain_start = 0
+    run_xml_start = 0
+    while xml_pos < n_xml:
+        c = xml_str[xml_pos]
+        if c == "<":
+            if not in_tag and plaintext_pos > run_plain_start:
+                spans.append((run_plain_start, plaintext_pos, run_xml_start, xml_pos))
+            in_tag = True
+            xml_pos += 1
+            continue
+        if in_tag:
+            if c in ("\"", "'"):
+                quote = c
+                xml_pos += 1
+                while xml_pos < n_xml and xml_str[xml_pos] != quote:
+                    if xml_str[xml_pos] == "\\":
+                        xml_pos += 1
+                    xml_pos += 1
+                if xml_pos < n_xml:
+                    xml_pos += 1
+                continue
+            if c == ">":
+                in_tag = False
+                run_plain_start = plaintext_pos
+                run_xml_start = xml_pos + 1
+            xml_pos += 1
+            continue
+        if plaintext_pos < n_plain:
+            plaintext_pos += 1
+        xml_pos += 1
+    if not in_tag and run_xml_start < n_xml and plaintext_pos > run_plain_start:
+        spans.append((run_plain_start, plaintext_pos, run_xml_start, xml_pos))
+    return spans
+
+
+def _plaintext_pos_to_xml(
+    spans: List[Tuple[int, int, int, int]],
+    plaintext_pos: int,
+    after: bool,
+) -> int:
+    """XML string index to insert at: before plaintext_pos (tag before char at P) or after (tag after char at P-1)."""
+    for p_start, p_end, x_start, x_end in spans:
+        if after:
+            if p_start < plaintext_pos <= p_end:
+                return x_start + (plaintext_pos - p_start)
+        else:
+            if p_start <= plaintext_pos < p_end:
+                return x_start + (plaintext_pos - p_start)
+            if plaintext_pos == p_start:
+                return x_start
+    if not spans:
+        return 0
+    if after and plaintext_pos >= spans[-1][1]:
+        return spans[-1][3]
+    return spans[0][2]
+
+
 def rebuild_xml_with_tokens_string_based(
     block_elem: ET.Element,
     plaintext: str,
@@ -1756,30 +2232,72 @@ def rebuild_xml_with_tokens_string_based(
     token_positions: List[Tuple[int, int, Token]],
     sentence_positions: List[Tuple[int, int, Sentence]],
     document: Document,
-) -> None:
+    block_elements: Set[str],
+    extract_elements: Set[str],
+    note_content_map: Dict[str, Tuple[str, Dict[str, str], List[ET.Element]]],
+    start_tok_id: int = 1,
+    start_sent_idx: int = 0,
+    settings: Optional[Any] = None,
+) -> Tuple[int, int]:
     """
-    Placeholder for a fallback approach that rebuilds TEITOK blocks purely from
-    the standoff representation, without mutating an ElementTree in place.
-    
-    Intended flow:
-        1. Collect every start/end offset from `markup`, `token_positions`, and
-           `sentence_positions`. Split the original XML string at those offsets
-           so no remaining span intersects another (cf. `tmp/standoff2xml`).
-        2. Convert the split structure into a linear stream of text fragments
-           plus explicit open/close tag tokens. Because splitting happened up
-           front, inserting new tags cannot create crossing markup.
-        3. Walk that stream, emitting characters into a string builder and
-           injecting `<s>` / `<tok>` tags when their offsets are reached. All
-           whitespace from `plaintext` is copied verbatim.
-        4. After finishing a block (or periodically), validate the accumulated
-           string with `ET.fromstring` to ensure well‑formed XML before replacing
-           the original block element.
-        5. Once the new XML fragment is parsed, swap it back into the document
-           and reapply the saved note/gap contents just like the current code.
-    
-    This function is not yet implemented; it serves as a skeleton so we can add
-    a reliable fallback if the in-place builder ever fails the verification
-    check.
+    Rebuild block by working on the serialized XML string. Serialization already
+    has correct spacing (text + tails). We map plaintext offsets to positions
+    in that string with a simple scan (no regex), then insert <s>/<tok> at
+    those positions and re-parse. Avoids all .text/.tail mutation.
+
+    Limitation: when a sentence spans across existing tag boundaries (e.g.
+    </hi><hi>), inserting </s> at the last character can wrap a literal "</hi>"
+    inside <s>, producing invalid XML. This engine is safest for blocks with
+    little or no nested markup; for complex nesting use standoff or minidom.
     """
-    raise NotImplementedError("string-based rebuild not implemented yet")
+    def _resolve_attr(internal_attr: str) -> str:
+        if settings:
+            return settings.resolve_xml_attribute(internal_attr, default=internal_attr) or internal_attr
+        return internal_attr
+
+    xml_str = ET.tostring(block_elem, encoding="unicode")
+    spans = _plaintext_to_xml_positions(xml_str, plaintext)
+    if not spans:
+        return (0, 0)
+
+    insertions: List[Tuple[int, str, int]] = []
+    global_tok_id = start_tok_id
+    sent_idx = start_sent_idx
+    id_attr = _resolve_attr("id")
+
+    for s_start, s_end, sent in sentence_positions:
+        pos_before = _plaintext_pos_to_xml(spans, s_start, after=False)
+        pos_after = _plaintext_pos_to_xml(spans, s_end, after=True)
+        s_id = f"s-{sent_idx + 1}"
+        attrs = f' {id_attr}="{s_id}"'
+        if getattr(sent, "text", None):
+            from xml.sax.saxutils import escape
+            attrs += f' text="{escape(sent.text)}"'
+        insertions.append((pos_after, "</s>", 0))
+        insertions.append((pos_before, f"<s{attrs}>", 0))
+        sent_idx += 1
+
+    for t_start, t_end, token in token_positions:
+        pos_before = _plaintext_pos_to_xml(spans, t_start, after=False)
+        pos_after = _plaintext_pos_to_xml(spans, t_end, after=True)
+        tok_id = f"w-{global_tok_id}"
+        insertions.append((pos_after, "</tok>", 0))
+        insertions.append((pos_before, f"<tok {id_attr}=\"{tok_id}\">", 1))
+        global_tok_id += 1
+
+    # Sort by position descending (insert from end so indices stay valid), then by order so at same position we get <tok> before <s> (so result is <s><tok>...)
+    insertions.sort(key=lambda x: (-x[0], -x[2]))
+    for pos, tag, _ in insertions:
+        xml_str = xml_str[:pos] + tag + xml_str[pos:]
+
+    new_elem = ET.fromstring(xml_str)
+    original_tail = block_elem.tail
+    block_elem.clear()
+    block_elem.attrib.update(dict(new_elem.attrib))
+    for child in list(new_elem):
+        block_elem.append(child)
+    if original_tail is not None:
+        block_elem.tail = original_tail
+
+    return (global_tok_id - start_tok_id, sent_idx - start_sent_idx)
 

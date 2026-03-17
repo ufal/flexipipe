@@ -2130,7 +2130,13 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--output",
         default=None,
-        help="Output file (omit to write to stdout)",
+        help="Output file (omit to write to stdout). When --input is a directory, --output may be a directory; each input file is then written to output_dir/<same name>.",
+    )
+    process_parser.add_argument(
+        "--input-glob",
+        default="*.xml",
+        metavar="GLOB",
+        help="Glob pattern for files when --input is a directory (default: *.xml).",
     )
     process_parser.add_argument(
         "--backend",
@@ -2409,6 +2415,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--textnotes",
         action="store_true",
         help="Include <note> elements in extracted text when using --tokenize (default: exclude notes).",
+    )
+    process_parser.add_argument(
+        "--insert-tokens-engine",
+        type=str,
+        choices=("standoff", "minidom", "string", "teitok"),
+        default="standoff",
+        help="Engine for inserting <s>/<tok> into untokenized TEITOK XML: 'standoff' (default), 'minidom', 'string', or 'teitok' (Python port of xmltokenize.pl: regex/line-based, robust on real TEITOK XML).",
     )
     process_parser.add_argument(
         "--teitok",
@@ -4011,6 +4024,29 @@ def _prepare_spacy_model_if_needed(args: argparse.Namespace) -> None:
     )
 
 
+def _get_process_entries(args: argparse.Namespace) -> List[Tuple[Optional[Path], Optional[Path]]]:
+    """
+    When --input is a directory, return one (input_path, output_path) per file;
+    when --input is a file, return one tuple; when stdin/inline, return one (None, None).
+    output_path is set only when --output is a directory (for batch).
+    """
+    inp = getattr(args, "input", None)
+    if not inp or inp in ("-", "<inline-data>"):
+        return [(None, None)]
+    path = Path(inp).expanduser().resolve()
+    if not path.exists():
+        return [(path, None)]  # let downstream report file not found
+    if path.is_dir():
+        glob_pattern = getattr(args, "input_glob", "*.xml")
+        files = sorted(path.glob(glob_pattern))
+        if not files:
+            return []  # caller will error
+        out = getattr(args, "output", None)
+        output_dir = Path(out).expanduser().resolve() if out and Path(out).expanduser().resolve().is_dir() else None
+        return [(f, (output_dir / f.name) if output_dir else None) for f in files]
+    return [(path, None)]
+
+
 def run_tag(args: argparse.Namespace) -> int:
     # Apply defaults from config if not specified
     from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model, get_unicode_normalization
@@ -4365,118 +4401,139 @@ def run_tag(args: argparse.Namespace) -> int:
             print("Error: No input specified. Provide --input <file> or pipe data to STDIN.", file=sys.stderr)
             return 1
     
-    # Handle stdin (reuse content if already read for language extraction)
-    read_from_stdin = (args.input == "-") and not inline_data_text
-    stdin_content = stdin_content_early if stdin_content_early is not None else None
+    _process_entries = _get_process_entries(args)
+    if not _process_entries:
+        print("[flexipipe] No files matched. When --input is a directory, use --input-glob to specify a pattern (default: *.xml).", file=sys.stderr)
+        return 1
+    # Reuse backend across files when processing a directory (avoids loading model N times)
+    if len(_process_entries) > 1:
+        args._backend_cache = {}
+    for _inp, _out in _process_entries:
+        if _inp is not None:
+            args.input = str(_inp)
+        if _out is not None:
+            args.output = str(_out)
+        # Handle stdin (reuse content if already read for language extraction)
+        read_from_stdin = (args.input == "-") and not inline_data_text
+        stdin_content = stdin_content_early if stdin_content_early is not None else None
     
-    input_format = _normalize_format_name(args.input_format)
-    if inline_data_text:
-        input_format = "raw"
+        input_format = _normalize_format_name(args.input_format)
+        if inline_data_text:
+            input_format = "raw"
     
-    if input_format == "auto" and not inline_data_text:
-        if read_from_stdin:
-            # For stdin, we need to read the content first to detect format
-            # But we can't rewind stdin, so we'll read it all and use it
-            if stdin_content is None:
-                stdin_content = sys.stdin.read()
-            # Create a temporary approach: try to detect from content
-            sample = stdin_content[:4096] if len(stdin_content) > 4096 else stdin_content
-            stripped = sample.lstrip()
-            if "<tok" in sample or "<TEI" in sample or stripped.startswith("<TEI"):
-                input_format = "teitok"
-            else:
-                for line in sample.splitlines():
-                    stripped_line = line.strip()
-                    if not stripped_line:
-                        continue
-                    if stripped_line.startswith("#"):
-                        if stripped_line.startswith("# text") or stripped_line.startswith("# sent_id") or stripped_line.startswith("# newdoc"):
+        if input_format == "auto" and not inline_data_text:
+            if read_from_stdin:
+                # For stdin, we need to read the content first to detect format
+                # But we can't rewind stdin, so we'll read it all and use it
+                if stdin_content is None:
+                    stdin_content = sys.stdin.read()
+                # Create a temporary approach: try to detect from content
+                sample = stdin_content[:4096] if len(stdin_content) > 4096 else stdin_content
+                stripped = sample.lstrip()
+                if "<tok" in sample or "<TEI" in sample or stripped.startswith("<TEI"):
+                    input_format = "teitok"
+                else:
+                    for line in sample.splitlines():
+                        stripped_line = line.strip()
+                        if not stripped_line:
+                            continue
+                        if stripped_line.startswith("#"):
+                            if stripped_line.startswith("# text") or stripped_line.startswith("# sent_id") or stripped_line.startswith("# newdoc"):
+                                input_format = "conllu"
+                                break
+                            continue
+                        if "\t" in stripped_line and len(stripped_line.split("\t")) >= 10:
                             input_format = "conllu"
                             break
-                        continue
-                    if "\t" in stripped_line and len(stripped_line.split("\t")) >= 10:
-                        input_format = "conllu"
-                        break
-    if inline_data_text:
-        input_format = "raw"
-    elif input_format == "auto":
-        if read_from_stdin:
-            input_format = "raw"
-        else:
-            input_format = detect_input_format(args.input)
-            if args.debug or args.verbose:
-                print(f"[flexipipe] detected input format: {input_format}")
-
-    if args.debug or args.verbose:
-        destination = args.output if args.output else "stdout"
         if inline_data_text:
-            input_source = "<inline data>"
-        else:
-            input_source = "stdin" if read_from_stdin else args.input
-        print(f"[flexipipe] treating {input_source} -> {destination}")
+            input_format = "raw"
+        elif input_format == "auto":
+            if read_from_stdin:
+                input_format = "raw"
+            else:
+                input_format = detect_input_format(args.input)
+                if args.debug or args.verbose:
+                    print(f"[flexipipe] detected input format: {input_format}")
 
-    detection_attempted = False
-    detection_result = None
-    detection_source_text: Optional[str] = None
-    validator_source_doc: Optional[Document] = None
+        if args.debug or args.verbose:
+            destination = args.output if args.output else "stdout"
+            if inline_data_text:
+                input_source = "<inline data>"
+            else:
+                input_source = "stdin" if read_from_stdin else args.input
+            print(f"[flexipipe] treating {input_source} -> {destination}")
 
-    input_entry = None
-    if not inline_data_text:
-        input_entry = io_registry.get_input(input_format)
+        detection_attempted = False
+        detection_result = None
+        detection_source_text: Optional[str] = None
+        validator_source_doc: Optional[Document] = None
 
-    if (not output_explicit) and (input_format == "teitok" or getattr(args, "test", False)):
-        args.output_format = "teitok"
+        input_entry = None
+        if not inline_data_text:
+            input_entry = io_registry.get_input(input_format)
 
-    if args.test and input_format != "teitok":
-        if args.verbose or args.debug:
-            print("[flexipipe] --test is currently supported for TEITOK writeback only; ignoring for this input format.", file=sys.stderr)
-        args.test = False
+        if (not output_explicit) and (input_format == "teitok" or getattr(args, "test", False)):
+            args.output_format = "teitok"
 
-    if inline_data_text:
-        input_format = "raw"
-        detection_source_text = inline_data_text
-        detection_attempted = True
-        # Only try detection again if we don't already have a language (from earlier detection)
-        if not getattr(args, "language", None):
-            detection_result = _maybe_detect_language(args, detection_source_text)
-            if detection_result and not auto_selected:
-                backend_type = _auto_select_model_for_language(args, backend_type)
-                args.backend = backend_type
-                auto_selected = True
-        else:
-            detection_result = None
-        backend_type = getattr(args, "backend", None) or "flexitag"
-        segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-        tokenize_locally = segment_locally and backend_type != "treetagger"
-        doc = Document.from_plain_text(
-            inline_data_text,
-            doc_id="",
-            segment=segment_locally,
-            tokenize=tokenize_locally,
-        )
-        # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
-        if backend_type == "treetagger" and not tokenize_locally:
-            for sent in doc.sentences:
-                sent.tokens = []
-        doc.meta.setdefault("source", "inline-data")
-        # Normalize document encoding
-        if unicode_normalize != "none":
-            doc.normalize_unicode(unicode_normalize)
-    elif input_entry:
-        stdin_payload = stdin_content if read_from_stdin else None
-        doc = input_entry.load(args=args, stdin_content=stdin_payload)
-        # Normalize document encoding
-        if unicode_normalize != "none":
-            doc.normalize_unicode(unicode_normalize)
-        if not read_from_stdin and args.input not in (None, "-"):
-            note_source_path = note_source_path or args.input
-        elif read_from_stdin:
-            doc.meta.setdefault("source", "stdin")
-            # When piping, extract backend info from CoNLL-U headers
-            # Check for backend-specific model attributes (udpipe_model, nametag_model, etc.)
-            if "_file_level_attrs" in doc.meta:
-                file_attrs = doc.meta["_file_level_attrs"]
-                for key in file_attrs.keys():
+        if args.test and input_format != "teitok":
+            if args.verbose or args.debug:
+                print("[flexipipe] --test is currently supported for TEITOK writeback only; ignoring for this input format.", file=sys.stderr)
+            args.test = False
+
+        if inline_data_text:
+            input_format = "raw"
+            detection_source_text = inline_data_text
+            detection_attempted = True
+            # Only try detection again if we don't already have a language (from earlier detection)
+            if not getattr(args, "language", None):
+                detection_result = _maybe_detect_language(args, detection_source_text)
+                if detection_result and not auto_selected:
+                    backend_type = _auto_select_model_for_language(args, backend_type)
+                    args.backend = backend_type
+                    auto_selected = True
+            else:
+                detection_result = None
+            backend_type = getattr(args, "backend", None) or "flexitag"
+            segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
+            tokenize_locally = segment_locally and backend_type != "treetagger"
+            doc = Document.from_plain_text(
+                inline_data_text,
+                doc_id="",
+                segment=segment_locally,
+                tokenize=tokenize_locally,
+            )
+            # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+            if backend_type == "treetagger" and not tokenize_locally:
+                for sent in doc.sentences:
+                    sent.tokens = []
+            doc.meta.setdefault("source", "inline-data")
+            # Normalize document encoding
+            if unicode_normalize != "none":
+                doc.normalize_unicode(unicode_normalize)
+        elif input_entry:
+            stdin_payload = stdin_content if read_from_stdin else None
+            doc = input_entry.load(args=args, stdin_content=stdin_payload)
+            # Normalize document encoding
+            if unicode_normalize != "none":
+                doc.normalize_unicode(unicode_normalize)
+            if not read_from_stdin and args.input not in (None, "-"):
+                note_source_path = note_source_path or args.input
+            elif read_from_stdin:
+                doc.meta.setdefault("source", "stdin")
+                # When piping, extract backend info from CoNLL-U headers
+                # Check for backend-specific model attributes (udpipe_model, nametag_model, etc.)
+                if "_file_level_attrs" in doc.meta:
+                    file_attrs = doc.meta["_file_level_attrs"]
+                    for key in file_attrs.keys():
+                        if key.endswith("_model"):
+                            backend_name = key.replace("_model", "").lower()
+                            if backend_name in ["udpipe", "nametag", "udmorph", "treetagger"]:
+                                if "_backends_used" not in doc.meta:
+                                    doc.meta["_backends_used"] = []
+                                if backend_name not in doc.meta["_backends_used"]:
+                                    doc.meta["_backends_used"].append(backend_name)
+                # Also check document.attrs for model info
+                for key in doc.attrs.keys():
                     if key.endswith("_model"):
                         backend_name = key.replace("_model", "").lower()
                         if backend_name in ["udpipe", "nametag", "udmorph", "treetagger"]:
@@ -4484,171 +4541,273 @@ def run_tag(args: argparse.Namespace) -> int:
                                 doc.meta["_backends_used"] = []
                             if backend_name not in doc.meta["_backends_used"]:
                                 doc.meta["_backends_used"].append(backend_name)
-            # Also check document.attrs for model info
-            for key in doc.attrs.keys():
-                if key.endswith("_model"):
-                    backend_name = key.replace("_model", "").lower()
-                    if backend_name in ["udpipe", "nametag", "udmorph", "treetagger"]:
-                        if "_backends_used" not in doc.meta:
-                            doc.meta["_backends_used"] = []
-                        if backend_name not in doc.meta["_backends_used"]:
-                            doc.meta["_backends_used"].append(backend_name)
-        detection_source_text = _document_to_plain_text(doc)
-    elif input_format == "raw":
-        if read_from_stdin:
-            if stdin_content is None:
-                stdin_content = sys.stdin.read()
-            raw_text = stdin_content
-        else:
-            from .file_utils import read_text_file
-            if args.debug:
-                raw_text, detected_encoding = read_text_file(Path(args.input), return_encoding=True)
-                print(f"[flexipipe] DEBUG: Detected file encoding: {detected_encoding}", file=sys.stderr)
+            detection_source_text = _document_to_plain_text(doc)
+        elif input_format == "raw":
+            if read_from_stdin:
+                if stdin_content is None:
+                    stdin_content = sys.stdin.read()
+                raw_text = stdin_content
             else:
-                raw_text = read_text_file(Path(args.input))
-        # Normalize input text before processing
-        if unicode_normalize != "none":
-            if args.debug:
-                print(f"[flexipipe] DEBUG: Normalizing input text to {unicode_normalize}", file=sys.stderr)
-            raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
-        elif args.debug:
-            print(f"[flexipipe] DEBUG: Input text normalization: none", file=sys.stderr)
-        detection_source_text = raw_text
-        detection_attempted = True
-        detection_result = _maybe_detect_language(args, detection_source_text)
-        if not auto_selected:
-            backend_type = _auto_select_model_for_language(args, backend_type)
-            args.backend = backend_type
-            auto_selected = True
+                from .file_utils import read_text_file
+                if args.debug:
+                    raw_text, detected_encoding = read_text_file(Path(args.input), return_encoding=True)
+                    print(f"[flexipipe] DEBUG: Detected file encoding: {detected_encoding}", file=sys.stderr)
+                else:
+                    raw_text = read_text_file(Path(args.input))
+            # Normalize input text before processing
+            if unicode_normalize != "none":
+                if args.debug:
+                    print(f"[flexipipe] DEBUG: Normalizing input text to {unicode_normalize}", file=sys.stderr)
+                raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
+            elif args.debug:
+                print(f"[flexipipe] DEBUG: Input text normalization: none", file=sys.stderr)
+            detection_source_text = raw_text
+            detection_attempted = True
+            detection_result = _maybe_detect_language(args, detection_source_text)
+            if not auto_selected:
+                backend_type = _auto_select_model_for_language(args, backend_type)
+                args.backend = backend_type
+                auto_selected = True
         
-        # Determine which backend to use (needed to decide on segmentation)
-        backend_type = getattr(args, "backend", None)
-        if not backend_type:
-            backend_type = "flexitag"  # Default backend
+            # Determine which backend to use (needed to decide on segmentation)
+            backend_type = getattr(args, "backend", None)
+            if not backend_type:
+                backend_type = "flexitag"  # Default backend
         
-        # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
-        # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
-        # (so we don't create whitespace-split tokens that would prevent proper tokenization)
-        segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-        tokenize_locally = segment_locally and backend_type != "treetagger"
+            # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+            # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
+            # (so we don't create whitespace-split tokens that would prevent proper tokenization)
+            segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
+            tokenize_locally = segment_locally and backend_type != "treetagger"
 
-        doc = Document.from_plain_text(
-            raw_text,
-            doc_id="",
-            segment=segment_locally,
-            tokenize=tokenize_locally,
-        )
+            doc = Document.from_plain_text(
+                raw_text,
+                doc_id="",
+                segment=segment_locally,
+                tokenize=tokenize_locally,
+            )
         
-        # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
-        if backend_type == "treetagger" and not tokenize_locally:
-            for sent in doc.sentences:
-                sent.tokens = []
-        # Normalize document encoding
-        if unicode_normalize != "none":
-            doc.normalize_unicode(unicode_normalize)
-        assign_doc_id_from_path(doc, args.input if not read_from_stdin else None)
-        if not read_from_stdin and args.input not in (None, "-"):
-            note_source_path = note_source_path or args.input
-            doc.meta.setdefault("source_path", args.input)
-        elif read_from_stdin:
-            doc.meta.setdefault("source", "stdin")
-    else:
-        # TEITOK XML input
-        if read_from_stdin:
-            if stdin_content is None:
-                stdin_content = sys.stdin.read()
-            # For TEI, we need to pass the content to load_teitok
-            # Check if load_teitok accepts content or only file paths
-            from io import StringIO
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.xml', delete=False) as tmp:
-                tmp.write(stdin_content)
-                tmp_path = tmp.name
-            try:
-                # Check if file has tokens
-                from .teitok import teitok_has_tokens, extract_teitok_plain_text
-                has_tokens = teitok_has_tokens(tmp_path)
+            # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+            if backend_type == "treetagger" and not tokenize_locally:
+                for sent in doc.sentences:
+                    sent.tokens = []
+            # Normalize document encoding
+            if unicode_normalize != "none":
+                doc.normalize_unicode(unicode_normalize)
+            assign_doc_id_from_path(doc, args.input if not read_from_stdin else None)
+            if not read_from_stdin and args.input not in (None, "-"):
+                note_source_path = note_source_path or args.input
+                doc.meta.setdefault("source_path", args.input)
+            elif read_from_stdin:
+                doc.meta.setdefault("source", "stdin")
+        else:
+            # TEITOK XML input
+            if read_from_stdin:
+                if stdin_content is None:
+                    stdin_content = sys.stdin.read()
+                # For TEI, we need to pass the content to load_teitok
+                # Check if load_teitok accepts content or only file paths
+                from io import StringIO
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.xml', delete=False) as tmp:
+                    tmp.write(stdin_content)
+                    tmp_path = tmp.name
+                try:
+                    # Check if file has tokens
+                    from .teitok import teitok_has_tokens
+                    from .insert_tokens import extract_plaintext_for_teitok_backend
+                    has_tokens = teitok_has_tokens(tmp_path)
                 
-                if not has_tokens:
-                    if not args.tokenize:
-                        print(
-                            f"Error: TEITOK XML file has no <tok> elements. "
-                            f"Use --tokenize to enable tokenization mode.",
-                            file=sys.stderr
+                    if not has_tokens:
+                        if not args.tokenize:
+                            print(
+                                f"Error: TEITOK XML file has no <tok> elements. "
+                                f"Use --tokenize to enable tokenization mode.",
+                                file=sys.stderr
+                            )
+                            return 1
+                        # Extract plain text using same logic as insert_tokens so backend and writeback match
+                        textnode_xpath = getattr(args, "textnode", ".//text")
+                        include_notes = getattr(args, "textnotes", False)
+                        raw_text = extract_plaintext_for_teitok_backend(tmp_path, textnode_xpath, include_notes=include_notes)
+                        # Normalize input text before processing
+                        if unicode_normalize != "none":
+                            raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
+                        if args.debug:
+                            print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
+                            print("=" * 80)
+                            print(raw_text)
+                            print("=" * 80)
+                        # Store original input path for potential writeback
+                        original_input_path = tmp_path
+                        # Treat as raw text input
+                        detection_source_text = raw_text
+                        # Note: Language detection will happen later after checking settings.xml
+                        # We don't set detection_attempted here so that settings.xml can be checked first
+                    
+                        # Determine which backend to use (needed to decide on segmentation)
+                        backend_type = getattr(args, "backend", None)
+                        if not backend_type:
+                            backend_type = "flexitag"  # Default backend
+                    
+                        # Treat extracted text as raw input - let the backend handle segmentation/tokenization
+                        # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+                        # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
+                        segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
+                        tokenize_locally = segment_locally and backend_type != "treetagger"
+                    
+                        doc = Document.from_plain_text(
+                            raw_text,
+                            doc_id="",
+                            segment=segment_locally,
+                            tokenize=tokenize_locally,
                         )
-                        return 1
-                    # Extract plain text and treat as raw input
-                    textnode_xpath = getattr(args, "textnode", ".//text")
-                    include_notes = getattr(args, "textnotes", False)
-                    raw_text = extract_teitok_plain_text(tmp_path, textnode_xpath, include_notes=include_notes)
-                    # Normalize input text before processing
-                    if unicode_normalize != "none":
-                        raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
-                    if args.debug:
-                        print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
-                        print("=" * 80)
-                        print(raw_text)
-                        print("=" * 80)
-                    # Store original input path for potential writeback
-                    original_input_path = tmp_path
-                    # Treat as raw text input
-                    detection_source_text = raw_text
-                    # Note: Language detection will happen later after checking settings.xml
-                    # We don't set detection_attempted here so that settings.xml can be checked first
+                        # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
+                        if backend_type == "treetagger" and not tokenize_locally:
+                            for sent in doc.sentences:
+                                sent.tokens = []
+                        # Normalize document encoding
+                        if unicode_normalize != "none":
+                            doc.normalize_unicode(unicode_normalize)
+                        doc.meta["original_input_path"] = original_input_path
+                        doc.meta.setdefault("source_path", original_input_path)
+                        if read_from_stdin:
+                            doc.meta.setdefault("source", "tei-stdin")
+                        doc.meta["original_input_xpath"] = textnode_xpath
+                        if not read_from_stdin:
+                            assign_doc_id_from_path(doc, original_input_path)
                     
-                    # Determine which backend to use (needed to decide on segmentation)
-                    backend_type = getattr(args, "backend", None)
-                    if not backend_type:
-                        backend_type = "flexitag"  # Default backend
-                    
-                    # Treat extracted text as raw input - let the backend handle segmentation/tokenization
-                    # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
-                    # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
-                    segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-                    tokenize_locally = segment_locally and backend_type != "treetagger"
-                    
-                    doc = Document.from_plain_text(
-                        raw_text,
-                        doc_id="",
-                        segment=segment_locally,
-                        tokenize=tokenize_locally,
-                    )
-                    # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
-                    if backend_type == "treetagger" and not tokenize_locally:
-                        for sent in doc.sentences:
-                            sent.tokens = []
-                    # Normalize document encoding
-                    if unicode_normalize != "none":
-                        doc.normalize_unicode(unicode_normalize)
-                    doc.meta["original_input_path"] = original_input_path
-                    doc.meta.setdefault("source_path", original_input_path)
-                    if read_from_stdin:
-                        doc.meta.setdefault("source", "tei-stdin")
-                    doc.meta["original_input_xpath"] = textnode_xpath
-                    if not read_from_stdin:
-                        assign_doc_id_from_path(doc, original_input_path)
-                    
-                    # Load TEITOK settings even when file has no tokens (needed for writeback and language)
-                    # Note: For stdin, settings won't be available, but that's OK
-                    if not read_from_stdin:
+                        # Load TEITOK settings even when file has no tokens (needed for writeback and language)
+                        # Note: For stdin, settings won't be available, but that's OK
+                        if not read_from_stdin:
+                            teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                            if teitok_settings:
+                                if not teitok_settings_obj:
+                                    teitok_settings_obj = teitok_settings
+                                if not writeback_explicit:
+                                    args.writeback = True
+                                if args.verbose or args.debug:
+                                    print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
+                                # Set language from settings.xml if not already set
+                                if not getattr(args, "language", None):
+                                    settings_lang = teitok_settings.get_language()
+                                    if settings_lang:
+                                        args.language = settings_lang
+                                        if args.verbose or args.debug:
+                                            print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
+                    else:
+                        # Load TEITOK settings and merge with CLI mappings
                         teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
                         if teitok_settings:
                             if not teitok_settings_obj:
                                 teitok_settings_obj = teitok_settings
                             if not writeback_explicit:
                                 args.writeback = True
-                            if args.verbose or args.debug:
-                                print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
-                            # Set language from settings.xml if not already set
-                            if not getattr(args, "language", None):
-                                settings_lang = teitok_settings.get_language()
-                                if settings_lang:
-                                    args.language = settings_lang
-                                    if args.verbose or args.debug:
-                                        print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
+                        xpos_attr = merged_attrs_map.get("xpos")
+                        reg_attr = merged_attrs_map.get("reg")
+                        expan_attr = merged_attrs_map.get("expan")
+                        lemma_attr = merged_attrs_map.get("lemma")
+                        doc = load_teitok(
+                            tmp_path,
+                            xpos_attr=xpos_attr,
+                            reg_attr=reg_attr,
+                            expan_attr=expan_attr,
+                            lemma_attr=lemma_attr,
+                        )
+                        # Normalize document encoding
+                        if unicode_normalize != "none":
+                            doc.normalize_unicode(unicode_normalize)
+                        # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
+                        # Note: For stdin input, writeback is not supported, so we skip this
+                        # Store settings for later language resolution
+                        # (Language will be resolved after document is loaded to check teiHeader first)
+                        detection_source_text = _document_to_plain_text(doc)
+                finally:
+                    # Always clean up temp file (stdin doesn't support writeback anyway)
+                    os.unlink(tmp_path)
+            else:
+                # Check if file has tokens
+                from .teitok import teitok_has_tokens
+                from .insert_tokens import extract_plaintext_for_teitok_backend
+                has_tokens = teitok_has_tokens(args.input)
+            
+                if not has_tokens:
+                    # Allow either explicit --tokenize or a tasks list that includes 'tokenize'
+                    wants_tokenize = bool(getattr(args, "tokenize", False))
+                    try:
+                        if not wants_tokenize:
+                            raw_tasks = getattr(args, "tasks", None)
+                            if raw_tasks is not None:
+                                requested_for_header = _parse_tasks_argument(raw_tasks)
+                                wants_tokenize = "tokenize" in requested_for_header
+                    except Exception:
+                        # Fall back to requiring --tokenize on parse errors
+                        pass
+
+                    if not wants_tokenize:
+                        print(
+                            f"Error: TEITOK XML file '{args.input}' has no <tok> elements. "
+                            f"Use --tokenize or include 'tokenize' in --tasks to enable tokenization mode.",
+                            file=sys.stderr
+                        )
+                        return 1
+                    # Extract plain text using same logic as insert_tokens so backend and writeback match
+                    textnode_xpath = getattr(args, "textnode", ".//text")
+                    include_notes = getattr(args, "textnotes", False)
+                    raw_text = extract_plaintext_for_teitok_backend(args.input, textnode_xpath, include_notes=include_notes)
+                    if args.debug:
+                        print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
+                        print("=" * 80)
+                        print(raw_text)
+                        print("=" * 80)
+                    # Treat as raw text input
+                    detection_source_text = raw_text
+                    # Note: Language detection will happen later after checking settings.xml
+                    # We don't set detection_attempted here so that settings.xml can be checked first
+                
+                    # Determine which backend to use (needed to decide on segmentation)
+                    backend_type = getattr(args, "backend", None)
+                    if not backend_type:
+                        backend_type = "flexitag"  # Default backend
+                
+                    # Treat extracted text as raw input - let the backend handle segmentation/tokenization
+                    # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
+                    # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
+                    segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
+                    tokenize_locally = segment_locally and backend_type != "treetagger"
+                
+                    doc = Document.from_plain_text(
+                        raw_text,
+                        doc_id="",
+                        segment=segment_locally,
+                        tokenize=tokenize_locally,
+                    )
+                    # Store original input path in doc metadata for writeback
+                    doc.meta["original_input_path"] = args.input
+                    doc.meta["original_input_xpath"] = textnode_xpath
+                    doc.meta.setdefault("source_path", args.input)
+                    assign_doc_id_from_path(doc, args.input)
+                    note_source_path = note_source_path or args.input
+                
+                    # Load TEITOK settings even when file has no tokens (needed for writeback and language)
+                    teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
+                    if teitok_settings:
+                        if not teitok_settings_obj:
+                            teitok_settings_obj = teitok_settings
+                        if not writeback_explicit:
+                            args.writeback = True
+                        if args.verbose or args.debug:
+                            print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
+                        # Set language from settings.xml if not already set
+                        if not getattr(args, "language", None):
+                            settings_lang = teitok_settings.get_language()
+                            if settings_lang:
+                                args.language = settings_lang
+                                if args.verbose or args.debug:
+                                    print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
                 else:
                     # Load TEITOK settings and merge with CLI mappings
-                    teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                    teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
                     if teitok_settings:
                         if not teitok_settings_obj:
                             teitok_settings_obj = teitok_settings
@@ -4659,7 +4818,7 @@ def run_tag(args: argparse.Namespace) -> int:
                     expan_attr = merged_attrs_map.get("expan")
                     lemma_attr = merged_attrs_map.get("lemma")
                     doc = load_teitok(
-                        tmp_path,
+                        args.input,
                         xpos_attr=xpos_attr,
                         reg_attr=reg_attr,
                         expan_attr=expan_attr,
@@ -4669,363 +4828,213 @@ def run_tag(args: argparse.Namespace) -> int:
                     if unicode_normalize != "none":
                         doc.normalize_unicode(unicode_normalize)
                     # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
-                    # Note: For stdin input, writeback is not supported, so we skip this
+                    # Only enable if settings.xml actually exists (we're in a TEITOK project)
+                    if args.writeback is None and teitok_settings and teitok_settings.settings_path and teitok_settings.settings_path.exists():
+                        args.writeback = True
+                        if args.verbose or args.debug:
+                            print("[flexipipe] Auto-enabled writeback mode (TEITOK settings.xml found)", file=sys.stderr)
                     # Store settings for later language resolution
                     # (Language will be resolved after document is loaded to check teiHeader first)
-                    detection_source_text = _document_to_plain_text(doc)
-            finally:
-                # Always clean up temp file (stdin doesn't support writeback anyway)
-                os.unlink(tmp_path)
-        else:
-            # Check if file has tokens
-            from .teitok import teitok_has_tokens, extract_teitok_plain_text
-            has_tokens = teitok_has_tokens(args.input)
-            
-            if not has_tokens:
-                # Allow either explicit --tokenize or a tasks list that includes 'tokenize'
-                wants_tokenize = bool(getattr(args, "tokenize", False))
-                try:
-                    if not wants_tokenize:
-                        raw_tasks = getattr(args, "tasks", None)
-                        if raw_tasks is not None:
-                            requested_for_header = _parse_tasks_argument(raw_tasks)
-                            wants_tokenize = "tokenize" in requested_for_header
-                except Exception:
-                    # Fall back to requiring --tokenize on parse errors
-                    pass
+            detection_source_text = _document_to_plain_text(doc)
+        if args.debug:
+            sent_count = len(doc.sentences)
+            tok_count = sum(len(sent.tokens) for sent in doc.sentences)
+            print(f"[flexipipe] loaded document: sentences={sent_count} tokens={tok_count}")
 
-                if not wants_tokenize:
-                    print(
-                        f"Error: TEITOK XML file '{args.input}' has no <tok> elements. "
-                        f"Use --tokenize or include 'tokenize' in --tasks to enable tokenization mode.",
-                        file=sys.stderr
-                    )
-                    return 1
-                # Extract plain text and treat as raw input
-                textnode_xpath = getattr(args, "textnode", ".//text")
-                include_notes = getattr(args, "textnotes", False)
-                raw_text = extract_teitok_plain_text(args.input, textnode_xpath, include_notes=include_notes)
-                if args.debug:
-                    print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
-                    print("=" * 80)
-                    print(raw_text)
-                    print("=" * 80)
-                # Treat as raw text input
-                detection_source_text = raw_text
-                # Note: Language detection will happen later after checking settings.xml
-                # We don't set detection_attempted here so that settings.xml can be checked first
-                
-                # Determine which backend to use (needed to decide on segmentation)
-                backend_type = getattr(args, "backend", None)
-                if not backend_type:
-                    backend_type = "flexitag"  # Default backend
-                
-                # Treat extracted text as raw input - let the backend handle segmentation/tokenization
-                # For flexitag we always segment/tokenize. For other backends, only do so when --pretokenize is requested.
-                # Exception: treetagger needs tokenization but we'll let maybe_apply_tokenization handle it
-                segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
-                tokenize_locally = segment_locally and backend_type != "treetagger"
-                
-                doc = Document.from_plain_text(
-                    raw_text,
-                    doc_id="",
-                    segment=segment_locally,
-                    tokenize=tokenize_locally,
-                )
-                # Store original input path in doc metadata for writeback
-                doc.meta["original_input_path"] = args.input
-                doc.meta["original_input_xpath"] = textnode_xpath
-                doc.meta.setdefault("source_path", args.input)
-                assign_doc_id_from_path(doc, args.input)
-                note_source_path = note_source_path or args.input
-                
-                # Load TEITOK settings even when file has no tokens (needed for writeback and language)
-                teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
-                if teitok_settings:
+        if not detection_attempted:
+            # Language resolution priority:
+            # 1. CLI --language (already checked)
+            # 2. Document metadata (from teiHeader)
+            # 3. TEITOK settings.xml (if available)
+            # 4. Language detection
+        
+            # Check document metadata first (from teiHeader)
+            # teiHeader language takes priority over settings.xml
+            doc_lang = None
+        
+            # First, try to extract language from TEI header's profileDesc/langUsage/language
+            if input_format == "teitok" and args.input and args.input not in ("-", "<inline-data>"):
+                try:
+                    import xml.etree.ElementTree as ET
+                    tree = ET.parse(args.input)
+                    root = tree.getroot()
+                    # Look for <profileDesc><langUsage><language ident="...">
+                    profile_desc = root.find(".//{http://www.tei-c.org/ns/1.0}profileDesc")
+                    if profile_desc is None:
+                        profile_desc = root.find(".//profileDesc")
+                    if profile_desc is not None:
+                        lang_usage = profile_desc.find("{http://www.tei-c.org/ns/1.0}langUsage")
+                        if lang_usage is None:
+                            lang_usage = profile_desc.find("langUsage")
+                        if lang_usage is not None:
+                            lang_elem = lang_usage.find("{http://www.tei-c.org/ns/1.0}language")
+                            if lang_elem is None:
+                                lang_elem = lang_usage.find("language")
+                            if lang_elem is not None:
+                                # Get language from @ident attribute (preferred) or text content
+                                doc_lang = lang_elem.get("ident") or lang_elem.text
+                                if doc_lang:
+                                    doc_lang = doc_lang.strip()
+                except Exception:
+                    # If parsing fails, continue with other methods
+                    pass
+        
+            # Also check doc.attrs and doc.meta (may have been set during loading)
+            if not doc_lang and hasattr(doc, "attrs") and doc.attrs:
+                doc_lang = doc.attrs.get("language") or doc.attrs.get("lang")
+            if not doc_lang and hasattr(doc, "meta") and doc.meta:
+                doc_lang = doc.meta.get("language") or doc.meta.get("lang")
+        
+            # If we have a language from document teiHeader, use it (overrides settings.xml)
+            if doc_lang:
+                # Override any language that was set from settings.xml
+                args.language = doc_lang
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] Using language from document metadata (teiHeader): {doc_lang}", file=sys.stderr)
+        
+            # Check TEITOK settings.xml if still no language (only if teiHeader didn't provide one)
+            if not getattr(args, "language", None) and input_format == "teitok":
+                # Try to load settings if we haven't already
+                if args.input and args.input not in ("-", "<inline-data>"):
                     if not teitok_settings_obj:
-                        teitok_settings_obj = teitok_settings
-                    if not writeback_explicit:
-                        args.writeback = True
-                    if args.verbose or args.debug:
-                        print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
-                    # Set language from settings.xml if not already set
-                    if not getattr(args, "language", None):
+                        teitok_settings_obj, _ = _load_and_merge_teitok_settings(args, args.input)
+                    teitok_settings = teitok_settings_obj
+                    if teitok_settings:
                         settings_lang = teitok_settings.get_language()
                         if settings_lang:
                             args.language = settings_lang
                             if args.verbose or args.debug:
                                 print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
+        
+            # Try language detection if still no language
+            if not getattr(args, "language", None):
+                detection_result = _maybe_detect_language(args, detection_source_text)
+                detection_attempted = True
+                # Store detected language in document.meta
+                if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
+                    doc.meta["language"] = detection_result["language"]
+                    # Prefer language_iso for settings.xml matching (e.g., "en" instead of "English (EWT)")
+                    detected_lang = detection_result.get("language_iso") or detection_result.get("language")
+                    args.language = detected_lang
             else:
-                # Load TEITOK settings and merge with CLI mappings
-                teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
-                if teitok_settings:
-                    if not teitok_settings_obj:
-                        teitok_settings_obj = teitok_settings
-                    if not writeback_explicit:
-                        args.writeback = True
-                xpos_attr = merged_attrs_map.get("xpos")
-                reg_attr = merged_attrs_map.get("reg")
-                expan_attr = merged_attrs_map.get("expan")
-                lemma_attr = merged_attrs_map.get("lemma")
-                doc = load_teitok(
-                    args.input,
-                    xpos_attr=xpos_attr,
-                    reg_attr=reg_attr,
-                    expan_attr=expan_attr,
-                    lemma_attr=lemma_attr,
-                )
-                # Normalize document encoding
-                if unicode_normalize != "none":
-                    doc.normalize_unicode(unicode_normalize)
-                # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
-                # Only enable if settings.xml actually exists (we're in a TEITOK project)
-                if args.writeback is None and teitok_settings and teitok_settings.settings_path and teitok_settings.settings_path.exists():
-                    args.writeback = True
+                detection_attempted = True
+        
+            # Store final language in document.meta
+            if getattr(args, "language", None):
+                doc.meta["language"] = args.language
+
+        # Apply settings.xml preferences BEFORE auto-selection, but only if not overridden by CLI
+        # Priority: CLI arguments > settings.xml > auto-selection
+        if teitok_settings_obj and getattr(args, "language", None):
+            # Try to get preference using the language as-is, and also try extracting ISO code
+            from .language_utils import resolve_language_query
+            lang_query = resolve_language_query(args.language)
+            lang_iso = lang_query.get("raw_normalized") or lang_query.get("iso", set())
+            if isinstance(lang_iso, set) and lang_iso:
+                lang_iso = next(iter(lang_iso))
+        
+            # Try both the full language string and the ISO code
+            pref = teitok_settings_obj.get_flexipipe_preference(args.language)
+            if not pref and lang_iso and lang_iso != args.language:
+                pref = teitok_settings_obj.get_flexipipe_preference(lang_iso)
+        
+            if args.verbose or args.debug:
+                print(f"[flexipipe] Checking settings.xml preferences for language '{args.language}' (ISO: {lang_iso}): {pref}", file=sys.stderr)
+            if pref:
+                pref_backend = pref.get("backend")
+                pref_model = pref.get("model")
+                # Only apply settings.xml backend if not explicitly set via CLI
+                if pref_backend and not getattr(args, "_backend_explicit", False):
+                    args.backend = pref_backend
+                    backend_type = pref_backend
+                    setattr(args, "_backend_explicit", True)
+                    setattr(args, "_settings_xml_backend_set", True)
                     if args.verbose or args.debug:
-                        print("[flexipipe] Auto-enabled writeback mode (TEITOK settings.xml found)", file=sys.stderr)
-                # Store settings for later language resolution
-                # (Language will be resolved after document is loaded to check teiHeader first)
-        detection_source_text = _document_to_plain_text(doc)
-    if args.debug:
-        sent_count = len(doc.sentences)
-        tok_count = sum(len(sent.tokens) for sent in doc.sentences)
-        print(f"[flexipipe] loaded document: sentences={sent_count} tokens={tok_count}")
+                        print(f"[flexipipe] Using preferred backend '{pref_backend}' for language '{args.language}' from settings.xml", file=sys.stderr)
+                elif pref_backend and (args.verbose or args.debug):
+                    print(f"[flexipipe] Settings.xml specifies backend '{pref_backend}' but CLI argument overrides it", file=sys.stderr)
+                # Only apply settings.xml model if not explicitly set via CLI
+                if pref_model and not getattr(args, "model", None):
+                    args.model = pref_model
+                    if args.verbose or args.debug:
+                        print(f"[flexipipe] Using preferred model '{pref_model}' for language '{args.language}' from settings.xml", file=sys.stderr)
+            elif (args.verbose or args.debug) and teitok_settings_obj:
+                print(f"[flexipipe] No settings.xml preferences found for language '{args.language}'", file=sys.stderr)
 
-    if not detection_attempted:
-        # Language resolution priority:
-        # 1. CLI --language (already checked)
-        # 2. Document metadata (from teiHeader)
-        # 3. TEITOK settings.xml (if available)
-        # 4. Language detection
-        
-        # Check document metadata first (from teiHeader)
-        # teiHeader language takes priority over settings.xml
-        doc_lang = None
-        
-        # First, try to extract language from TEI header's profileDesc/langUsage/language
-        if input_format == "teitok" and args.input and args.input not in ("-", "<inline-data>"):
-            try:
-                import xml.etree.ElementTree as ET
-                tree = ET.parse(args.input)
-                root = tree.getroot()
-                # Look for <profileDesc><langUsage><language ident="...">
-                profile_desc = root.find(".//{http://www.tei-c.org/ns/1.0}profileDesc")
-                if profile_desc is None:
-                    profile_desc = root.find(".//profileDesc")
-                if profile_desc is not None:
-                    lang_usage = profile_desc.find("{http://www.tei-c.org/ns/1.0}langUsage")
-                    if lang_usage is None:
-                        lang_usage = profile_desc.find("langUsage")
-                    if lang_usage is not None:
-                        lang_elem = lang_usage.find("{http://www.tei-c.org/ns/1.0}language")
-                        if lang_elem is None:
-                            lang_elem = lang_usage.find("language")
-                        if lang_elem is not None:
-                            # Get language from @ident attribute (preferred) or text content
-                            doc_lang = lang_elem.get("ident") or lang_elem.text
-                            if doc_lang:
-                                doc_lang = doc_lang.strip()
-            except Exception:
-                # If parsing fails, continue with other methods
-                pass
-        
-        # Also check doc.attrs and doc.meta (may have been set during loading)
-        if not doc_lang and hasattr(doc, "attrs") and doc.attrs:
-            doc_lang = doc.attrs.get("language") or doc.attrs.get("lang")
-        if not doc_lang and hasattr(doc, "meta") and doc.meta:
-            doc_lang = doc.meta.get("language") or doc.meta.get("lang")
-        
-        # If we have a language from document teiHeader, use it (overrides settings.xml)
-        if doc_lang:
-            # Override any language that was set from settings.xml
-            args.language = doc_lang
-            if args.verbose or args.debug:
-                print(f"[flexipipe] Using language from document metadata (teiHeader): {doc_lang}", file=sys.stderr)
-        
-        # Check TEITOK settings.xml if still no language (only if teiHeader didn't provide one)
-        if not getattr(args, "language", None) and input_format == "teitok":
-            # Try to load settings if we haven't already
-            if args.input and args.input not in ("-", "<inline-data>"):
-                if not teitok_settings_obj:
-                    teitok_settings_obj, _ = _load_and_merge_teitok_settings(args, args.input)
-                teitok_settings = teitok_settings_obj
-                if teitok_settings:
-                    settings_lang = teitok_settings.get_language()
-                    if settings_lang:
-                        args.language = settings_lang
-                        if args.verbose or args.debug:
-                            print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
-        
-        # Try language detection if still no language
-        if not getattr(args, "language", None):
-            detection_result = _maybe_detect_language(args, detection_source_text)
-            detection_attempted = True
-            # Store detected language in document.meta
-            if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
-                doc.meta["language"] = detection_result["language"]
-                # Prefer language_iso for settings.xml matching (e.g., "en" instead of "English (EWT)")
-                detected_lang = detection_result.get("language_iso") or detection_result.get("language")
-                args.language = detected_lang
-        else:
-            detection_attempted = True
-        
-        # Store final language in document.meta
-        if getattr(args, "language", None):
-            doc.meta["language"] = args.language
+        if args.test:
+            args.writeback = True
 
-    # Apply settings.xml preferences BEFORE auto-selection, but only if not overridden by CLI
-    # Priority: CLI arguments > settings.xml > auto-selection
-    if teitok_settings_obj and getattr(args, "language", None):
-        # Try to get preference using the language as-is, and also try extracting ISO code
-        from .language_utils import resolve_language_query
-        lang_query = resolve_language_query(args.language)
-        lang_iso = lang_query.get("raw_normalized") or lang_query.get("iso", set())
-        if isinstance(lang_iso, set) and lang_iso:
-            lang_iso = next(iter(lang_iso))
-        
-        # Try both the full language string and the ISO code
-        pref = teitok_settings_obj.get_flexipipe_preference(args.language)
-        if not pref and lang_iso and lang_iso != args.language:
-            pref = teitok_settings_obj.get_flexipipe_preference(lang_iso)
-        
-        if args.verbose or args.debug:
-            print(f"[flexipipe] Checking settings.xml preferences for language '{args.language}' (ISO: {lang_iso}): {pref}", file=sys.stderr)
-        if pref:
-            pref_backend = pref.get("backend")
-            pref_model = pref.get("model")
-            # Only apply settings.xml backend if not explicitly set via CLI
-            if pref_backend and not getattr(args, "_backend_explicit", False):
-                args.backend = pref_backend
-                backend_type = pref_backend
-                setattr(args, "_backend_explicit", True)
-                setattr(args, "_settings_xml_backend_set", True)
-                if args.verbose or args.debug:
-                    print(f"[flexipipe] Using preferred backend '{pref_backend}' for language '{args.language}' from settings.xml", file=sys.stderr)
-            elif pref_backend and (args.verbose or args.debug):
-                print(f"[flexipipe] Settings.xml specifies backend '{pref_backend}' but CLI argument overrides it", file=sys.stderr)
-            # Only apply settings.xml model if not explicitly set via CLI
-            if pref_model and not getattr(args, "model", None):
-                args.model = pref_model
-                if args.verbose or args.debug:
-                    print(f"[flexipipe] Using preferred model '{pref_model}' for language '{args.language}' from settings.xml", file=sys.stderr)
-        elif (args.verbose or args.debug) and teitok_settings_obj:
-            print(f"[flexipipe] No settings.xml preferences found for language '{args.language}'", file=sys.stderr)
-
-    if args.test:
-        args.writeback = True
-
-    # Only auto-select if backend and model aren't already set (e.g., from settings.xml)
-    # Skip auto-selection if:
-    # 1. Backend is explicitly set (from CLI or settings.xml) - always skip if backend is set
-    # 2. Settings.xml set a backend (even if model isn't set yet)
-    backend_explicit = getattr(args, "_backend_explicit", False)
-    model_set = bool(getattr(args, "model", None))
-    settings_xml_backend_set = getattr(args, "_settings_xml_backend_set", False)
-    # Skip auto-selection if backend is explicitly set (CLI or settings.xml)
-    skip_auto_select = backend_explicit or settings_xml_backend_set
+        # Only auto-select if backend and model aren't already set (e.g., from settings.xml)
+        # Skip auto-selection if:
+        # 1. Backend is explicitly set (from CLI or settings.xml) - always skip if backend is set
+        # 2. Settings.xml set a backend (even if model isn't set yet)
+        backend_explicit = getattr(args, "_backend_explicit", False)
+        model_set = bool(getattr(args, "model", None))
+        settings_xml_backend_set = getattr(args, "_settings_xml_backend_set", False)
+        # Skip auto-selection if backend is explicitly set (CLI or settings.xml)
+        skip_auto_select = backend_explicit or settings_xml_backend_set
     
-    if not auto_selected and not skip_auto_select:
-        backend_type = _auto_select_model_for_language(args, backend_type)
-        args.backend = backend_type
-        auto_selected = True
-        if backend_type is None:
-            print(f"[flexipipe] No available models found for language '{language_arg or args.language}'.", file=sys.stderr)
-            return 1
-    elif skip_auto_select and (args.verbose or args.debug):
-        print(f"[flexipipe] Skipping auto-selection (backend explicitly set: {backend_explicit}, model set: {model_set}, settings.xml backend: {settings_xml_backend_set})", file=sys.stderr)
-        if backend_type:
-            print(f"[flexipipe] Using backend: {backend_type}", file=sys.stderr)
+        if not auto_selected and not skip_auto_select:
+            backend_type = _auto_select_model_for_language(args, backend_type)
+            args.backend = backend_type
+            auto_selected = True
+            if backend_type is None:
+                print(f"[flexipipe] No available models found for language '{language_arg or args.language}'.", file=sys.stderr)
+                return 1
+        elif skip_auto_select and (args.verbose or args.debug):
+            print(f"[flexipipe] Skipping auto-selection (backend explicitly set: {backend_explicit}, model set: {model_set}, settings.xml backend: {settings_xml_backend_set})", file=sys.stderr)
+            if backend_type:
+                print(f"[flexipipe] Using backend: {backend_type}", file=sys.stderr)
 
-    # Apply normalization strategy for NLP components if requested
-    if getattr(args, "nlpform", "form") != "form":
-        doc = apply_nlpform(doc, args.nlpform)
+        # Apply normalization strategy for NLP components if requested
+        if getattr(args, "nlpform", "form") != "form":
+            doc = apply_nlpform(doc, args.nlpform)
 
-    # Track model information for output
-    model_str = None
+        # Track model information for output
+        model_str = None
     
-    # Check if we need a backend at all - if no tasks are requested (or only mandatory tasks),
-    # we can skip backend processing and just do format conversion
-    tasks_requiring_backend = requested_tasks - TASK_MANDATORY
-    needs_backend = len(tasks_requiring_backend) > 0
-    if args.writeback and input_format == "teitok":
-        # Always ensure default tasks are requested for writeback to guarantee tagging happens
-        # This ensures the document gets properly annotated even if user didn't specify --tasks
+        # Check if we need a backend at all - if no tasks are requested (or only mandatory tasks),
+        # we can skip backend processing and just do format conversion
+        tasks_requiring_backend = requested_tasks - TASK_MANDATORY
+        needs_backend = len(tasks_requiring_backend) > 0
+        if args.writeback and input_format == "teitok":
+            # Always ensure default tasks are requested for writeback to guarantee tagging happens
+            # This ensures the document gets properly annotated even if user didn't specify --tasks
+            if not needs_backend:
+                requested_tasks = set(TASK_DEFAULTS)
+                tasks_requiring_backend = requested_tasks - TASK_MANDATORY
+                needs_backend = True
+                if args.verbose or args.debug:
+                    tasks_str = ", ".join(sorted(requested_tasks))
+                    print(f"[flexipipe] writeback requested; running default tagging tasks: {tasks_str}", file=sys.stderr)
+            else:
+                needs_backend = True
+                if args.verbose or args.debug:
+                    tasks_str = ", ".join(sorted(requested_tasks))
+                    print(f"[flexipipe] writeback requested; forcing backend execution with tasks: {tasks_str}", file=sys.stderr)
+    
+        # If no backend is needed, skip all backend processing
         if not needs_backend:
-            requested_tasks = set(TASK_DEFAULTS)
-            tasks_requiring_backend = requested_tasks - TASK_MANDATORY
-            needs_backend = True
-            if args.verbose or args.debug:
-                tasks_str = ", ".join(sorted(requested_tasks))
-                print(f"[flexipipe] writeback requested; running default tagging tasks: {tasks_str}", file=sys.stderr)
+            # Just use the document as-is for format conversion
+            from .engine import FlexitagResult
+            result = FlexitagResult(document=doc, stats={})
+            model_str = None  # No model used for format conversion
         else:
-            needs_backend = True
-            if args.verbose or args.debug:
-                tasks_str = ", ".join(sorted(requested_tasks))
-                print(f"[flexipipe] writeback requested; forcing backend execution with tasks: {tasks_str}", file=sys.stderr)
-    
-    # If no backend is needed, skip all backend processing
-    if not needs_backend:
-        # Just use the document as-is for format conversion
-        from .engine import FlexitagResult
-        result = FlexitagResult(document=doc, stats={})
-        model_str = None  # No model used for format conversion
-    else:
-        neural_components = _tasks_to_backend_components(requested_tasks, backend_type)
+            neural_components = _tasks_to_backend_components(requested_tasks, backend_type)
         
-        # backend_type now reflects any auto-selected backend after language detection
+            # backend_type now reflects any auto-selected backend after language detection
         
-        excluded_backends: set[str] = set()
-        backend_kwargs: dict[str, object] = {}
+            excluded_backends: set[str] = set()
+            backend_kwargs: dict[str, object] = {}
 
-        while True:
-            # Always use args.backend if set (from CLI, settings.xml, or auto-selection)
-            # This ensures settings.xml preferences are respected
-            backend_type = args.backend or backend_type
-            backend_kwargs = {}
+            while True:
+                # Always use args.backend if set (from CLI, settings.xml, or auto-selection)
+                # This ensures settings.xml preferences are respected
+                backend_type = args.backend or backend_type
+                backend_kwargs = {}
 
-            if backend_type and backend_type != "flexitag":
-                backend_type_lower = backend_type.lower()
-                # Precedence: CLI > TEITOK settings > config default
-                download_model_explicit = hasattr(args, "download_model") and args.download_model is not None
-                if download_model_explicit:
-                    backend_kwargs["download_model"] = bool(args.download_model)
-                elif teitok_settings_obj and teitok_settings_obj.download_model:
-                    backend_kwargs["download_model"] = True
-                else:
-                    backend_kwargs["download_model"] = get_default_download_model()
-                if backend_type_lower == "stanza":
-                    backend_kwargs["enable_wsd"] = bool(getattr(args, "stanza_wsd", False))
-                    backend_kwargs["enable_sentiment"] = bool(getattr(args, "stanza_sentiment", False))
-                    backend_kwargs["enable_coref"] = bool(getattr(args, "stanza_coref", False))
-                    # --stanza-package removed: use --model lang_package format instead (e.g., --model cs_cac)
-                    model_name = getattr(args, "model", None)
-                    language = getattr(args, "language", None)
-                    stanza_lang, stanza_pkg, stanza_model = _parse_stanza_model_spec(
-                        model_name, language, None  # No longer support --stanza-package
-                    )
-                    if stanza_lang:
-                        backend_kwargs["language"] = stanza_lang
-                    if stanza_pkg:
-                        backend_kwargs["package"] = stanza_pkg
-                    if stanza_model:
-                        backend_kwargs["model_name"] = stanza_model
-                # Parse ClassLA model specification (lang-type format, e.g., mk-standard, sr-nonstandard)
-                elif backend_type_lower == "classla":
-                    classla_package = getattr(args, "classla_package", None)
-                    classla_type = getattr(args, "classla_type", None)
-                    model_name = getattr(args, "model", None)
-                    language = getattr(args, "language", None)
-                    classla_lang, classla_pkg, classla_model, classla_type_parsed = _parse_classla_model_spec(
-                        model_name, language, classla_package, classla_type
-                    )
-                    if classla_lang:
-                        backend_kwargs["language"] = classla_lang
-                    if classla_pkg:
-                        backend_kwargs["package"] = classla_pkg
-                    if classla_type_parsed:
-                        backend_kwargs["type"] = classla_type_parsed
-                    if classla_model:
-                        backend_kwargs["model_name"] = classla_model
+                if backend_type and backend_type != "flexitag":
+                    backend_type_lower = backend_type.lower()
                     # Precedence: CLI > TEITOK settings > config default
                     download_model_explicit = hasattr(args, "download_model") and args.download_model is not None
                     if download_model_explicit:
@@ -5034,1056 +5043,1109 @@ def run_tag(args: argparse.Namespace) -> int:
                         backend_kwargs["download_model"] = True
                     else:
                         backend_kwargs["download_model"] = get_default_download_model()
-                elif backend_type_lower == "transformers":
-                    if not getattr(args, "model", None):
-                        print("[flexipipe] Transformers backend requires --model to specify a HuggingFace model.", file=sys.stderr)
-                        return 1
-                    backend_kwargs["task"] = getattr(args, "transformers_task", None)
-                    backend_kwargs["adapter_name"] = getattr(args, "transformers_adapter", None)
-                    backend_kwargs["device"] = getattr(args, "transformers_device", "cpu")
-                    backend_kwargs["revision"] = getattr(args, "transformers_revision", None)
-                    backend_kwargs["trust_remote_code"] = bool(getattr(args, "transformers_trust_remote_code", False))
-                    context_override = _parse_transformers_context_arg(getattr(args, "transformers_context", None))
-                    if context_override:
-                        backend_kwargs["context_attrs"] = context_override
-                    else:
-                        entry = _get_transformers_model_entry(getattr(args, "model", None))
-                        default_context = entry.get("context_attrs") if entry else None
-                        if default_context:
-                            backend_kwargs["context_attrs"] = default_context
-                
-                # Add UDPipe-specific kwargs (only for udpipe REST backend, not udpipe1)
-                if backend_type_lower == "udpipe":
-                    backend_kwargs.update(_build_udpipe_backend_kwargs(args))
-                # Add UDMorph-specific kwargs
-                if backend_type_lower == "udmorph":
-                    backend_kwargs.update(_build_udmorph_backend_kwargs(args))
-                # Add NameTag-specific kwargs
-                if backend_type_lower == "nametag":
-                    backend_kwargs.update(_build_nametag_backend_kwargs(args))
-                # Add TreeTagger-specific kwargs
-                if backend_type_lower == "treetagger":
-                    backend_kwargs.update(_build_treetagger_backend_kwargs(args))
-
-            try:
-                _prepare_spacy_model_if_needed(args)
-            except SystemExit as exc:
-                backend_type_lower = backend_type.lower() if backend_type else None
-                backend_locked = bool(getattr(args, "_backend_explicit", False))
-                if (
-                    backend_type_lower == "spacy"
-                    and not backend_locked
-                ):
-                    missing_model = getattr(args, "model", None)
-                    args.model = None
-                    args.backend = None
-                    excluded_backends.add("spacy")
-                    fallback_backend = _auto_select_model_for_language(
-                        args,
-                        None,
-                        exclude_backends=excluded_backends,
-                    )
-                    if fallback_backend and fallback_backend.lower() not in excluded_backends:
-                        msg = exc.code if isinstance(exc.code, str) else str(exc)
-                        if msg:
-                            print(f"[flexipipe] {msg}")
-                        print(
-                            f"[flexipipe] Falling back to backend '{fallback_backend}' "
-                            f"because spaCy model '{missing_model}' is not installed."
-                        )
-                        backend_type = fallback_backend
-                        args.backend = fallback_backend
-                        continue
-                raise
-
-            if backend_type and backend_type != "flexitag":
-                # Check if we need flexitag fallback (use_neural_primary means neural is primary, flexitag is fallback)
-                needs_flexitag_fallback = getattr(args, 'use_neural_primary', False)
-                if not needs_flexitag_fallback:
-                    # Neural backend only, no flexitag fallback
-                    from .backend_registry import create_backend
-                    
-                    # Resolve flexitag model path if needed for fallback (from --model, not --params)
-                    flexitag_model_path = None
-                    
-                    # Extract Stanza-specific args if present
-                    stanza_lang = backend_kwargs.pop("language", None)
-                    stanza_pkg = backend_kwargs.pop("package", None)
-                    stanza_model = backend_kwargs.pop("model_name", None)
-                    
-                    # Build create_backend arguments
-                    create_kwargs = dict(backend_kwargs)
-                    model_name = getattr(args, "model", None)
-                    language = getattr(args, "language", None)
-                    
                     if backend_type_lower == "stanza":
-                        create_kwargs["package"] = stanza_pkg
-                        create_kwargs["language"] = stanza_lang
-                        create_kwargs["model_name"] = stanza_model
-                    elif backend_type_lower == "udpipe1":
-                        # For udpipe1, pass model directly (not model_name or model_path)
-                        if model_name:
-                            create_kwargs["model"] = model_name
-                        create_kwargs.pop("model_name", None)
-                        create_kwargs.pop("model_path", None)
-                    else:
-                        create_kwargs["model_name"] = model_name
-                        if backend_type_lower == "flair":
-                            create_kwargs["language"] = language or "en"
-                        else:
-                            create_kwargs["language"] = language if not model_name else None
-                    
-                    # Only pass verbose to backends that support it (stanza, flair, udpipe1, transformers, ctext)
-                    backend_kwargs_final = dict(create_kwargs)
-                    if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers", "ctext"):
-                        backend_kwargs_final["verbose"] = args.verbose or args.debug
-                    # Pass debug separately for backends that support it (udkanbun)
-                    if backend_type.lower() == "udkanbun":
-                        backend_kwargs_final["debug"] = args.debug
-                        backend_kwargs_final["verbose"] = args.verbose
-                    
-                    # For udpipe1, don't use model_path - pass model directly
-                    model_path_arg = None
-                    if backend_type_lower != "udpipe1":
-                        model_path_arg = model_name if model_name and Path(model_name).exists() else None
-                    
-                    if args.verbose or args.debug:
-                        print(f"[flexipipe] Creating backend: {backend_type} (model: {model_name or 'auto'})", file=sys.stderr)
-                    
-                    try:
-                        neural_backend = create_backend(
-                            backend_type,
-                            training=False,
-                            model_path=model_path_arg,
-                            **backend_kwargs_final,
+                        backend_kwargs["enable_wsd"] = bool(getattr(args, "stanza_wsd", False))
+                        backend_kwargs["enable_sentiment"] = bool(getattr(args, "stanza_sentiment", False))
+                        backend_kwargs["enable_coref"] = bool(getattr(args, "stanza_coref", False))
+                        # --stanza-package removed: use --model lang_package format instead (e.g., --model cs_cac)
+                        model_name = getattr(args, "model", None)
+                        language = getattr(args, "language", None)
+                        stanza_lang, stanza_pkg, stanza_model = _parse_stanza_model_spec(
+                            model_name, language, None  # No longer support --stanza-package
                         )
-                    except (ImportError, RuntimeError, ValueError) as exc:
-                        # Check if this is a JSON parsing error (from corrupted cache files)
-                        error_msg = str(exc)
-                        if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
-                            if args.debug:
-                                import traceback
-                                print("[flexipipe] Full traceback for JSON error:", file=sys.stderr)
-                                traceback.print_exc(file=sys.stderr)
-                            print(
-                                "[flexipipe] Error: Corrupted JSON file detected. "
-                                "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
-                                file=sys.stderr
-                            )
+                        if stanza_lang:
+                            backend_kwargs["language"] = stanza_lang
+                        if stanza_pkg:
+                            backend_kwargs["package"] = stanza_pkg
+                        if stanza_model:
+                            backend_kwargs["model_name"] = stanza_model
+                    # Parse ClassLA model specification (lang-type format, e.g., mk-standard, sr-nonstandard)
+                    elif backend_type_lower == "classla":
+                        classla_package = getattr(args, "classla_package", None)
+                        classla_type = getattr(args, "classla_type", None)
+                        model_name = getattr(args, "model", None)
+                        language = getattr(args, "language", None)
+                        classla_lang, classla_pkg, classla_model, classla_type_parsed = _parse_classla_model_spec(
+                            model_name, language, classla_package, classla_type
+                        )
+                        if classla_lang:
+                            backend_kwargs["language"] = classla_lang
+                        if classla_pkg:
+                            backend_kwargs["package"] = classla_pkg
+                        if classla_type_parsed:
+                            backend_kwargs["type"] = classla_type_parsed
+                        if classla_model:
+                            backend_kwargs["model_name"] = classla_model
+                        # Precedence: CLI > TEITOK settings > config default
+                        download_model_explicit = hasattr(args, "download_model") and args.download_model is not None
+                        if download_model_explicit:
+                            backend_kwargs["download_model"] = bool(args.download_model)
+                        elif teitok_settings_obj and teitok_settings_obj.download_model:
+                            backend_kwargs["download_model"] = True
+                        else:
+                            backend_kwargs["download_model"] = get_default_download_model()
+                    elif backend_type_lower == "transformers":
+                        if not getattr(args, "model", None):
+                            print("[flexipipe] Transformers backend requires --model to specify a HuggingFace model.", file=sys.stderr)
                             return 1
-                        # Backend not available (missing module) - try to find an alternative
-                        backend_locked = bool(getattr(args, "_backend_explicit", False))
-                        if not backend_locked:
-                            # Only fallback if backend wasn't explicitly requested
-                            if "requires the" in error_msg and "module" in error_msg:
-                                # Missing module - try alternative backend
-                                excluded_backends.add(backend_type_lower)
-                                fallback_backend = _auto_select_model_for_language(
-                                    args,
-                                    None,
-                                    exclude_backends=excluded_backends,
+                        backend_kwargs["task"] = getattr(args, "transformers_task", None)
+                        backend_kwargs["adapter_name"] = getattr(args, "transformers_adapter", None)
+                        backend_kwargs["device"] = getattr(args, "transformers_device", "cpu")
+                        backend_kwargs["revision"] = getattr(args, "transformers_revision", None)
+                        backend_kwargs["trust_remote_code"] = bool(getattr(args, "transformers_trust_remote_code", False))
+                        context_override = _parse_transformers_context_arg(getattr(args, "transformers_context", None))
+                        if context_override:
+                            backend_kwargs["context_attrs"] = context_override
+                        else:
+                            entry = _get_transformers_model_entry(getattr(args, "model", None))
+                            default_context = entry.get("context_attrs") if entry else None
+                            if default_context:
+                                backend_kwargs["context_attrs"] = default_context
+                
+                    # Add UDPipe-specific kwargs (only for udpipe REST backend, not udpipe1)
+                    if backend_type_lower == "udpipe":
+                        backend_kwargs.update(_build_udpipe_backend_kwargs(args))
+                    # Add UDMorph-specific kwargs
+                    if backend_type_lower == "udmorph":
+                        backend_kwargs.update(_build_udmorph_backend_kwargs(args))
+                    # Add NameTag-specific kwargs
+                    if backend_type_lower == "nametag":
+                        backend_kwargs.update(_build_nametag_backend_kwargs(args))
+                    # Add TreeTagger-specific kwargs
+                    if backend_type_lower == "treetagger":
+                        backend_kwargs.update(_build_treetagger_backend_kwargs(args))
+
+                try:
+                    _prepare_spacy_model_if_needed(args)
+                except SystemExit as exc:
+                    backend_type_lower = backend_type.lower() if backend_type else None
+                    backend_locked = bool(getattr(args, "_backend_explicit", False))
+                    if (
+                        backend_type_lower == "spacy"
+                        and not backend_locked
+                    ):
+                        missing_model = getattr(args, "model", None)
+                        args.model = None
+                        args.backend = None
+                        excluded_backends.add("spacy")
+                        fallback_backend = _auto_select_model_for_language(
+                            args,
+                            None,
+                            exclude_backends=excluded_backends,
+                        )
+                        if fallback_backend and fallback_backend.lower() not in excluded_backends:
+                            msg = exc.code if isinstance(exc.code, str) else str(exc)
+                            if msg:
+                                print(f"[flexipipe] {msg}")
+                            print(
+                                f"[flexipipe] Falling back to backend '{fallback_backend}' "
+                                f"because spaCy model '{missing_model}' is not installed."
+                            )
+                            backend_type = fallback_backend
+                            args.backend = fallback_backend
+                            continue
+                    raise
+
+                if backend_type and backend_type != "flexitag":
+                    # Check if we need flexitag fallback (use_neural_primary means neural is primary, flexitag is fallback)
+                    needs_flexitag_fallback = getattr(args, 'use_neural_primary', False)
+                    if not needs_flexitag_fallback:
+                        # Neural backend only, no flexitag fallback
+                        from .backend_registry import create_backend
+                    
+                        # Resolve flexitag model path if needed for fallback (from --model, not --params)
+                        flexitag_model_path = None
+                    
+                        # Extract Stanza-specific args if present
+                        stanza_lang = backend_kwargs.pop("language", None)
+                        stanza_pkg = backend_kwargs.pop("package", None)
+                        stanza_model = backend_kwargs.pop("model_name", None)
+                    
+                        # Build create_backend arguments
+                        create_kwargs = dict(backend_kwargs)
+                        model_name = getattr(args, "model", None)
+                        language = getattr(args, "language", None)
+                    
+                        if backend_type_lower == "stanza":
+                            create_kwargs["package"] = stanza_pkg
+                            create_kwargs["language"] = stanza_lang
+                            create_kwargs["model_name"] = stanza_model
+                        elif backend_type_lower == "udpipe1":
+                            # For udpipe1, pass model directly (not model_name or model_path)
+                            if model_name:
+                                create_kwargs["model"] = model_name
+                            create_kwargs.pop("model_name", None)
+                            create_kwargs.pop("model_path", None)
+                        else:
+                            create_kwargs["model_name"] = model_name
+                            if backend_type_lower == "flair":
+                                create_kwargs["language"] = language or "en"
+                            else:
+                                create_kwargs["language"] = language if not model_name else None
+                    
+                        # Only pass verbose to backends that support it (stanza, flair, udpipe1, transformers, ctext)
+                        backend_kwargs_final = dict(create_kwargs)
+                        if backend_type.lower() in ("stanza", "classla", "flair", "udpipe1", "spacy", "transformers", "ctext"):
+                            backend_kwargs_final["verbose"] = args.verbose or args.debug
+                        # Pass debug separately for backends that support it (udkanbun)
+                        if backend_type.lower() == "udkanbun":
+                            backend_kwargs_final["debug"] = args.debug
+                            backend_kwargs_final["verbose"] = args.verbose
+                    
+                        # For udpipe1, don't use model_path - pass model directly
+                        model_path_arg = None
+                        if backend_type_lower != "udpipe1":
+                            model_path_arg = model_name if model_name and Path(model_name).exists() else None
+                    
+                        _cache = getattr(args, "_backend_cache", None)
+                        _cache_key = (backend_type, model_name, getattr(args, "language", None)) if _cache is not None else None
+                        if _cache_key is not None and _cache_key in _cache:
+                            neural_backend = _cache[_cache_key]
+                            if args.verbose or args.debug:
+                                print(f"[flexipipe] Reusing backend: {backend_type} (model: {model_name or 'auto'})", file=sys.stderr)
+                        else:
+                            if args.verbose or args.debug:
+                                print(f"[flexipipe] Creating backend: {backend_type} (model: {model_name or 'auto'})", file=sys.stderr)
+                            try:
+                                neural_backend = create_backend(
+                                    backend_type,
+                                    training=False,
+                                    model_path=model_path_arg,
+                                    **backend_kwargs_final,
                                 )
-                                if fallback_backend and fallback_backend.lower() not in excluded_backends:
-                                    print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                                if _cache_key is not None:
+                                    _cache[_cache_key] = neural_backend
+                            except (ImportError, RuntimeError, ValueError) as exc:
+                                # Check if this is a JSON parsing error (from corrupted cache files)
+                                error_msg = str(exc)
+                                if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
+                                    if args.debug:
+                                        import traceback
+                                        print("[flexipipe] Full traceback for JSON error:", file=sys.stderr)
+                                        traceback.print_exc(file=sys.stderr)
                                     print(
-                                        f"[flexipipe] Falling back to backend '{fallback_backend}' "
-                                        f"because '{backend_type}' is not available.",
+                                        "[flexipipe] Error: Corrupted JSON file detected. "
+                                        "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
                                         file=sys.stderr
                                     )
-                                    backend_type = fallback_backend
-                                    backend_type_lower = backend_type.lower()
-                                    args.backend = fallback_backend
-                                    # Retry with fallback backend
-                                    continue
-                        # If backend was explicitly requested or no fallback found, raise the error
-                        raise
-                    except (ValueError, FileNotFoundError, RuntimeError) as e:
-                        error_msg = str(e)
-                        # Check if this is a JSON parsing error (from corrupted cache files)
-                        if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
-                            if args.debug:
-                                import traceback
-                                print("[flexipipe] Full traceback:", file=sys.stderr)
-                                traceback.print_exc(file=sys.stderr)
-                            print(
-                                "[flexipipe] Error: Corrupted JSON file detected. "
-                                "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
-                                file=sys.stderr
-                            )
-                            return 1
-                        # Check if language detection was attempted and failed
-                        if detection_attempted and detection_result is None and not getattr(args, "language", None):
-                            # Language detection failed - enhance the error message
-                            if "requires" in error_msg and ("model" in error_msg or "language" in error_msg):
-                                print(
-                                    "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
-                                    "Please provide --language or --model explicitly.",
-                                    file=sys.stderr
-                                )
-                        print(f"[flexipipe] {error_msg}", file=sys.stderr)
-                        return 1
+                                    return 1
+                                # Backend not available (missing module) - try to find an alternative
+                                backend_locked = bool(getattr(args, "_backend_explicit", False))
+                                if not backend_locked:
+                                    # Only fallback if backend wasn't explicitly requested
+                                    if "requires the" in error_msg and "module" in error_msg:
+                                        # Missing module - try alternative backend
+                                        excluded_backends.add(backend_type_lower)
+                                        fallback_backend = _auto_select_model_for_language(
+                                            args,
+                                            None,
+                                            exclude_backends=excluded_backends,
+                                        )
+                                        if fallback_backend and fallback_backend.lower() not in excluded_backends:
+                                            print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                                            print(
+                                                f"[flexipipe] Falling back to backend '{fallback_backend}' "
+                                                f"because '{backend_type}' is not available.",
+                                                file=sys.stderr
+                                            )
+                                            backend_type = fallback_backend
+                                            backend_type_lower = backend_type.lower()
+                                            args.backend = fallback_backend
+                                            # Retry with fallback backend
+                                            continue
+                                # If backend was explicitly requested or no fallback found, raise the error
+                                raise
+                            except (ValueError, FileNotFoundError, RuntimeError) as e:
+                                error_msg = str(e)
+                                # Check if this is a JSON parsing error (from corrupted cache files)
+                                if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
+                                    if args.debug:
+                                        import traceback
+                                        print("[flexipipe] Full traceback:", file=sys.stderr)
+                                        traceback.print_exc(file=sys.stderr)
+                                    print(
+                                        "[flexipipe] Error: Corrupted JSON file detected. "
+                                        "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
+                                        file=sys.stderr
+                                    )
+                                    return 1
+                                # Check if language detection was attempted and failed
+                                if detection_attempted and detection_result is None and not getattr(args, "language", None):
+                                    # Language detection failed - enhance the error message
+                                    if "requires" in error_msg and ("model" in error_msg or "language" in error_msg):
+                                        print(
+                                            "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
+                                            "Please provide --language or --model explicitly.",
+                                            file=sys.stderr
+                                        )
+                                print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                                return 1
                     
-                    if backend_type_lower == "spacy" and not getattr(args, "model", None):
-                        auto_model = getattr(neural_backend, "auto_model", None)
-                        if auto_model:
-                            setattr(args, "model", auto_model)
-                            model_name = auto_model
-                    # Successfully created backend - break out of loop
-                    break
+                        if backend_type_lower == "spacy" and not getattr(args, "model", None):
+                            auto_model = getattr(neural_backend, "auto_model", None)
+                            if auto_model:
+                                setattr(args, "model", auto_model)
+                                model_name = auto_model
+                        # Successfully created backend - break out of loop
+                        break
+                    else:
+                        # Needs flexitag fallback - break to continue with flexitag setup
+                        break
                 else:
-                    # Needs flexitag fallback - break to continue with flexitag setup
+                    # No backend needed or flexitag - break out of loop
                     break
-            else:
-                # No backend needed or flexitag - break out of loop
-                break
 
-        # After loop, continue with backend usage (neural_backend should be set if we got here)
-        if backend_type and backend_type != "flexitag":
-            # For raw text input, use raw text mode to let backend do its own tokenization
-            # For other formats (conllu, teitok), use tokenized mode to preserve existing tokenization
-            # Exception: if text was extracted from TEITOK XML with --tokenize, treat as raw text
-            # Or if --use-raw-text is explicitly set (CLI flag), force raw text mode
-            # Or if use_raw_text is set in TEITOK settings.xml, use that (unless CLI flag overrides)
-            # CRITICAL: For TEITOK files with existing tokens, we MUST use pretokenized mode
-            # to preserve tokenization and prevent misalignment with XML nodes
-            is_extracted_text = doc.meta.get("original_input_path") is not None
-            has_existing_tokens = (
-                input_format == "teitok" and not is_extracted_text and
-                any(sent.tokens for sent in doc.sentences)
-            )
-            # CLI flag has highest priority, but if TEITOK file has tokens, warn if trying to use raw text
-            use_raw_text_cli = getattr(args, "use_raw_text", False)
-            if use_raw_text_cli and has_existing_tokens and (args.verbose or args.debug):
-                print(
-                    "[flexipipe] WARNING: --use-raw-text is set but TEITOK file has existing tokens. "
-                    "The backend will retokenize the text, which may cause token misalignment with existing XML tokens. "
-                    "The character-level alignment check will verify correctness before writing.",
-                    file=sys.stderr
+            # After loop, continue with backend usage (neural_backend should be set if we got here)
+            if backend_type and backend_type != "flexitag":
+                # For raw text input, use raw text mode to let backend do its own tokenization
+                # For other formats (conllu, teitok), use tokenized mode to preserve existing tokenization
+                # Exception: if text was extracted from TEITOK XML with --tokenize, treat as raw text
+                # Or if --use-raw-text is explicitly set (CLI flag), force raw text mode
+                # Or if use_raw_text is set in TEITOK settings.xml, use that (unless CLI flag overrides)
+                # CRITICAL: For TEITOK files with existing tokens, we MUST use pretokenized mode
+                # to preserve tokenization and prevent misalignment with XML nodes
+                is_extracted_text = doc.meta.get("original_input_path") is not None
+                has_existing_tokens = (
+                    input_format == "teitok" and not is_extracted_text and
+                    any(sent.tokens for sent in doc.sentences)
                 )
-            use_raw_text = (
-                use_raw_text_cli or  # CLI flag (highest priority, but warned above if problematic)
-                (teitok_settings_obj and teitok_settings_obj.use_raw_text and not has_existing_tokens) or  # Settings.xml (only if no existing tokens)
-                (input_format == "raw" and not getattr(args, "pretokenize", False)) or
-                (is_extracted_text and not getattr(args, "pretokenize", False))
-            )
-            if backend_type_lower == "udmorph":
-                use_raw_text = True
-            # If the file already has tokens and the user did not request tokenize, use
-            # pretokenized mode so the backend does not retokenize. Otherwise we send
-            # reconstructed text, the backend retokenizes (possibly with different spacing,
-            # e.g. "senátuStále" -> "senátu Stále"), and writeback alignment fails.
-            if has_existing_tokens and "tokenize" not in requested_tasks and use_raw_text:
-                use_raw_text = False
-                if args.verbose or args.debug:
+                # CLI flag has highest priority, but if TEITOK file has tokens, warn if trying to use raw text
+                use_raw_text_cli = getattr(args, "use_raw_text", False)
+                if use_raw_text_cli and has_existing_tokens and (args.verbose or args.debug):
                     print(
-                        "[flexipipe] Using pretokenized mode (tokenize not in --tasks); "
-                        "preserving existing tokenization for writeback.",
+                        "[flexipipe] WARNING: --use-raw-text is set but TEITOK file has existing tokens. "
+                        "The backend will retokenize the text, which may cause token misalignment with existing XML tokens. "
+                        "The character-level alignment check will verify correctness before writing.",
                         file=sys.stderr
                     )
-            # Set create_implicit_mwt flag in document.meta so backend can use it when parsing CoNLL-U
-            create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
-            if create_implicit_mwt:
-                doc.meta["_create_implicit_mwt"] = True
-            
-            # Apply pre-segmentation and pre-tokenization if needed (before backend processing)
-            from .segmentation import maybe_apply_segmentation
-            from .tokenization import maybe_apply_tokenization
-            
-            # Handle --pretokenize for backwards compatibility (maps to --tokenizer)
-            pretokenize = getattr(args, "pretokenize", False)
-            tokenizer_spec = getattr(args, "tokenizer", None)
-            if pretokenize and tokenizer_spec is None:
-                # --pretokenize without --tokenizer: use auto-detection
-                tokenizer_spec = None  # Will auto-detect
-            elif pretokenize and tokenizer_spec == "":
-                # --pretokenize with --tokenizer '' (disabled): ignore --pretokenize
-                tokenizer_spec = ""
-            
-            # Get model name for registry lookups
-            model_name = getattr(args, "model", None)
-            
-            # Apply segmentation (sentence splitting)
-            segmenter_spec = getattr(args, "segmenter", None)
-            segmenter_lang = getattr(args, "segmenter_language", None) or language
-            doc, segmentation_applied = maybe_apply_segmentation(
-                doc,
-                backend_type,
-                segmenter_spec=segmenter_spec,
-                language=segmenter_lang,
-                model_name=model_name,
-                use_cache=True,
-                verbose=args.verbose or args.debug,
-            )
-            
-            # Apply tokenization (word tokenization)
-            tokenizer_lang = getattr(args, "tokenizer_language", None) or language
-            doc, tokenization_applied = maybe_apply_tokenization(
-                doc,
-                backend_type,
-                tokenizer_spec=tokenizer_spec,
-                language=tokenizer_lang,
-                model_name=model_name,
-                use_cache=True,
-                verbose=args.verbose or args.debug,
-            )
-            
-            # Apply normalization BEFORE backend processing (so backend uses corrected forms)
-            from .normalization import maybe_apply_normalization
-            normalizer_spec = getattr(args, "normalizer", None)
-            normalizer_lang = getattr(args, "normalizer_language", None) or language
-            doc, normalization_applied = maybe_apply_normalization(
-                doc,
-                backend_type,
-                normalizer_spec=normalizer_spec,
-                language=normalizer_lang,
-                model_name=model_name,
-                use_cache=True,
-                verbose=args.verbose or args.debug,
-            )
-            
-            if normalization_applied and (args.verbose or args.debug):
-                print("[flexipipe] Orthographic normalization applied. Backend will process corrected forms.", file=sys.stderr)
-            
-            # Note: We no longer force pretokenized mode when normalization is applied.
-            # Backends should use raw_text mode by default and reconstruct text using effective forms (reg attribute).
-            # This allows the NLP model to do its own tokenization, which is usually better.
-            # The backend will map results back to the original pretokenized document.
-            
-            # Note: We no longer force pretokenized mode when tokenization is applied.
-            # Backends should use raw_text mode by default and map results back to the original pretokenized Doc.
-            # This allows the NLP model to do its own tokenization, which is usually better.
-            if segmentation_applied:
-                # Only segmentation applied - sentences have text but no tokens
-                # Keep use_raw_text=True so backend processes the text
-                if args.verbose or args.debug:
-                    print("[flexipipe] Pre-segmentation applied. Main backend will process sentence text.", file=sys.stderr)
-            
-            try:
-                if args.verbose or args.debug:
-                    components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
-                    mode_str = "raw text" if use_raw_text else "pretokenized"
-                    print(f"[flexipipe] Running backend '{backend_type}' with components: {components_str} (mode: {mode_str})", file=sys.stderr)
-                neural_result = neural_backend.tag(
-                    doc,
-                    use_raw_text=use_raw_text,
-                    components=neural_components,
+                use_raw_text = (
+                    use_raw_text_cli or  # CLI flag (highest priority, but warned above if problematic)
+                    (teitok_settings_obj and teitok_settings_obj.use_raw_text and not has_existing_tokens) or  # Settings.xml (only if no existing tokens)
+                    (input_format == "raw" and not getattr(args, "pretokenize", False)) or
+                    (is_extracted_text and not getattr(args, "pretokenize", False))
                 )
-                # Store whether this was processed from raw text for alignment verification
-                neural_result.document.meta["_processed_from_raw_text"] = use_raw_text
-                if args.verbose or args.debug:
-                    sent_count = len(neural_result.document.sentences)
-                    tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
-                    print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
-            except (ValueError, FileNotFoundError, RuntimeError, requests.exceptions.HTTPError) as e:
-                print(f"[flexipipe] {e}", file=sys.stderr)
-                return 1
-            from .engine import FlexitagResult
-            result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
-            _propagate_sentence_metadata(result.document, doc)
-            _propagate_token_ids(result.document, doc)
-            
-            # Copy normalization map from original doc to result doc meta if it exists
-            # (needed for restoration after backend processing)
-            if normalization_applied and "_normalization_map" in doc.meta:
-                result.document.meta["_normalization_map"] = doc.meta["_normalization_map"].copy()
-            
-            # If normalization was applied, restore original forms and preserve reg attributes
-            # Backends may create new tokens, so we need to match them back to original tokens
-            normalization_map = None
-            if normalization_applied:
-                # Check result document meta (should have been copied above)
-                if "_normalization_map" in result.document.meta:
-                    normalization_map = result.document.meta["_normalization_map"].copy()
-                # Fallback to original doc meta
-                elif "_normalization_map" in doc.meta:
-                    normalization_map = doc.meta["_normalization_map"].copy()
-            
-            if normalization_map:
-                import re
-                if args.debug:
-                    print(f"[flexipipe] DEBUG: Normalization map has {len(normalization_map)} entries: {normalization_map}", file=sys.stderr)
-                for sent_idx, sentence in enumerate(result.document.sentences):
-                    for token in sentence.tokens:
-                        # Try to match token form to normalization map
-                        # The normalization map keys are (sentence_idx, normalized_form)
-                        # We need to match the backend's output (which has normalized forms) back to original forms
-                        
-                        # Try exact match first (case-sensitive)
-                        key = (sent_idx, token.form)
-                        if key in normalization_map:
-                            original_form, reg_value = normalization_map[key]
-                            if args.debug:
-                                print(f"[flexipipe] DEBUG: Exact match token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
-                            # Restore original form and set reg attribute
-                            token.form = original_form
-                            # Only set reg if it's different from the original form
-                            if reg_value and reg_value != original_form:
-                                token.reg = reg_value
-                        else:
-                            # Try case-insensitive match (in case backend changed case)
-                            matched = False
-                            for (map_sent_idx, map_form), (orig_form, reg_val) in normalization_map.items():
-                                if map_sent_idx == sent_idx and map_form.lower() == token.form.lower():
-                                    if args.debug:
-                                        print(f"[flexipipe] DEBUG: Case-insensitive match token '{token.form}' -> '{orig_form}' (reg={reg_val})", file=sys.stderr)
-                                    token.form = orig_form
-                                    if reg_val and reg_val != orig_form:
-                                        token.reg = reg_val
-                                    matched = True
-                                    break
-                            
-                            # If still no match, try stripping punctuation (for cases where backend attached punctuation)
-                            if not matched:
-                                token_form_clean = re.sub(r'[.!?,:;]+$', '', token.form)
-                                key_clean = (sent_idx, token_form_clean)
-                                if key_clean in normalization_map:
-                                    original_form, reg_value = normalization_map[key_clean]
-                                    if args.debug:
-                                        print(f"[flexipipe] DEBUG: Matched (stripped punctuation) token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
-                                    token.form = original_form
-                                    if reg_value and reg_value != original_form:
-                                        token.reg = reg_value
-                                    matched = True
-                
-                # Clean up the normalization map
-                if "_normalization_map" in result.document.meta:
-                    del result.document.meta["_normalization_map"]
-                if "_normalization_map" in doc.meta:
-                    del doc.meta["_normalization_map"]
-            
-            # Track backend used
-            if "_backends_used" not in result.document.meta:
-                result.document.meta["_backends_used"] = []
-            result.document.meta["_backends_used"].append(backend_type_lower)
-            
-            # Determine model string for backend
-            display_backend = backend_type_lower.upper()
-            backend_descriptor = getattr(neural_backend, "model_descriptor", None)
-            if backend_type_lower == "spacy":
-                # Get the actual model name from the backend
-                spacy_model_name = getattr(neural_backend, "_model_name", None) or getattr(neural_backend, "_auto_model", None) or model_name
-                if spacy_model_name and Path(spacy_model_name).exists():
-                    model_display = Path(spacy_model_name).name
-                elif spacy_model_name:
-                    model_display = spacy_model_name
-                elif language:
-                    model_display = f"{language} (blank)"
-                else:
-                    model_display = backend_descriptor or "unknown"
-                model_str = f"{display_backend}: {model_display}"
-                # Also set model information in document meta for CoNLL-U output
-                if spacy_model_name and "_file_level_attrs" not in result.document.meta:
-                    result.document.meta["_file_level_attrs"] = {}
-                if spacy_model_name:
-                    result.document.meta["_file_level_attrs"]["spacy_model"] = spacy_model_name
-            elif backend_type_lower == "nametag":
-                # For NameTag, if a specific model/language is set, show it; otherwise just show the version
-                backend_model = getattr(neural_backend, "model", None)
-                backend_language = getattr(neural_backend, "language", None)
-                if backend_model:
-                    model_str = f"{display_backend}: {backend_model}"
-                elif backend_language:
-                    model_str = f"{display_backend}: {backend_language}"
-                else:
-                    # No specific model - just show the version (e.g., "NameTag3")
-                    model_str = backend_descriptor or f"NameTag{getattr(neural_backend, 'version', '3')}"
-            elif backend_type_lower == "ctext":
-                # For CTexT, get model name from backend's model_name property
-                # This is accessed after tag() runs, so _actual_techs_used should be set
-                backend_model_name = getattr(neural_backend, "model_name", None)
-                if backend_model_name:
-                    model_str = f"{display_backend}: {backend_model_name}"
-                elif language:
-                    # Fallback to language name if model name not available
-                    model_str = f"{display_backend}: {language}"
-                else:
-                    model_str = f"{display_backend}: unknown"
-            elif backend_type_lower == "udkanbun":
-                # UD-Kanbun uses a single default model, so just show the backend name
-                model_str = "UD-Kanbun"
-            else:
-                model_display = model_name or backend_descriptor or "unknown"
-                model_str = f"{display_backend}: {model_display}"
-        elif backend_type == "flexitag":
-            # Use flexitag only
-            from .backend_registry import create_backend
-            
-            flexitag_options = build_flexitag_options_from_args(args)
-            
-            try:
-                flexitag_backend = create_backend(
-                    "flexitag",
-                    training=False,
-                    model_name=getattr(args, "model", None),
-                    language=getattr(args, "language", None),
-                    params_path=None,  # --params removed, use --model instead
-                    options=flexitag_options,
-                    debug=args.debug,
-                )
-            except (ValueError, RuntimeError) as e:
-                error_msg = str(e)
-                # Check if language detection was attempted and failed
-                if detection_attempted and detection_result is None and not getattr(args, "language", None):
-                    # Language detection failed - enhance the error message
-                    if "requires a model" in error_msg or "Provide --model or --language" in error_msg:
+                if backend_type_lower == "udmorph":
+                    use_raw_text = True
+                # If the file already has tokens and the user did not request tokenize, use
+                # pretokenized mode so the backend does not retokenize. Otherwise we send
+                # reconstructed text, the backend retokenizes (possibly with different spacing,
+                # e.g. "senátuStále" -> "senátu Stále"), and writeback alignment fails.
+                if has_existing_tokens and "tokenize" not in requested_tasks and use_raw_text:
+                    use_raw_text = False
+                    if args.verbose or args.debug:
                         print(
-                            "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
-                            "Please provide --language or --model explicitly.",
+                            "[flexipipe] Using pretokenized mode (tokenize not in --tasks); "
+                            "preserving existing tokenization for writeback.",
                             file=sys.stderr
                         )
-                        print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                # Set create_implicit_mwt flag in document.meta so backend can use it when parsing CoNLL-U
+                create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
+                if create_implicit_mwt:
+                    doc.meta["_create_implicit_mwt"] = True
+            
+                # Apply pre-segmentation and pre-tokenization if needed (before backend processing)
+                from .segmentation import maybe_apply_segmentation
+                from .tokenization import maybe_apply_tokenization
+            
+                # Handle --pretokenize for backwards compatibility (maps to --tokenizer)
+                pretokenize = getattr(args, "pretokenize", False)
+                tokenizer_spec = getattr(args, "tokenizer", None)
+                if pretokenize and tokenizer_spec is None:
+                    # --pretokenize without --tokenizer: use auto-detection
+                    tokenizer_spec = None  # Will auto-detect
+                elif pretokenize and tokenizer_spec == "":
+                    # --pretokenize with --tokenizer '' (disabled): ignore --pretokenize
+                    tokenizer_spec = ""
+            
+                # Get model name for registry lookups
+                model_name = getattr(args, "model", None)
+            
+                # Apply segmentation (sentence splitting)
+                segmenter_spec = getattr(args, "segmenter", None)
+                segmenter_lang = getattr(args, "segmenter_language", None) or language
+                doc, segmentation_applied = maybe_apply_segmentation(
+                    doc,
+                    backend_type,
+                    segmenter_spec=segmenter_spec,
+                    language=segmenter_lang,
+                    model_name=model_name,
+                    use_cache=True,
+                    verbose=args.verbose or args.debug,
+                )
+            
+                # Apply tokenization (word tokenization)
+                tokenizer_lang = getattr(args, "tokenizer_language", None) or language
+                doc, tokenization_applied = maybe_apply_tokenization(
+                    doc,
+                    backend_type,
+                    tokenizer_spec=tokenizer_spec,
+                    language=tokenizer_lang,
+                    model_name=model_name,
+                    use_cache=True,
+                    verbose=args.verbose or args.debug,
+                )
+            
+                # Apply normalization BEFORE backend processing (so backend uses corrected forms)
+                from .normalization import maybe_apply_normalization
+                normalizer_spec = getattr(args, "normalizer", None)
+                normalizer_lang = getattr(args, "normalizer_language", None) or language
+                doc, normalization_applied = maybe_apply_normalization(
+                    doc,
+                    backend_type,
+                    normalizer_spec=normalizer_spec,
+                    language=normalizer_lang,
+                    model_name=model_name,
+                    use_cache=True,
+                    verbose=args.verbose or args.debug,
+                )
+            
+                if normalization_applied and (args.verbose or args.debug):
+                    print("[flexipipe] Orthographic normalization applied. Backend will process corrected forms.", file=sys.stderr)
+            
+                # Note: We no longer force pretokenized mode when normalization is applied.
+                # Backends should use raw_text mode by default and reconstruct text using effective forms (reg attribute).
+                # This allows the NLP model to do its own tokenization, which is usually better.
+                # The backend will map results back to the original pretokenized document.
+            
+                # Note: We no longer force pretokenized mode when tokenization is applied.
+                # Backends should use raw_text mode by default and map results back to the original pretokenized Doc.
+                # This allows the NLP model to do its own tokenization, which is usually better.
+                if segmentation_applied:
+                    # Only segmentation applied - sentences have text but no tokens
+                    # Keep use_raw_text=True so backend processes the text
+                    if args.verbose or args.debug:
+                        print("[flexipipe] Pre-segmentation applied. Main backend will process sentence text.", file=sys.stderr)
+            
+                try:
+                    if args.verbose or args.debug:
+                        components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
+                        mode_str = "raw text" if use_raw_text else "pretokenized"
+                        print(f"[flexipipe] Running backend '{backend_type}' with components: {components_str} (mode: {mode_str})", file=sys.stderr)
+                    neural_result = neural_backend.tag(
+                        doc,
+                        use_raw_text=use_raw_text,
+                        components=neural_components,
+                    )
+                    # Store whether this was processed from raw text for alignment verification
+                    neural_result.document.meta["_processed_from_raw_text"] = use_raw_text
+                    if args.verbose or args.debug:
+                        sent_count = len(neural_result.document.sentences)
+                        tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
+                        print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
+                except (ValueError, FileNotFoundError, RuntimeError, requests.exceptions.HTTPError) as e:
+                    print(f"[flexipipe] {e}", file=sys.stderr)
+                    return 1
+                from .engine import FlexitagResult
+                result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
+                _propagate_sentence_metadata(result.document, doc)
+                _propagate_token_ids(result.document, doc)
+            
+                # Copy normalization map from original doc to result doc meta if it exists
+                # (needed for restoration after backend processing)
+                if normalization_applied and "_normalization_map" in doc.meta:
+                    result.document.meta["_normalization_map"] = doc.meta["_normalization_map"].copy()
+            
+                # If normalization was applied, restore original forms and preserve reg attributes
+                # Backends may create new tokens, so we need to match them back to original tokens
+                normalization_map = None
+                if normalization_applied:
+                    # Check result document meta (should have been copied above)
+                    if "_normalization_map" in result.document.meta:
+                        normalization_map = result.document.meta["_normalization_map"].copy()
+                    # Fallback to original doc meta
+                    elif "_normalization_map" in doc.meta:
+                        normalization_map = doc.meta["_normalization_map"].copy()
+            
+                if normalization_map:
+                    import re
+                    if args.debug:
+                        print(f"[flexipipe] DEBUG: Normalization map has {len(normalization_map)} entries: {normalization_map}", file=sys.stderr)
+                    for sent_idx, sentence in enumerate(result.document.sentences):
+                        for token in sentence.tokens:
+                            # Try to match token form to normalization map
+                            # The normalization map keys are (sentence_idx, normalized_form)
+                            # We need to match the backend's output (which has normalized forms) back to original forms
+                        
+                            # Try exact match first (case-sensitive)
+                            key = (sent_idx, token.form)
+                            if key in normalization_map:
+                                original_form, reg_value = normalization_map[key]
+                                if args.debug:
+                                    print(f"[flexipipe] DEBUG: Exact match token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
+                                # Restore original form and set reg attribute
+                                token.form = original_form
+                                # Only set reg if it's different from the original form
+                                if reg_value and reg_value != original_form:
+                                    token.reg = reg_value
+                            else:
+                                # Try case-insensitive match (in case backend changed case)
+                                matched = False
+                                for (map_sent_idx, map_form), (orig_form, reg_val) in normalization_map.items():
+                                    if map_sent_idx == sent_idx and map_form.lower() == token.form.lower():
+                                        if args.debug:
+                                            print(f"[flexipipe] DEBUG: Case-insensitive match token '{token.form}' -> '{orig_form}' (reg={reg_val})", file=sys.stderr)
+                                        token.form = orig_form
+                                        if reg_val and reg_val != orig_form:
+                                            token.reg = reg_val
+                                        matched = True
+                                        break
+                            
+                                # If still no match, try stripping punctuation (for cases where backend attached punctuation)
+                                if not matched:
+                                    token_form_clean = re.sub(r'[.!?,:;]+$', '', token.form)
+                                    key_clean = (sent_idx, token_form_clean)
+                                    if key_clean in normalization_map:
+                                        original_form, reg_value = normalization_map[key_clean]
+                                        if args.debug:
+                                            print(f"[flexipipe] DEBUG: Matched (stripped punctuation) token '{token.form}' -> '{original_form}' (reg={reg_value})", file=sys.stderr)
+                                        token.form = original_form
+                                        if reg_value and reg_value != original_form:
+                                            token.reg = reg_value
+                                        matched = True
+                
+                    # Clean up the normalization map
+                    if "_normalization_map" in result.document.meta:
+                        del result.document.meta["_normalization_map"]
+                    if "_normalization_map" in doc.meta:
+                        del doc.meta["_normalization_map"]
+            
+                # Track backend used
+                if "_backends_used" not in result.document.meta:
+                    result.document.meta["_backends_used"] = []
+                result.document.meta["_backends_used"].append(backend_type_lower)
+            
+                # Determine model string for backend
+                display_backend = backend_type_lower.upper()
+                backend_descriptor = getattr(neural_backend, "model_descriptor", None)
+                if backend_type_lower == "spacy":
+                    # Get the actual model name from the backend
+                    spacy_model_name = getattr(neural_backend, "_model_name", None) or getattr(neural_backend, "_auto_model", None) or model_name
+                    if spacy_model_name and Path(spacy_model_name).exists():
+                        model_display = Path(spacy_model_name).name
+                    elif spacy_model_name:
+                        model_display = spacy_model_name
+                    elif language:
+                        model_display = f"{language} (blank)"
+                    else:
+                        model_display = backend_descriptor or "unknown"
+                    model_str = f"{display_backend}: {model_display}"
+                    # Also set model information in document meta for CoNLL-U output
+                    if spacy_model_name and "_file_level_attrs" not in result.document.meta:
+                        result.document.meta["_file_level_attrs"] = {}
+                    if spacy_model_name:
+                        result.document.meta["_file_level_attrs"]["spacy_model"] = spacy_model_name
+                elif backend_type_lower == "nametag":
+                    # For NameTag, if a specific model/language is set, show it; otherwise just show the version
+                    backend_model = getattr(neural_backend, "model", None)
+                    backend_language = getattr(neural_backend, "language", None)
+                    if backend_model:
+                        model_str = f"{display_backend}: {backend_model}"
+                    elif backend_language:
+                        model_str = f"{display_backend}: {backend_language}"
+                    else:
+                        # No specific model - just show the version (e.g., "NameTag3")
+                        model_str = backend_descriptor or f"NameTag{getattr(neural_backend, 'version', '3')}"
+                elif backend_type_lower == "ctext":
+                    # For CTexT, get model name from backend's model_name property
+                    # This is accessed after tag() runs, so _actual_techs_used should be set
+                    backend_model_name = getattr(neural_backend, "model_name", None)
+                    if backend_model_name:
+                        model_str = f"{display_backend}: {backend_model_name}"
+                    elif language:
+                        # Fallback to language name if model name not available
+                        model_str = f"{display_backend}: {language}"
+                    else:
+                        model_str = f"{display_backend}: unknown"
+                elif backend_type_lower == "udkanbun":
+                    # UD-Kanbun uses a single default model, so just show the backend name
+                    model_str = "UD-Kanbun"
+                else:
+                    model_display = model_name or backend_descriptor or "unknown"
+                    model_str = f"{display_backend}: {model_display}"
+            elif backend_type == "flexitag":
+                # Use flexitag only
+                from .backend_registry import create_backend
+            
+                flexitag_options = build_flexitag_options_from_args(args)
+            
+                try:
+                    flexitag_backend = create_backend(
+                        "flexitag",
+                        training=False,
+                        model_name=getattr(args, "model", None),
+                        language=getattr(args, "language", None),
+                        params_path=None,  # --params removed, use --model instead
+                        options=flexitag_options,
+                        debug=args.debug,
+                    )
+                except (ValueError, RuntimeError) as e:
+                    error_msg = str(e)
+                    # Check if language detection was attempted and failed
+                    if detection_attempted and detection_result is None and not getattr(args, "language", None):
+                        # Language detection failed - enhance the error message
+                        if "requires a model" in error_msg or "Provide --model or --language" in error_msg:
+                            print(
+                                "[flexipipe] Language detection (ALI) failed - could not automatically detect the language. "
+                                "Please provide --language or --model explicitly.",
+                                file=sys.stderr
+                            )
+                            print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                        else:
+                            print(f"[flexipipe] {error_msg}", file=sys.stderr)
                     else:
                         print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                    return 1
+            
+                neural_result = flexitag_backend.tag(doc)
+                result = neural_result  # FlexitagBackend returns NeuralResult
+                _propagate_sentence_metadata(result.document, doc)
+                _propagate_token_ids(result.document, doc)
+            
+                # Model string for flexitag only
+                if args.model:
+                    model_str = f"FLEXITAG: {args.model}"
                 else:
-                    print(f"[flexipipe] {error_msg}", file=sys.stderr)
+                    model_str = "FLEXITAG: unknown"
+            elif not backend_type:
+                # Backend needed but not specified
+                print("Error: Backend required for requested tasks but none specified. Use --backend to specify a backend.", file=sys.stderr)
                 return 1
-            
-            neural_result = flexitag_backend.tag(doc)
-            result = neural_result  # FlexitagBackend returns NeuralResult
-            _propagate_sentence_metadata(result.document, doc)
-            _propagate_token_ids(result.document, doc)
-            
-            # Model string for flexitag only
-            if args.model:
-                model_str = f"FLEXITAG: {args.model}"
-            else:
-                model_str = "FLEXITAG: unknown"
-        elif not backend_type:
-            # Backend needed but not specified
-            print("Error: Backend required for requested tasks but none specified. Use --backend to specify a backend.", file=sys.stderr)
-            return 1
 
-    validator_source_doc = result.document
+        validator_source_doc = result.document
 
-    output_format = args.output_format
-    output_path = args.output
+        output_format = args.output_format
+        output_path = args.output
 
-    # Ensure "ner" is in tasks if entities exist (preserve NER from backends)
-    has_entities = False
-    for sent in result.document.sentences:
-        if sent.entities:
-            has_entities = True
-            break
-    if not has_entities and getattr(result.document, "spans", None):
-        if result.document.spans.get("ner"):
-            has_entities = True
-    if has_entities and "ner" not in requested_tasks:
-        requested_tasks.add("ner")
+        # Ensure "ner" is in tasks if entities exist (preserve NER from backends)
+        has_entities = False
+        for sent in result.document.sentences:
+            if sent.entities:
+                has_entities = True
+                break
+        if not has_entities and getattr(result.document, "spans", None):
+            if result.document.spans.get("ner"):
+                has_entities = True
+        if has_entities and "ner" not in requested_tasks:
+            requested_tasks.add("ner")
 
-    _filter_document_by_tasks(result.document, requested_tasks)
+        _filter_document_by_tasks(result.document, requested_tasks)
 
-    # If validation is requested but no output file is specified, use a temp file
-    validation_temp_file = None
-    if getattr(args, "validate", False) and not output_path and output_format in ("conllu", "conllu-ne"):
-        import tempfile
-        validation_temp_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".conllu",
-            delete=False,
-            encoding="utf-8",
-        )
-        output_path = validation_temp_file.name
-        validation_temp_file.close()
-
-    output_entry = io_registry.get_output(output_format)
-    if output_entry:
-        # Ensure language is preserved in result document (for chaining)
-        if getattr(args, "language", None) and "language" not in result.document.meta:
-            result.document.meta["language"] = args.language
-        elif "language" in doc.meta and "language" not in result.document.meta:
-            # Copy language from original document if not already in result
-            result.document.meta["language"] = doc.meta["language"]
-        # Normalize output document before serialization
-        if output_unicode_normalize != "none":
-            if args.debug:
-                print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
-            result.document.normalize_unicode(output_unicode_normalize)
-        elif args.debug:
-            print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
-        # If we're using a temp file for validation, save to it but don't print yet
-        actual_output_path = output_path if not validation_temp_file else output_path
-        output_entry.save(
-            result.document,
-            args=args,
-            output_path=actual_output_path,
-            model_info=model_str,
-        )
-    elif output_format == "teitok":
-        # Normalize output document before serialization
-        if output_unicode_normalize != "none":
-            if args.debug:
-                print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
-            result.document.normalize_unicode(output_unicode_normalize)
-        elif args.debug:
-            print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
-        # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
-        # But defer this until we know if we're in writeback mode and updating existing tokens
-        output_doc = result.document
-        # Record which tasks were requested for this run (as provided by the user),
-        # so downstream consumers (e.g. TEITOK header writer) can report what was
-        # asked for rather than inferring tasks from whatever annotations happen
-        # to be present. If the user did not provide --tasks, leave this unset so
-        # the header can fall back to heuristic detection.
-        try:
-            if header_tasks_for_run is not None:
-                output_doc.meta["_requested_tasks_for_run"] = sorted(header_tasks_for_run)
-        except Exception:
-            pass
-        validator_source_doc = output_doc
-        
-        # Apply tag mapping if requested
-        map_tags_models = getattr(args, "map_tags_models", None)
-        if map_tags_models:
-            model_paths = [Path(p) for p in map_tags_models]
-            mapping = build_tag_mapping_from_paths(model_paths)
-            
-            direction = getattr(args, "map_direction", None)
-            fill_xpos = getattr(args, "fill_xpos", None)
-            fill_upos = getattr(args, "fill_upos", None)
-            fill_feats = getattr(args, "fill_feats", None)
-            allow_partial = getattr(args, "allow_partial", True)
-            
-            # Apply direction defaults unless user explicitly overrode via --fill-* options
-            if direction == "xpos":
-                if fill_xpos is None:
-                    fill_xpos = True
-                if fill_upos is None:
-                    fill_upos = False
-                if fill_feats is None:
-                    fill_feats = False
-            elif direction == "upos-feats":
-                if fill_xpos is None:
-                    fill_xpos = False
-                if fill_upos is None:
-                    fill_upos = True
-                if fill_feats is None:
-                    fill_feats = True
-            elif direction == "both":
-                if fill_xpos is None:
-                    fill_xpos = True
-                if fill_upos is None:
-                    fill_upos = True
-                if fill_feats is None:
-                    fill_feats = True
-            
-            # If no direction specified and no explicit fill options, default to both
-            if direction is None and fill_xpos is None and fill_upos is None and fill_feats is None:
-                fill_xpos = True
-                fill_upos = True
-                fill_feats = True
-            
-            fill_xpos = bool(fill_xpos) if fill_xpos is not None else False
-            fill_upos = bool(fill_upos) if fill_upos is not None else False
-            fill_feats = bool(fill_feats) if fill_feats is not None else False
-            
-            if fill_xpos or fill_upos or fill_feats:
-                changes = mapping.enrich_document(
-                    output_doc,
-                    fill_xpos=fill_xpos,
-                    fill_upos=fill_upos,
-                    fill_feats=fill_feats,
-                    allow_partial=allow_partial,
-                )
-                if args.verbose or args.debug:
-                    direction_desc = []
-                    if fill_xpos:
-                        direction_desc.append("XPOS")
-                    if fill_upos or fill_feats:
-                        parts = ["UPOS" if fill_upos else None, "FEATS" if fill_feats else None]
-                        direction_desc.append("+".join(p for p in parts if p))
-                    direction_text = ", ".join(direction_desc) or "nothing"
-                    print(f"[flexipipe] tag mapping ({direction_text}) updated {changes} tokens")
-        
-        # Apply task-based filtering: keep only annotations for requested tasks,
-        # then drop any explicitly stripped tasks (if --strip-tags was used).
-        try:
-            from .task_registry import TASK_DESCRIPTIONS
-            # Start from requested tasks (already includes mandatory tasks).
-            keep_tasks = set(requested_tasks)
-            if strip_tasks:
-                keep_tasks -= strip_tasks
-            # Only pass known/recognized tasks to the filter.
-            known_tasks = set(TASK_DESCRIPTIONS.keys())
-            keep_tasks &= known_tasks
-            if keep_tasks:
-                _filter_document_by_tasks(output_doc, keep_tasks)
-        except Exception:
-            # Filtering is best-effort; never fail the pipeline because of it.
-            pass
-
-        validator_source_doc = output_doc
-        
-        # Check if writeback should be used
-        use_writeback = False
-        original_input_path = None
-        is_extracted_text = False
-        if args.writeback and input_format == "teitok":
-            # Writeback only works when input is TEITOK XML (not stdin)
-            if not read_from_stdin and args.input:
-                original_input_path = Path(args.input)
-                if original_input_path.exists():
-                    # Use writeback if output is same as input, or no output specified
-                    if not output_path or str(original_input_path.resolve()) == str(Path(output_path).resolve()):
-                        use_writeback = True
-                        # Check if this came from extracted text (non-tokenized TEITOK with --tokenize)
-                        # OR if --use-raw-text was used on an untokenized XML file
-                        from .teitok import teitok_has_tokens
-                        # First check: if original input file has no tokens, we need to insert tokens
-                        if not teitok_has_tokens(str(original_input_path)):
-                            is_extracted_text = True
-                        # Second check: if meta says it came from extracted text
-                        elif output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
-                            is_extracted_text = True
-                        # Third check: if processed from raw text and original file has no tokens
-                        elif output_doc.meta.get("_processed_from_raw_text", False):
-                            if not teitok_has_tokens(str(original_input_path)):
-                                is_extracted_text = True
-        
-        # Apply create_implicit_mwt if requested, but only when:
-        # 1. Not in writeback mode (regular output), OR
-        # 2. In writeback mode but inserting new tokens (is_extracted_text is True)
-        # Don't apply when updating existing tokens in writeback mode
-        # When updating existing tokens, the backend might create MWTs from SpaceAfter=No sequences,
-        # but we don't want to apply _create_implicit_mwt as it would break token alignment
-        # Also don't apply if backend explicitly disables it (e.g., UD-Kanbun)
-        if args.create_implicit_mwt and output_format == "teitok":
-            # Check if backend explicitly disables create_implicit_mwt
-            if output_doc.meta.get("_disable_create_implicit_mwt", False):
-                should_apply_mwt = False
-            else:
-                should_apply_mwt = False
-                if not use_writeback:
-                    # Regular output - always apply if requested
-                    should_apply_mwt = True
-                elif use_writeback and is_extracted_text:
-                    # Writeback mode but inserting new tokens (untokenized file)
-                    should_apply_mwt = True
-                elif use_writeback and output_doc.meta.get("_processed_from_raw_text", False) and original_input_path:
-                    # Processed from raw text - check if file has no tokens
-                    from .teitok import teitok_has_tokens
-                    if not teitok_has_tokens(str(original_input_path)):
-                        should_apply_mwt = True
-            # Explicitly don't apply when updating existing tokens in writeback mode
-            # (is_extracted_text is False and we're in writeback mode)
-            if should_apply_mwt:
-                from .conllu import _create_implicit_mwt
-                from .doc import Document, Sentence
-                # Create a new document with MWTs created
-                new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta), attrs=dict(output_doc.attrs))
-                # Copy spans from original document
-                for layer, spans in output_doc.spans.items():
-                    for span in spans:
-                        new_doc.add_span(layer, span)
-                for sent in output_doc.sentences:
-                    new_sent = _create_implicit_mwt(sent)
-                    new_doc.sentences.append(new_sent)
-                output_doc = new_doc
-                validator_source_doc = output_doc
-        
-        if use_writeback and original_input_path:
-            target_writeback_path = original_input_path
-            temp_writeback_path: Optional[Path] = None
-            if args.test:
-                import tempfile
-                import shutil
-                suffix = original_input_path.suffix or ".xml"
-                fd, temp_name = tempfile.mkstemp(prefix="flexipipe-test-", suffix=suffix)
-                os.close(fd)
-                shutil.copy2(original_input_path, temp_name)
-                target_writeback_path = Path(temp_name)
-                temp_writeback_path = target_writeback_path
-            # Create backup before writeback (TEITOK-style once-a-day backup)
-            # Only create backup if we're in a TEITOK project (settings.xml exists)
-            from .teitok_backup import create_teitok_backup
-            from .teitok_settings import find_settings_xml
-            
-            backup_path = None
-            settings_path = find_settings_xml(original_input_path)
-            if args.test:
-                if args.verbose or args.debug:
-                    print("[flexipipe] Skipping backup (--test dry-run)", file=sys.stderr)
-            elif settings_path and settings_path.exists():
-                backup_path = create_teitok_backup(str(original_input_path))
-                if backup_path:
-                    if args.verbose or args.debug:
-                        print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
-                elif args.verbose or args.debug:
-                    from datetime import date
-                    today = date.today().strftime("%Y%m%d")
-                    filename = Path(original_input_path).name
-                    if "." in filename:
-                        name_part, ext_part = filename.rsplit(".", 1)
-                        backup_name = f"{name_part}-{today}.{ext_part}"
-                    else:
-                        backup_name = f"{filename}-{today}"
-                    backups_dir = Path.cwd() / "backups"
-                    existing_backup = backups_dir / backup_name
-                    if existing_backup.exists():
-                        print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
-            elif args.verbose or args.debug:
-                print("[flexipipe] Skipping backup (not in a TEITOK project - settings.xml not found)", file=sys.stderr)
-            
-            from .teitok import update_teitok
-            from .insert_tokens import insert_tokens_into_teitok
-            # Note: create_implicit_mwt is already applied earlier if needed (when not in writeback mode
-            # or when inserting new tokens in writeback mode)
-            try:
-                if is_extracted_text:
-                    textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
-                    include_notes = getattr(args, "textnotes", False)
-                    insert_tokens_into_teitok(
-                        output_doc,
-                        str(target_writeback_path),
-                        output_path if output_path else None,
-                        textnode_xpath=textnode_xpath,
-                        include_notes=include_notes,
-                        settings=teitok_settings_obj,
-                    )
-                    if args.verbose or args.debug:
-                        target = str(target_writeback_path) if not output_path else output_path
-                        print(f"[flexipipe] Inserted tokens into TEITOK file: {target}")
-                else:
-                    # Determine if this was processed from raw text
-                    # Check if use_raw_text was used (stored in document metadata)
-                    processed_from_raw = output_doc.meta.get("_processed_from_raw_text", False)
-                    # Decide whether to insert <s> elements on writeback.
-                    # If the original TEITOK XML had tokens but no <s>, and the user
-                    # requested segmentation, auto-enable sentence insertion so that
-                    # backend sentence boundaries are reflected in the XML.
-                    auto_insert_sentences = getattr(args, "writeback_insert_sentences", False)
-                    if not auto_insert_sentences:
-                        # Safely check document metadata populated by load_teitok
-                        meta = getattr(output_doc, "meta", {}) or {}
-                        tokens_only_xml = bool(meta.get("_teitok_tokens_only_xml"))
-                        if tokens_only_xml and "segment" in requested_tasks:
-                            auto_insert_sentences = True
-                    
-                    update_teitok(
-                        output_doc,
-                        str(target_writeback_path),
-                        output_path if output_path else None,
-                        settings=teitok_settings_obj,
-                        from_raw_text=processed_from_raw,
-                        strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
-                        unicode_normalization=output_unicode_normalize,
-                        insert_sentences=auto_insert_sentences,
-                        verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
-                    )
-                    if args.verbose or args.debug:
-                        target = str(target_writeback_path) if not output_path else output_path
-                        print(f"[flexipipe] Updated TEITOK file in-place: {target}")
-            except Exception as e:
-                print(
-                    f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
-                    file=sys.stderr,
-                )
-                if args.test and temp_writeback_path:
-                    temp_writeback_path.unlink(missing_ok=True)
-            else:
-                if args.test and temp_writeback_path:
-                    with open(temp_writeback_path, "r", encoding="utf-8") as tf:
-                        sys.stdout.write(tf.read())
-                    temp_writeback_path.unlink(missing_ok=True)
-                    return 0
-                writeback_rendered = True
-        emit_teitok_output = True
-        if use_writeback and not args.test and not output_path:
-            emit_teitok_output = args.verbose or args.debug
-        if emit_teitok_output or output_path or args.test or not use_writeback:
-            tei_tasks = _detect_performed_tasks(output_doc)
-            tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
-            pretty_print = getattr(args, "pretty_print", False)
-            spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
-            skip_spaceafter_for_breaking = getattr(args, "skip_spaceafter_for_breaking_elements", True)
-            tei_output = dump_teitok(
-                output_doc,
-                pretty_print=pretty_print,
-                spaceafter_handling=spaceafter_handling,
-                skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
-                settings=teitok_settings_obj,
-                unicode_normalization=output_unicode_normalize,
-            )
-            note_candidate = (
-                note_source_path
-                or output_doc.meta.get("original_input_path")
-                or output_doc.meta.get("source_path")
-            )
-            note_value = None
-            if note_candidate and str(note_candidate) not in ("-", "<inline-data>"):
-                note_value = f"{Path(str(note_candidate)).stem}.xml"
-            change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            
-            # Collect all backends used (from piping or single backend)
-            backends_used = output_doc.meta.get("_backends_used", [])
-            if backend_type and backend_type.lower() not in backends_used:
-                backends_used.append(backend_type.lower())
-            if not backends_used:
-                backends_used = ["flexipipe"]
-            
-            # Build backend string - show all backends
-            backend_names = [b.upper() for b in backends_used]
-            change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
-            change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
-            
-            # Collect model/license info and acknowledgements for notes
-            api_notes = []
-            
-            # Extract model and license info from file-level attributes
-            file_level_attrs = output_doc.meta.get("_file_level_attrs", {})
-            model_info_lines = []
-            
-            # Collect all model and license pairs
-            model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
-            for model_key in model_keys:
-                model_name = file_level_attrs[model_key]
-                model_info_lines.append(f"# {model_key} = {model_name}")
-                
-                # Add corresponding license if present
-                licence_key = f"{model_key}_licence"
-                if licence_key in file_level_attrs:
-                    model_info_lines.append(f"# {licence_key} = {file_level_attrs[licence_key]}")
-            
-            if model_info_lines:
-                # Add acknowledgements if present
-                if "_api_acknowledgements" in output_doc.meta:
-                    acknowledgements = output_doc.meta["_api_acknowledgements"]
-                    if isinstance(acknowledgements, list):
-                        model_info_lines.append("")
-                        model_info_lines.append("# acknowledgements:")
-                        for ack in acknowledgements:
-                            model_info_lines.append(f"#   {ack}")
-                    elif isinstance(acknowledgements, str):
-                        model_info_lines.append("")
-                        model_info_lines.append(f"# acknowledgements: {acknowledgements}")
-                
-                api_notes.append(("Model Information", "\n".join(model_info_lines)))
-            
-            tei_output = _augment_tei_output(
-                tei_output,
-                note_value=note_value,
-                change_text=change_text,
-                change_when=change_when,
-                api_notes=api_notes if api_notes else None,
-                pretty_print=pretty_print,
-                spaceafter_handling=spaceafter_handling,
-                skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
-            )
-            if output_path:
-                with open(output_path, "w", encoding="utf-8") as handle:
-                    handle.write(tei_output)
-            elif emit_teitok_output:
-                print(tei_output)
-    elif output_format == "json":
-        import json as json_module  # Use explicit name to avoid shadowing issues
-        performed_tasks = sorted(_detect_performed_tasks(result.document)) or sorted(requested_tasks)
-        payload = {
-            "document": document_to_json_payload(result.document),
-            "model": model_str,
-            "backend": backend_type,
-            "tasks": performed_tasks,
-            "stats": result.stats,
-        }
-        json_text = json_module.dumps(payload, ensure_ascii=False, indent=2)
-        if output_path:
-            Path(output_path).write_text(
-                json_text if json_text.endswith("\n") else f"{json_text}\n",
+        # If validation is requested but no output file is specified, use a temp file
+        validation_temp_file = None
+        if getattr(args, "validate", False) and not output_path and output_format in ("conllu", "conllu-ne"):
+            import tempfile
+            validation_temp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".conllu",
+                delete=False,
                 encoding="utf-8",
             )
-        else:
-            print(json_text)
-    else:
-        # For other formats (conllu, conllu-ne, svg), use _write_document
-        # Get Unicode normalization form for output
-        from .model_storage import get_unicode_normalization
-        output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
-        if output_unicode_normalize is None:
-            output_unicode_normalize = get_unicode_normalization()
-        
-        svg_style = getattr(args, "svg_style", "dep")
-        _write_document(
-            result.document,
-            output_path,
-            output_format,
-            unicode_normalization=output_unicode_normalize,
-            svg_style=svg_style,
-        )
+            output_path = validation_temp_file.name
+            validation_temp_file.close()
 
-    if args.debug:
-        print(f"[flexipipe] completed. stats={result.stats}")
-        sent_count = len(result.document.sentences)
-        tok_count = sum(len(sent.tokens) for sent in result.document.sentences)
-        print(f"[flexipipe] wrote document: sentences={sent_count} tokens={tok_count}")
-    elif args.verbose:
-        print(f"[flexipipe] saved to {output_path or 'stdout'}")
+        output_entry = io_registry.get_output(output_format)
+        if output_entry:
+            # Ensure language is preserved in result document (for chaining)
+            if getattr(args, "language", None) and "language" not in result.document.meta:
+                result.document.meta["language"] = args.language
+            elif "language" in doc.meta and "language" not in result.document.meta:
+                # Copy language from original document if not already in result
+                result.document.meta["language"] = doc.meta["language"]
+            # Normalize output document before serialization
+            if output_unicode_normalize != "none":
+                if args.debug:
+                    print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
+                result.document.normalize_unicode(output_unicode_normalize)
+            elif args.debug:
+                print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
+            # If we're using a temp file for validation, save to it but don't print yet
+            actual_output_path = output_path if not validation_temp_file else output_path
+            output_entry.save(
+                result.document,
+                args=args,
+                output_path=actual_output_path,
+                model_info=model_str,
+            )
+        elif output_format == "teitok":
+            # Normalize output document before serialization
+            if output_unicode_normalize != "none":
+                if args.debug:
+                    print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
+                result.document.normalize_unicode(output_unicode_normalize)
+            elif args.debug:
+                print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
+            # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
+            # But defer this until we know if we're in writeback mode and updating existing tokens
+            output_doc = result.document
+            # Record which tasks were requested for this run (as provided by the user),
+            # so downstream consumers (e.g. TEITOK header writer) can report what was
+            # asked for rather than inferring tasks from whatever annotations happen
+            # to be present. If the user did not provide --tasks, leave this unset so
+            # the header can fall back to heuristic detection.
+            try:
+                if header_tasks_for_run is not None:
+                    output_doc.meta["_requested_tasks_for_run"] = sorted(header_tasks_for_run)
+            except Exception:
+                pass
+            validator_source_doc = output_doc
+        
+            # Apply tag mapping if requested
+            map_tags_models = getattr(args, "map_tags_models", None)
+            if map_tags_models:
+                model_paths = [Path(p) for p in map_tags_models]
+                mapping = build_tag_mapping_from_paths(model_paths)
+            
+                direction = getattr(args, "map_direction", None)
+                fill_xpos = getattr(args, "fill_xpos", None)
+                fill_upos = getattr(args, "fill_upos", None)
+                fill_feats = getattr(args, "fill_feats", None)
+                allow_partial = getattr(args, "allow_partial", True)
+            
+                # Apply direction defaults unless user explicitly overrode via --fill-* options
+                if direction == "xpos":
+                    if fill_xpos is None:
+                        fill_xpos = True
+                    if fill_upos is None:
+                        fill_upos = False
+                    if fill_feats is None:
+                        fill_feats = False
+                elif direction == "upos-feats":
+                    if fill_xpos is None:
+                        fill_xpos = False
+                    if fill_upos is None:
+                        fill_upos = True
+                    if fill_feats is None:
+                        fill_feats = True
+                elif direction == "both":
+                    if fill_xpos is None:
+                        fill_xpos = True
+                    if fill_upos is None:
+                        fill_upos = True
+                    if fill_feats is None:
+                        fill_feats = True
+            
+                # If no direction specified and no explicit fill options, default to both
+                if direction is None and fill_xpos is None and fill_upos is None and fill_feats is None:
+                    fill_xpos = True
+                    fill_upos = True
+                    fill_feats = True
+            
+                fill_xpos = bool(fill_xpos) if fill_xpos is not None else False
+                fill_upos = bool(fill_upos) if fill_upos is not None else False
+                fill_feats = bool(fill_feats) if fill_feats is not None else False
+            
+                if fill_xpos or fill_upos or fill_feats:
+                    changes = mapping.enrich_document(
+                        output_doc,
+                        fill_xpos=fill_xpos,
+                        fill_upos=fill_upos,
+                        fill_feats=fill_feats,
+                        allow_partial=allow_partial,
+                    )
+                    if args.verbose or args.debug:
+                        direction_desc = []
+                        if fill_xpos:
+                            direction_desc.append("XPOS")
+                        if fill_upos or fill_feats:
+                            parts = ["UPOS" if fill_upos else None, "FEATS" if fill_feats else None]
+                            direction_desc.append("+".join(p for p in parts if p))
+                        direction_text = ", ".join(direction_desc) or "nothing"
+                        print(f"[flexipipe] tag mapping ({direction_text}) updated {changes} tokens")
+        
+            # Apply task-based filtering: keep only annotations for requested tasks,
+            # then drop any explicitly stripped tasks (if --strip-tags was used).
+            try:
+                from .task_registry import TASK_DESCRIPTIONS
+                # Start from requested tasks (already includes mandatory tasks).
+                keep_tasks = set(requested_tasks)
+                if strip_tasks:
+                    keep_tasks -= strip_tasks
+                # Only pass known/recognized tasks to the filter.
+                known_tasks = set(TASK_DESCRIPTIONS.keys())
+                keep_tasks &= known_tasks
+                if keep_tasks:
+                    _filter_document_by_tasks(output_doc, keep_tasks)
+            except Exception:
+                # Filtering is best-effort; never fail the pipeline because of it.
+                pass
 
-    if getattr(args, "validate", False):
-        if output_format not in ("conllu", "conllu-ne"):
-            print(
-                "[flexipipe] --validate currently supports only conllu/conllu-ne output. "
-                "Use --output-format conllu (or conllu-ne) when enabling validation.",
-                file=sys.stderr,
-            )
-            return 1
-        # output_path should be set now (either from user or from temp file)
-        if not output_path:
-            print(
-                "[flexipipe] --validate requires --output <file> so the UD validator can read the saved CoNLL-U.",
-                file=sys.stderr,
-            )
-            return 1
+            validator_source_doc = output_doc
         
-        validator_lang = getattr(args, "validator_lang", None)
-        if not validator_lang:
-            validator_lang = infer_language_from_document(
-                validator_source_doc,
-                detection_result,
-                getattr(args, "language", None),
-            )
-        # Smart validation is enabled by default, unless user explicitly sets rules or disables it
-        smart_validation = not getattr(args, "no_smart_validation", False) and not getattr(args, "validator_rules", None)
+            # Check if writeback should be used
+            use_writeback = False
+            original_input_path = None
+            is_extracted_text = False
+            if args.writeback and input_format == "teitok":
+                # Writeback only works when input is TEITOK XML (not stdin)
+                if not read_from_stdin and args.input:
+                    original_input_path = Path(args.input)
+                    if original_input_path.exists():
+                        # Use writeback if output is same as input, or no output specified
+                        if not output_path or str(original_input_path.resolve()) == str(Path(output_path).resolve()):
+                            use_writeback = True
+                            # Check if this came from extracted text (non-tokenized TEITOK with --tokenize)
+                            # OR if --use-raw-text was used on an untokenized XML file
+                            from .teitok import teitok_has_tokens
+                            # First check: if original input file has no tokens, we need to insert tokens
+                            if not teitok_has_tokens(str(original_input_path)):
+                                is_extracted_text = True
+                            # Second check: if meta says it came from extracted text
+                            elif output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
+                                is_extracted_text = True
+                            # Third check: if processed from raw text and original file has no tokens
+                            elif output_doc.meta.get("_processed_from_raw_text", False):
+                                if not teitok_has_tokens(str(original_input_path)):
+                                    is_extracted_text = True
         
-        # If we used a temp file, print the output to stdout first, then validate
-        if validation_temp_file:
-            try:
-                with open(output_path, "r", encoding="utf-8") as f:
-                    print(f.read(), end="")
-            except OSError:
-                pass
+            # Apply create_implicit_mwt if requested, but only when:
+            # 1. Not in writeback mode (regular output), OR
+            # 2. In writeback mode but inserting new tokens (is_extracted_text is True)
+            # Don't apply when updating existing tokens in writeback mode
+            # When updating existing tokens, the backend might create MWTs from SpaceAfter=No sequences,
+            # but we don't want to apply _create_implicit_mwt as it would break token alignment
+            # Also don't apply if backend explicitly disables it (e.g., UD-Kanbun)
+            if args.create_implicit_mwt and output_format == "teitok":
+                # Check if backend explicitly disables create_implicit_mwt
+                if output_doc.meta.get("_disable_create_implicit_mwt", False):
+                    should_apply_mwt = False
+                else:
+                    should_apply_mwt = False
+                    if not use_writeback:
+                        # Regular output - always apply if requested
+                        should_apply_mwt = True
+                    elif use_writeback and is_extracted_text:
+                        # Writeback mode but inserting new tokens (untokenized file)
+                        should_apply_mwt = True
+                    elif use_writeback and output_doc.meta.get("_processed_from_raw_text", False) and original_input_path:
+                        # Processed from raw text - check if file has no tokens
+                        from .teitok import teitok_has_tokens
+                        if not teitok_has_tokens(str(original_input_path)):
+                            should_apply_mwt = True
+                # Explicitly don't apply when updating existing tokens in writeback mode
+                # (is_extracted_text is False and we're in writeback mode)
+                if should_apply_mwt:
+                    from .conllu import _create_implicit_mwt
+                    from .doc import Document, Sentence
+                    # Create a new document with MWTs created
+                    new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta), attrs=dict(output_doc.attrs))
+                    # Copy spans from original document
+                    for layer, spans in output_doc.spans.items():
+                        for span in spans:
+                            new_doc.add_span(layer, span)
+                    for sent in output_doc.sentences:
+                        new_sent = _create_implicit_mwt(sent)
+                        new_doc.sentences.append(new_sent)
+                    output_doc = new_doc
+                    validator_source_doc = output_doc
         
-        validation_rc = run_validator_cli(
-            Path(output_path),
-            version=getattr(args, "ud_tools_version", "latest"),
-            url=getattr(args, "ud_tools_url", None),
-            rules=getattr(args, "validator_rules", None),
-            extra_args=getattr(args, "validator_args", None),
-            lang=validator_lang,
-            verbose=args.verbose or args.debug,
-            smart_validation=smart_validation,
-        )
-        
-        # Clean up temp file after validation
-        if validation_temp_file:
-            try:
-                Path(output_path).unlink()
-            except OSError:
-                pass
-        
-        if validation_rc != 0:
-            if session:
+            if use_writeback and original_input_path:
+                target_writeback_path = original_input_path
+                temp_writeback_path: Optional[Path] = None
+                if args.test:
+                    import tempfile
+                    import shutil
+                    suffix = original_input_path.suffix or ".xml"
+                    fd, temp_name = tempfile.mkstemp(prefix="flexipipe-test-", suffix=suffix)
+                    os.close(fd)
+                    shutil.copy2(original_input_path, temp_name)
+                    target_writeback_path = Path(temp_name)
+                    temp_writeback_path = target_writeback_path
+                # Create backup before writeback (TEITOK-style once-a-day backup)
+                # Only create backup if we're in a TEITOK project (settings.xml exists)
+                from .teitok_backup import create_teitok_backup
+                from .teitok_settings import find_settings_xml
+            
+                backup_path = None
+                settings_path = find_settings_xml(original_input_path)
+                if args.test:
+                    if args.verbose or args.debug:
+                        print("[flexipipe] Skipping backup (--test dry-run)", file=sys.stderr)
+                elif settings_path and settings_path.exists():
+                    backup_path = create_teitok_backup(str(original_input_path))
+                    if backup_path:
+                        if args.verbose or args.debug:
+                            print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
+                    elif args.verbose or args.debug:
+                        from datetime import date
+                        today = date.today().strftime("%Y%m%d")
+                        filename = Path(original_input_path).name
+                        if "." in filename:
+                            name_part, ext_part = filename.rsplit(".", 1)
+                            backup_name = f"{name_part}-{today}.{ext_part}"
+                        else:
+                            backup_name = f"{filename}-{today}"
+                        backups_dir = Path.cwd() / "backups"
+                        existing_backup = backups_dir / backup_name
+                        if existing_backup.exists():
+                            print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
+                elif args.verbose or args.debug:
+                    print("[flexipipe] Skipping backup (not in a TEITOK project - settings.xml not found)", file=sys.stderr)
+            
+                from .teitok import update_teitok
+                from .insert_tokens import insert_tokens_into_teitok
+                # Note: create_implicit_mwt is already applied earlier if needed (when not in writeback mode
+                # or when inserting new tokens in writeback mode)
                 try:
-                    update_session(session.session_id, status="failed", error=f"Validation failed with exit code {validation_rc}")
-                except Exception:
-                    pass
-            return validation_rc
+                    if is_extracted_text:
+                        textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
+                        include_notes = getattr(args, "textnotes", False)
+                        engine = getattr(args, "insert_tokens_engine", "standoff")
+                        insert_tokens_into_teitok(
+                            output_doc,
+                            str(target_writeback_path),
+                            output_path if output_path else None,
+                            textnode_xpath=textnode_xpath,
+                            include_notes=include_notes,
+                            settings=teitok_settings_obj,
+                            use_minidom_rebuild=(engine == "minidom"),
+                            use_string_rebuild=(engine == "string"),
+                            use_teitok_rebuild=(engine == "teitok"),
+                        )
+                        if args.verbose or args.debug:
+                            target = str(target_writeback_path) if not output_path else output_path
+                            print(f"[flexipipe] Inserted tokens into TEITOK file: {target}")
+                    else:
+                        # Determine if this was processed from raw text
+                        # Check if use_raw_text was used (stored in document metadata)
+                        processed_from_raw = output_doc.meta.get("_processed_from_raw_text", False)
+                        # Decide whether to insert <s> elements on writeback.
+                        # If the original TEITOK XML had tokens but no <s>, and the user
+                        # requested segmentation, auto-enable sentence insertion so that
+                        # backend sentence boundaries are reflected in the XML.
+                        auto_insert_sentences = getattr(args, "writeback_insert_sentences", False)
+                        if not auto_insert_sentences:
+                            # Safely check document metadata populated by load_teitok
+                            meta = getattr(output_doc, "meta", {}) or {}
+                            tokens_only_xml = bool(meta.get("_teitok_tokens_only_xml"))
+                            if tokens_only_xml and "segment" in requested_tasks:
+                                auto_insert_sentences = True
+                    
+                        update_teitok(
+                            output_doc,
+                            str(target_writeback_path),
+                            output_path if output_path else None,
+                            settings=teitok_settings_obj,
+                            from_raw_text=processed_from_raw,
+                            strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
+                            unicode_normalization=output_unicode_normalize,
+                            insert_sentences=auto_insert_sentences,
+                            verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
+                        )
+                        if args.verbose or args.debug:
+                            target = str(target_writeback_path) if not output_path else output_path
+                            print(f"[flexipipe] Updated TEITOK file in-place: {target}")
+                except Exception as e:
+                    print(
+                        f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
+                        file=sys.stderr,
+                    )
+                    if args.test and temp_writeback_path:
+                        temp_writeback_path.unlink(missing_ok=True)
+                else:
+                    if args.test and temp_writeback_path:
+                        with open(temp_writeback_path, "r", encoding="utf-8") as tf:
+                            sys.stdout.write(tf.read())
+                        temp_writeback_path.unlink(missing_ok=True)
+                        return 0
+                    writeback_rendered = True
+            emit_teitok_output = True
+            if use_writeback and not args.test and not output_path:
+                emit_teitok_output = args.verbose or args.debug
+            if emit_teitok_output or output_path or args.test or not use_writeback:
+                tei_tasks = _detect_performed_tasks(output_doc)
+                tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
+                pretty_print = getattr(args, "pretty_print", False)
+                spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
+                skip_spaceafter_for_breaking = getattr(args, "skip_spaceafter_for_breaking_elements", True)
+                tei_output = dump_teitok(
+                    output_doc,
+                    pretty_print=pretty_print,
+                    spaceafter_handling=spaceafter_handling,
+                    skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
+                    settings=teitok_settings_obj,
+                    unicode_normalization=output_unicode_normalize,
+                )
+                note_candidate = (
+                    note_source_path
+                    or output_doc.meta.get("original_input_path")
+                    or output_doc.meta.get("source_path")
+                )
+                note_value = None
+                if note_candidate and str(note_candidate) not in ("-", "<inline-data>"):
+                    note_value = f"{Path(str(note_candidate)).stem}.xml"
+                change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+                # Collect all backends used (from piping or single backend)
+                backends_used = output_doc.meta.get("_backends_used", [])
+                if backend_type and backend_type.lower() not in backends_used:
+                    backends_used.append(backend_type.lower())
+                if not backends_used:
+                    backends_used = ["flexipipe"]
+            
+                # Build backend string - show all backends
+                backend_names = [b.upper() for b in backends_used]
+                change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
+                change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+            
+                # Collect model/license info and acknowledgements for notes
+                api_notes = []
+            
+                # Extract model and license info from file-level attributes
+                file_level_attrs = output_doc.meta.get("_file_level_attrs", {})
+                model_info_lines = []
+            
+                # Collect all model and license pairs
+                model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+                for model_key in model_keys:
+                    model_name = file_level_attrs[model_key]
+                    model_info_lines.append(f"# {model_key} = {model_name}")
+                
+                    # Add corresponding license if present
+                    licence_key = f"{model_key}_licence"
+                    if licence_key in file_level_attrs:
+                        model_info_lines.append(f"# {licence_key} = {file_level_attrs[licence_key]}")
+            
+                if model_info_lines:
+                    # Add acknowledgements if present
+                    if "_api_acknowledgements" in output_doc.meta:
+                        acknowledgements = output_doc.meta["_api_acknowledgements"]
+                        if isinstance(acknowledgements, list):
+                            model_info_lines.append("")
+                            model_info_lines.append("# acknowledgements:")
+                            for ack in acknowledgements:
+                                model_info_lines.append(f"#   {ack}")
+                        elif isinstance(acknowledgements, str):
+                            model_info_lines.append("")
+                            model_info_lines.append(f"# acknowledgements: {acknowledgements}")
+                
+                    api_notes.append(("Model Information", "\n".join(model_info_lines)))
+            
+                tei_output = _augment_tei_output(
+                    tei_output,
+                    note_value=note_value,
+                    change_text=change_text,
+                    change_when=change_when,
+                    api_notes=api_notes if api_notes else None,
+                    pretty_print=pretty_print,
+                    spaceafter_handling=spaceafter_handling,
+                    skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
+                )
+                if output_path:
+                    with open(output_path, "w", encoding="utf-8") as handle:
+                        handle.write(tei_output)
+                elif emit_teitok_output:
+                    print(tei_output)
+        elif output_format == "json":
+            import json as json_module  # Use explicit name to avoid shadowing issues
+            performed_tasks = sorted(_detect_performed_tasks(result.document)) or sorted(requested_tasks)
+            payload = {
+                "document": document_to_json_payload(result.document),
+                "model": model_str,
+                "backend": backend_type,
+                "tasks": performed_tasks,
+                "stats": result.stats,
+            }
+            json_text = json_module.dumps(payload, ensure_ascii=False, indent=2)
+            if output_path:
+                Path(output_path).write_text(
+                    json_text if json_text.endswith("\n") else f"{json_text}\n",
+                    encoding="utf-8",
+                )
+            else:
+                print(json_text)
+        else:
+            # For other formats (conllu, conllu-ne, svg), use _write_document
+            # Get Unicode normalization form for output
+            from .model_storage import get_unicode_normalization
+            output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
+            if output_unicode_normalize is None:
+                output_unicode_normalize = get_unicode_normalization()
+        
+            svg_style = getattr(args, "svg_style", "dep")
+            _write_document(
+                result.document,
+                output_path,
+                output_format,
+                unicode_normalization=output_unicode_normalize,
+                svg_style=svg_style,
+            )
 
-    # Clean up session on successful completion
-    if session:
-        try:
-            update_session(session.session_id, status="completed")
-            delete_session(session.session_id)
-        except Exception:
-            pass
-    
+        if args.debug:
+            print(f"[flexipipe] completed. stats={result.stats}")
+            sent_count = len(result.document.sentences)
+            tok_count = sum(len(sent.tokens) for sent in result.document.sentences)
+            print(f"[flexipipe] wrote document: sentences={sent_count} tokens={tok_count}")
+        elif args.verbose:
+            print(f"[flexipipe] saved to {output_path or 'stdout'}")
+
+        if getattr(args, "validate", False):
+            if output_format not in ("conllu", "conllu-ne"):
+                print(
+                    "[flexipipe] --validate currently supports only conllu/conllu-ne output. "
+                    "Use --output-format conllu (or conllu-ne) when enabling validation.",
+                    file=sys.stderr,
+                )
+                return 1
+            # output_path should be set now (either from user or from temp file)
+            if not output_path:
+                print(
+                    "[flexipipe] --validate requires --output <file> so the UD validator can read the saved CoNLL-U.",
+                    file=sys.stderr,
+                )
+                return 1
+        
+            validator_lang = getattr(args, "validator_lang", None)
+            if not validator_lang:
+                validator_lang = infer_language_from_document(
+                    validator_source_doc,
+                    detection_result,
+                    getattr(args, "language", None),
+                )
+            # Smart validation is enabled by default, unless user explicitly sets rules or disables it
+            smart_validation = not getattr(args, "no_smart_validation", False) and not getattr(args, "validator_rules", None)
+        
+            # If we used a temp file, print the output to stdout first, then validate
+            if validation_temp_file:
+                try:
+                    with open(output_path, "r", encoding="utf-8") as f:
+                        print(f.read(), end="")
+                except OSError:
+                    pass
+        
+            validation_rc = run_validator_cli(
+                Path(output_path),
+                version=getattr(args, "ud_tools_version", "latest"),
+                url=getattr(args, "ud_tools_url", None),
+                rules=getattr(args, "validator_rules", None),
+                extra_args=getattr(args, "validator_args", None),
+                lang=validator_lang,
+                verbose=args.verbose or args.debug,
+                smart_validation=smart_validation,
+            )
+        
+            # Clean up temp file after validation
+            if validation_temp_file:
+                try:
+                    Path(output_path).unlink()
+                except OSError:
+                    pass
+        
+            if validation_rc != 0:
+                if session:
+                    try:
+                        update_session(session.session_id, status="failed", error=f"Validation failed with exit code {validation_rc}")
+                    except Exception:
+                        pass
+                return validation_rc
+
+        # Clean up session on successful completion
+        if session:
+            try:
+                update_session(session.session_id, status="completed")
+                delete_session(session.session_id)
+            except Exception:
+                pass
+
     return 0
 
 
