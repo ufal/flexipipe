@@ -1199,6 +1199,7 @@ def _auto_select_model_for_language(
         
         def sort_key(item: tuple[str, str, dict]):
             backend, model_name, entry = item
+            model_name_lower = (model_name or "").lower()
             # Check backend availability first - unavailable backends should be sorted last
             from .backend_registry import is_backend_available
             backend_available = is_backend_available(backend)
@@ -1208,13 +1209,23 @@ def _auto_select_model_for_language(
                 spacy_available = _spacy_model_available(model_name)
             availability_score = 0 if (backend_available and spacy_available) else 1
             
-            # Use preferred flag if available (from unified catalog)
-            preferred_score = 0 if entry.get("preferred", False) else 1
+            # Use preferred flag if available, but ignore stale/unsafe ATIS preference.
+            # Also softly prefer EWT for general English UDPipe auto-selection.
+            is_udpipe_atis = backend == "udpipe" and "-atis-" in model_name_lower
+            is_udpipe_en_ewt = (
+                backend == "udpipe"
+                and (language or "").strip().lower() == "en"
+                and "-ewt-" in model_name_lower
+            )
+            effective_preferred = bool(entry.get("preferred", False)) and not is_udpipe_atis
+            preferred_score = 0 if effective_preferred else 1
+            domain_penalty = 1 if is_udpipe_atis else 0
+            ewt_bonus = -1 if is_udpipe_en_ewt else 0
             status = (entry.get("status") or "").lower()
             installed_score = 0 if status == "installed" else 1
             backend_score = backend_rank.get(backend, len(combined_order))
-            # Sort by: availability (available first), preferred, installed, backend rank, model name
-            return (availability_score, preferred_score, installed_score, backend_score, model_name)
+            # Sort by: availability, preferred, EWT bonus (en/udpipe), domain penalty, installed, backend rank, model
+            return (availability_score, preferred_score, ewt_bonus, domain_penalty, installed_score, backend_score, model_name)
 
         matches.sort(key=sort_key)
         if getattr(args, "debug", False) and matches:
@@ -1548,7 +1559,10 @@ def _detect_language_from_text(
         if explicit or log_failures:
             print("[flexipipe] Language detection skipped: no text available.")
         return None
-    snippet = text.strip()
+    # Always normalize detection input to NFC so detector scores are stable
+    # across decomposed/composed Unicode forms.
+    import unicodedata
+    snippet = unicodedata.normalize("NFC", text.strip())
     if len(snippet) > 20000:
         snippet = snippet[:20000]
     if len(snippet) < min_length:
@@ -1676,9 +1690,37 @@ def _detect_language_from_text(
                     conf = candidate.get("confidence", 0.0)
                     print(f"  {idx}. {name} ({iso}): {conf:.2%}")
         # For explicit detection commands, treat low confidence as failure.
-        # For implicit detection (auto selection), keep the best guess anyway.
+        # For implicit detection, try trigram cross-check for fasttext before
+        # accepting a low-confidence best guess.
         if explicit:
             return None
+        if detector_name.lower() == "fasttext":
+            try:
+                trigram_result = detect_language_with(
+                    "trigram",
+                    snippet,
+                    min_length=min_length,
+                    confidence_threshold=0.0,
+                    verbose=explicit or log_failures,
+                )
+            except Exception as exc:
+                trigram_result = None
+                if log_failures:
+                    print(f"[flexipipe] Trigram cross-check failed: {exc}")
+            if trigram_result:
+                trigram_iso = trigram_result.get("language_iso") or trigram_result.get("label")
+                trigram_name = trigram_result.get("language_name") or trigram_iso
+                trigram_reliable = trigram_result.get("reliable")
+                if log_failures:
+                    print(
+                        f"[flexipipe] Low-confidence fasttext cross-check with trigram: "
+                        f"{trigram_iso} ({trigram_name}, reliable={trigram_reliable})"
+                    )
+                if trigram_reliable is True:
+                    trigram_result.setdefault("detector", "trigram")
+                    if log_failures:
+                        print("[flexipipe] Using trigram result due to low-confidence fasttext output.")
+                    return trigram_result
         elif log_failures:
             # In implicit mode with debug/verbose, still log that we're using the best guess
             detected_iso = result.get("language_iso") or result.get("label") or "unknown"
@@ -7653,6 +7695,9 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             raise
         return 0
+    # Backward compatibility: old `show ...` command maps to `info ...`
+    elif argv[0] == "show":
+        argv = ["info", *argv[1:]]
     elif argv[0] not in TASK_CHOICES and not argv[0].startswith("-"):
         # If the first argument is not a task name and not an option, treat it as inline text for `process`
         # This restores the “process by default” behavior for commands like:

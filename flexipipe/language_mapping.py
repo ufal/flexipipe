@@ -68,6 +68,7 @@ _LANGUAGE_MAPPINGS: List[Tuple[str, str, str, str, List[str]]] = [
     ("ru", "rus", "rus", "Russian", ["russian", "русский"]),
     ("sk", "slk", "slk", "Slovak", ["slovak", "slovenčina"]),
     ("sl", "slv", "slv", "Slovenian", ["slovenian", "slovenski"]),
+    ("sw", "swa", "swa", "Swahili", ["swahili", "kiswahili"]),
     ("sv", "swe", "swe", "Swedish", ["swedish", "svenska"]),
     ("tr", "tur", "tur", "Turkish", ["turkish", "türkçe", "turkce"]),
     ("uk", "ukr", "ukr", "Ukrainian", ["ukrainian", "українська"]),

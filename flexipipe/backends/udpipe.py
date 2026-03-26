@@ -187,6 +187,14 @@ def _entries_from_curated_registry(
                 features=model_info.get("features"),
                 tasks=model_info.get("tasks"),
             )
+            # Guard against bad upstream preference flags:
+            # ATIS treebanks are domain-specific and should not be auto-preferred.
+            model_name_lower = (model_name or "").lower()
+            if "-atis-" in model_name_lower:
+                entry["preferred"] = False
+            # For English general-purpose auto-selection, prefer EWT when available.
+            if model_name_lower.startswith("english-ewt-"):
+                entry["preferred"] = True
             
             # If the registry has a non-standard code (like "old_ch"), preserve it
             # standardize_language_metadata might normalize it incorrectly through name lookup

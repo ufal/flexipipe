@@ -77,19 +77,38 @@ def resolve_model_from_language(
     # Resolve from unified model catalog
     from .model_catalog import get_models_for_language
     
+    def _rank_backend_model(entry: Dict[str, Any]) -> tuple[int, int, str]:
+        """
+        Local ranking within one backend when registry flags are ambiguous.
+        Lower is better.
+        """
+        model = (entry.get("model") or "").lower()
+        # ATIS is domain-specific and should not win general auto-selection.
+        atis_penalty = 1 if "-atis-" in model else 0
+        # For English UDPipe, EWT is the preferred general-purpose treebank.
+        ewt_bonus = 0
+        if backend_name == "udpipe" and (language or "").strip().lower() == "en":
+            ewt_bonus = -1 if "-ewt-" in model else 0
+        return (atis_penalty, ewt_bonus, model)
+
     # Try preferred models first if requested
     if preferred_only:
         models = get_models_for_language(language, preferred_only=True, use_cache=use_cache)
         backend_models = [m for m in models if m.get("backend") == backend_name]
         if backend_models:
+            backend_models.sort(key=_rank_backend_model)
             model = backend_models[0].get("model")
             if model:
-                return model
+                # If preferred set is wrong/stale (e.g., only ATIS marked preferred),
+                # fall through to the full model list to pick a better general model.
+                if not (backend_name == "udpipe" and "-atis-" in model.lower()):
+                    return model
     
     # Fall back to any model for the language
     all_models = get_models_for_language(language, preferred_only=False, use_cache=use_cache)
     backend_models = [m for m in all_models if m.get("backend") == backend_name]
     if backend_models:
+        backend_models.sort(key=_rank_backend_model)
         model = backend_models[0].get("model")
         if model:
             return model

@@ -17,6 +17,9 @@ def _subcommand_from_argv(argv: list[str]) -> str | None:
 def run(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # Backward compatibility: old `show ...` command maps to `info ...`
+    if argv and argv[0] == "show":
+        argv = ["info", *argv[1:]]
     sub = _subcommand_from_argv(argv)
     if sub == "install":
         from ._cli_install import main
