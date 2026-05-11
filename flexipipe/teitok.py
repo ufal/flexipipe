@@ -496,6 +496,21 @@ def _get_attr_value_with_fallback(
     return ""
 
 
+def _xml_surface_form_like_load(elem: ET.Element) -> str:
+    """
+    Surface string for a <tok> for alignment / verification, using the same rule as
+    TEITOK load: when inner text and @form disagree, trust inner text (stale @form).
+    """
+    form_attr = (elem.get("form") or "").strip()
+    form_text = (elem.text or "").strip()
+    if form_text and form_attr and form_text != form_attr:
+        return form_text
+    v = _get_attr_value_with_fallback(elem, ["form"], fallback_to_text=True)
+    if not v:
+        v = form_text or form_attr
+    return (v or "").strip()
+
+
 def _build_parent_map(elem: ET.Element, parent_map: Dict[ET.Element, ET.Element]) -> None:
     """Build a map of element -> parent for all elements in the tree."""
     for child in elem:
@@ -946,9 +961,18 @@ def _load_teitok_with_mappings(
                     pass
             
             # Get form (required)
-            form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True)
-            if not form:
-                form = (tok_elem.text or "").strip()
+            form_attr = (tok_elem.get("form") or "").strip()
+            form_text = (tok_elem.text or "").strip()
+            # Prefer visible token text when it disagrees with @form.
+            # Some corpora contain stale/incorrect @form values from earlier runs
+            # (e.g. quote+word merged into one token), while inner text reflects the
+            # actual token segmentation in XML.
+            if form_text and form_attr and form_text != form_attr:
+                form = form_text
+            else:
+                form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True)
+                if not form:
+                    form = form_text
             
             # Infer space_after from XML structure
             # When sentence uses sameAs, tokens live elsewhere so use only each token's tail.
@@ -1085,9 +1109,14 @@ def _load_teitok_with_mappings(
                 if dtok_form_attr == "--":
                     continue  # Skip suppressed subtokens
                 
-                dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True)
-                if not dtok_form:
-                    dtok_form = (dtok_elem.text or "").strip()
+                dtok_form_attr = (dtok_elem.get("form") or "").strip()
+                dtok_form_text = (dtok_elem.text or "").strip()
+                if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
+                    dtok_form = dtok_form_text
+                else:
+                    dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True)
+                    if not dtok_form:
+                        dtok_form = dtok_form_text
                 
                 # Only fall back to form/innerText if "form" is explicitly in the attribute list
                 dtok_lemma_has_form = "form" in lemma_attrs
@@ -1301,7 +1330,12 @@ def _load_teitok_with_mappings(
                     current_sentence_tok_elems = []
                     prev_block = block
 
-                form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or (tok_elem.text or "").strip()
+                form_attr = (tok_elem.get("form") or "").strip()
+                form_text = (tok_elem.text or "").strip()
+                if form_text and form_attr and form_text != form_attr:
+                    form = form_text
+                else:
+                    form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or form_text
                 if not form:
                     continue
                 tokid = tok_elem.get("id") or tok_elem.get(f"{XML_NS}id", "")
@@ -1334,7 +1368,12 @@ def _load_teitok_with_mappings(
                 for dtok_elem in tok_elem.findall("dtok") or tok_elem.findall("{*}dtok"):
                     if dtok_elem.get("form", "") == "--":
                         continue
-                    dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or (dtok_elem.text or "").strip()
+                    dtok_form_attr = (dtok_elem.get("form") or "").strip()
+                    dtok_form_text = (dtok_elem.text or "").strip()
+                    if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
+                        dtok_form = dtok_form_text
+                    else:
+                        dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or dtok_form_text
                     subtokens.append(SubToken(id=len(subtokens) + 1, form=dtok_form, lemma="", xpos="", upos="", feats="", reg="", expan="", space_after=False, attrs={}))
                 token = Token(
                     id=global_tok_id,
@@ -1720,110 +1759,9 @@ def _verify_character_level_alignment(
         (is_valid, error_message) tuple
     """
     import sys
-    
-    # Reconstruct text from XML tokens (original) - use @text attribute from <s> nodes if available
-    xml_text_parts = []
-    sentence_nodes = []
-    for s_node in xml_root.iter():
-        if s_node.tag.endswith("}s") or s_node.tag == "s":
-            sentence_nodes.append(s_node)
-    
-    # Process sentences in document order
-    for s_node in sentence_nodes:
-        # First try to use sentence text attribute (most accurate)
-        sent_text = s_node.get("text", "")
-        if sent_text:
-            xml_text_parts.append(sent_text)
-            xml_text_parts.append(" ")
-        else:
-            # Fallback: reconstruct from tokens
-            sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
-            for tok_node in sent_tok_nodes:
-                # Get form from text content or @form attribute
-                form = (tok_node.text or "").strip() or tok_node.get("form", "")
-                if form:
-                    xml_text_parts.append(form)
-                    # Check SpaceAfter attribute
-                    space_after = tok_node.get("SpaceAfter", "Yes")
-                    if space_after and space_after.lower() != "no":
-                        xml_text_parts.append(" ")
-    
-    xml_text = "".join(xml_text_parts)
-    
-    # Reconstruct text from backend output (document)
-    backend_text_parts = []
-    for sent in document.sentences:
-        for token in sent.tokens:
-            if token.form:
-                backend_text_parts.append(token.form)
-                # Check SpaceAfter from MISC
-                has_space_after = True
-                if token.misc:
-                    misc_parts = token.misc.split("|")
-                    for part in misc_parts:
-                        if part.strip().startswith("SpaceAfter=No"):
-                            has_space_after = False
-                            break
-                if has_space_after:
-                    backend_text_parts.append(" ")
-    
-    backend_text = "".join(backend_text_parts)
-    
-    # Normalize whitespace for comparison (collapse multiple spaces to single space)
-    import re
-    xml_text_normalized = re.sub(r'\s+', ' ', xml_text.strip())
-    backend_text_normalized = re.sub(r'\s+', ' ', backend_text.strip())
-    
-    # Compare character-by-character
-    if xml_text_normalized == backend_text_normalized:
-        return (True, "")
-    
-    # Find the first difference
-    min_len = min(len(xml_text_normalized), len(backend_text_normalized))
-    diff_pos = min_len
-    for i in range(min_len):
-        if xml_text_normalized[i] != backend_text_normalized[i]:
-            diff_pos = i
-            break
-    
-    # Show context around the difference
-    start = max(0, diff_pos - 20)
-    end = min(len(xml_text_normalized), diff_pos + 20)
-    xml_context = xml_text_normalized[start:end]
-    backend_context = backend_text_normalized[start:end] if diff_pos < len(backend_text_normalized) else ""
-    
-    error_msg = (
-        f"Character-level alignment mismatch at position {diff_pos}. "
-        f"XML text: ...{xml_context}... "
-        f"Backend text: ...{backend_context}... "
-        f"(XML length: {len(xml_text_normalized)}, Backend length: {len(backend_text_normalized)})"
-    )
-    
-    return (False, error_msg)
-
-
-def _verify_character_level_alignment(
-    document: Document,
-    xml_root: ET.Element,
-    matched_token_mapping: Dict[Tuple[int, int], ET.Element],
-    from_raw_text: bool = False,
-) -> tuple[bool, str]:
-    """
-    Verify character-level alignment between backend output and original XML.
-    
-    Reconstructs text from both sources and compares character-by-character.
-    This ensures that token splits/merges don't introduce errors.
-    
-    Returns:
-        (is_valid, error_message) tuple
-    """
-    import sys
     import re
     
-    # Reconstruct text from XML tokens (original) - use @text from <s> or tokens (including sameAs)
-    xml_text_parts = []
-    
-    # Build sentence ID -> s node and tok id -> tok node
+    # Build tok id -> XML node (used by pretokenized token-aligned path and raw path)
     sentid_to_xml_node: Dict[str, ET.Element] = {}
     id_to_tok: Dict[str, ET.Element] = {}
     for node in xml_root.iter():
@@ -1836,12 +1774,85 @@ def _verify_character_level_alignment(
             if tid:
                 id_to_tok[tid] = node
     
+    if not from_raw_text:
+        # Pretokenized: align streams on the backend token sequence (same order as CoNLL-U).
+        # For each position, take XML surface from the matched node or fall back to tokid lookup,
+        # using the same inner-text vs @form rule as TEITOK load (fixes stale @form on e.g. '_').
+        xml_chunks: List[str] = []
+        backend_chunks: List[str] = []
+        num_sents = len(document.sentences)
+        for sent_idx, sent in enumerate(document.sentences):
+            num_toks = len(sent.tokens)
+            for token_idx, token in enumerate(sent.tokens):
+                bf = token.form if token.form is not None else ""
+                backend_chunks.append(bf)
+                el = matched_token_mapping.get((sent_idx, token_idx))
+                if el is None:
+                    tid = getattr(token, "tokid", None) or ""
+                    if tid and tid in id_to_tok:
+                        el = id_to_tok[tid]
+                xf = _xml_surface_form_like_load(el) if el is not None else bf
+                # XML may omit surface for a placeholder <tok> while backend has literal '_'.
+                if el is not None and not (xf or "").strip() and bf == "_":
+                    xf = "_"
+                xml_chunks.append(xf)
+                has_space_after = True
+                if token.space_after is False:
+                    has_space_after = False
+                elif token.misc:
+                    for part in token.misc.split("|"):
+                        part_stripped = part.strip()
+                        if part_stripped.startswith("SpaceAfter=No") or part_stripped == "SpaceAfter=No":
+                            has_space_after = False
+                            break
+                if has_space_after and not (sent_idx == num_sents - 1 and token_idx == num_toks - 1):
+                    xml_chunks.append(" ")
+                    backend_chunks.append(" ")
+        xml_text = "".join(xml_chunks)
+        backend_text = "".join(backend_chunks)
+        xml_text_normalized = re.sub(r"\s+", " ", xml_text.strip())
+        backend_text_normalized = re.sub(r"\s+", " ", backend_text.strip())
+        # Compare in NFC to avoid false mismatches from canonically equivalent
+        # combining-mark order (seen in Arabic diacritics).
+        xml_text_normalized = normalize_unicode(xml_text_normalized, "NFC") or xml_text_normalized
+        backend_text_normalized = normalize_unicode(backend_text_normalized, "NFC") or backend_text_normalized
+        if xml_text_normalized == backend_text_normalized:
+            return (True, "")
+        min_len = min(len(xml_text_normalized), len(backend_text_normalized))
+        diff_pos = min_len
+        for i in range(min_len):
+            if xml_text_normalized[i] != backend_text_normalized[i]:
+                diff_pos = i
+                break
+        start = max(0, diff_pos - 30)
+        end = min(len(xml_text_normalized), diff_pos + 30)
+        xml_context = xml_text_normalized[start:end]
+        backend_context = backend_text_normalized[start:end] if diff_pos < len(backend_text_normalized) else ""
+        xml_char = xml_text_normalized[diff_pos] if diff_pos < len(xml_text_normalized) else "<EOF>"
+        backend_char = backend_text_normalized[diff_pos] if diff_pos < len(backend_text_normalized) else "<EOF>"
+        xml_char_code = ord(xml_char) if len(xml_char) == 1 else 0
+        backend_char_code = ord(backend_char) if len(backend_char) == 1 else 0
+        error_msg = (
+            f"Character-level alignment mismatch at position {diff_pos}. "
+            f"XML char: '{xml_char}' (U+{xml_char_code:04X}), Backend char: '{backend_char}' (U+{backend_char_code:04X}). "
+            f"XML text: ...{xml_context}... "
+            f"Backend text: ...{backend_context}... "
+            f"(XML length: {len(xml_text_normalized)}, Backend length: {len(backend_text_normalized)})"
+        )
+        return (False, error_msg)
+    
+    # Raw text: reconstruct from XML sentence structure / @text and backend sentences
+    xml_text_parts = []
+    
     for sent_idx, sent in enumerate(document.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = sentid_to_xml_node.get(sent_id) if sent_id else None
         
         if s_node is not None:
-            sent_text = s_node.get("text", "")
+            # In pretokenized mode, verify against token stream rather than @text.
+            # Some corpora keep sentence @text that can diverge from tokenized content.
+            use_sentence_text = from_raw_text
+            sent_text = s_node.get("text", "") if use_sentence_text else ""
             if sent_text:
                 xml_text_parts.append(sent_text)
                 if sent_idx < len(document.sentences) - 1:
@@ -1860,7 +1871,7 @@ def _verify_character_level_alignment(
                     if not sent_tok_nodes:
                         sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
                 for tok_idx, tok_node in enumerate(sent_tok_nodes):
-                    form = (tok_node.text or "").strip() or tok_node.get("form", "")
+                    form = _xml_surface_form_like_load(tok_node)
                     if form:
                         xml_text_parts.append(form)
                         is_last = sent_idx == len(document.sentences) - 1 and tok_idx == len(sent_tok_nodes) - 1
@@ -1869,8 +1880,17 @@ def _verify_character_level_alignment(
                             if tail and any(c.isspace() for c in tail):
                                 xml_text_parts.append(" ")
                             else:
-                                space_after = tok_node.get("SpaceAfter", "Yes")
-                                if space_after and space_after.lower() != "no":
+                                # TEITOK spacing can be encoded either as an XML
+                                # attribute (SpaceAfter="No") or via CoNLL-U style
+                                # MISC (misc="...|SpaceAfter=No").
+                                misc_val = tok_node.get("misc", "") or ""
+                                space_after_attr = tok_node.get("SpaceAfter", "Yes")
+                                has_spaceafter_no_in_misc = "SpaceAfter=No" in misc_val
+                                if (
+                                    not has_spaceafter_no_in_misc
+                                    and space_after_attr
+                                    and space_after_attr.lower() != "no"
+                                ):
                                     xml_text_parts.append(" ")
         else:
             # No matching XML s_node: use backend tokens; still need space between sentences
@@ -1888,7 +1908,7 @@ def _verify_character_level_alignment(
     backend_text_parts = []
     for sent_idx, sent in enumerate(document.sentences):
         # If sentence has text, use it directly (most accurate)
-        if sent.text:
+        if from_raw_text and sent.text:
             backend_text_parts.append(sent.text)
             # Add space between sentences (except last one)
             if sent_idx < len(document.sentences) - 1:
@@ -1915,18 +1935,17 @@ def _verify_character_level_alignment(
     
     backend_text = "".join(backend_text_parts)
     
-    # Normalize for comparison. In raw text mode, treat punctuation/quote spacing as equivalent
-    # (e.g. ", " vs ",jen" with SpaceAfter=No; or ."To vs ." To after closing quote).
-    if from_raw_text:
-        # Remove optional spaces around punctuation and quotes so both sides compare equal
-        _punct_quote = r"[.,!?;:\"']"
-        xml_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", xml_text)
-        xml_text_normalized = re.sub(r"\s+", " ", xml_text_normalized.strip())
-        backend_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", backend_text)
-        backend_text_normalized = re.sub(r"\s+", " ", backend_text_normalized.strip())
-    else:
-        xml_text_normalized = re.sub(r"\s+", " ", xml_text.strip())
-        backend_text_normalized = re.sub(r"\s+", " ", backend_text.strip())
+    # Normalize for comparison (raw-text mode only reaches here). Treat punctuation/quote
+    # spacing as equivalent (e.g. ", " vs ",x" with SpaceAfter=No).
+    _punct_quote = r"[.,!?;:\"']"
+    xml_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", xml_text)
+    xml_text_normalized = re.sub(r"\s+", " ", xml_text_normalized.strip())
+    backend_text_normalized = re.sub(rf"\s*({_punct_quote})\s*", r"\1", backend_text)
+    backend_text_normalized = re.sub(r"\s+", " ", backend_text_normalized.strip())
+    # Compare in NFC to avoid false mismatches from canonically equivalent
+    # combining-mark order (seen in Arabic diacritics).
+    xml_text_normalized = normalize_unicode(xml_text_normalized, "NFC") or xml_text_normalized
+    backend_text_normalized = normalize_unicode(backend_text_normalized, "NFC") or backend_text_normalized
     
     # Compare character-by-character
     if xml_text_normalized == backend_text_normalized:
@@ -2057,6 +2076,7 @@ def update_teitok(
     unicode_normalization: Optional[str] = None,
     insert_sentences: bool = False,
     verbose: bool = False,
+    keep_ohead: bool = False,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
@@ -2077,6 +2097,8 @@ def update_teitok(
         insert_sentences: If True and the XML had no <s> elements (tokens-only), insert <s> elements
                          using sentence boundaries from the document (e.g. from UDPipe).
         verbose: If True, print token mismatch and alignment summary to stderr.
+        keep_ohead: If True, preserve original CoNLL-U head ordinal in @ohead while
+                    converting @head to TEITOK tokid references.
     """
     try:
         from lxml import etree as ET
@@ -2219,6 +2241,11 @@ def update_teitok(
     def is_comment_line_token(token: Token) -> bool:
         """Check if token looks like it came from a CoNLL-U comment line."""
         form = token.form or ""
+        # Real tokens from pretokenized TEITOK runs carry stable TokIds.
+        # Never classify those as comment artifacts, even if the form is
+        # e.g. "language" or another metadata-like word.
+        if getattr(token, "tokid", None):
+            return False
         # Check for common comment line patterns that UDPipe might tokenize
         comment_patterns = [
             "#", "sent_id", "text", "newdoc", "newpar", "generator", "language",
@@ -2295,13 +2322,23 @@ def update_teitok(
     for sent_idx, sent in enumerate(sanitized.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = None
+        # HEAD ordinals are sentence-local in CoNLL-U.
+        sent_ord_to_tokid: Dict[int, str] = {}
+        sent_ord_to_token: Dict[int, Token] = {}
+        for _tok in sent.tokens:
+            if _tok.id:
+                sent_ord_to_token[_tok.id] = _tok
+                if _tok.tokid:
+                    sent_ord_to_tokid[_tok.id] = _tok.tokid
         
         # Try exact match first
         if sent_id:
             s_node = sentid_to_node.get(sent_id)
         
-        # If exact match failed, try position-based matching
-        if s_node is None and sent_idx < len(sentence_nodes_ordered):
+        # If exact match failed and we have no usable sentence ID, try position-based matching.
+        # Never fall back by position when an explicit sentence ID is present, otherwise
+        # we can bind a sentence to the wrong XML node and corrupt head mappings.
+        if s_node is None and not sent_id and sent_idx < len(sentence_nodes_ordered):
             s_node = sentence_nodes_ordered[sent_idx]
         
         if s_node is None and not tokens_only_mode:
@@ -2328,6 +2365,19 @@ def update_teitok(
             if not sent_tok_nodes:
                 # Include tokens from descendants (e.g. inside <name>)
                 sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
+        sent_tok_nodes_set: Set[ET.Element] = set(sent_tok_nodes)
+        sent_tokid_to_node: Dict[str, ET.Element] = {}
+        sent_ord_to_node: Dict[int, ET.Element] = {}
+        for _n in sent_tok_nodes:
+            _tid = _n.get("id") or _n.get("{http://www.w3.org/XML/1998/namespace}id")
+            if _tid:
+                sent_tokid_to_node[_tid] = _n
+            _ord = _n.get("ord")
+            if _ord:
+                try:
+                    sent_ord_to_node[int(_ord)] = _n
+                except (TypeError, ValueError):
+                    pass
         
         # Build form-based index for smart alignment (for raw text mode with splits/joins)
         # Track which XML nodes have been matched to avoid double-matching
@@ -2571,6 +2621,34 @@ def update_teitok(
                         xml_form_to_nodes[node_form_normalized] = []
                     xml_form_to_nodes[node_form_normalized].append(node)
         
+        quote_chars = "\"'“”„‟«»‹›‚‘’"
+
+        def _forms_match_strict_or_quote_affix(
+            candidate_text: str,
+            candidate_canonical: str,
+            token_form: str,
+        ) -> bool:
+            """Strict form match with narrow quote-affix tolerance for pretokenized mode."""
+            if not token_form:
+                return False
+            token_form = token_form.strip()
+            if not token_form:
+                return False
+
+            # Strict exact match first.
+            if candidate_text == token_form or candidate_canonical == token_form:
+                return True
+
+            # In pretokenized mode, tolerate quote punctuation attached to token edges
+            # by backend tokenization (e.g. „niemals / einzusetzen“).
+            if not from_raw_text:
+                stripped = token_form.strip(quote_chars)
+                if stripped and stripped != token_form:
+                    if candidate_text == stripped or candidate_canonical == stripped:
+                        return True
+
+            return False
+
         # Define verification function before first pass
         def verify_match(candidate_node: ET.Element, token_form: str) -> bool:
             """
@@ -2583,24 +2661,16 @@ def update_teitok(
             if not token_form:
                 return False
             
+            # Same surface rule as TEITOK load: inner text wins over stale @form.
+            surf = _xml_surface_form_like_load(candidate_node)
+            if _forms_match_strict_or_quote_affix(surf, surf, token_form):
+                return True
+            
             candidate_text = get_full_text_content(candidate_node).strip()
             candidate_canonical = gettokform(candidate_node, settings).strip()
             
-            # CRITICAL: Forms must match EXACTLY - same length AND same content
-            # Reject if lengths don't match (prevents "con" matching "Español")
-            if candidate_text and len(candidate_text) != len(token_form):
-                return False
-            if candidate_canonical and len(candidate_canonical) != len(token_form):
-                return False
-            
-            # Check if candidate text exactly matches
-            if candidate_text == token_form:
+            if _forms_match_strict_or_quote_affix(candidate_text, candidate_canonical, token_form):
                 return True
-            # Check if candidate canonical form exactly matches
-            if candidate_canonical == token_form:
-                return True
-            
-            # NO MATCH - reject
             return False
         
         # First pass: match tokens that have TokIds (from CoNLL-U input)
@@ -2612,16 +2682,25 @@ def update_teitok(
                 skipped_tokens += 1
                 continue
             if token.tokid:
-                tok_node = tokid_to_node.get(token.tokid)
+                # Prefer sentence-local lookup to avoid cross-sentence mismatches
+                # when global token IDs are duplicated or stale.
+                tok_node = sent_tokid_to_node.get(token.tokid)
+                if tok_node is None:
+                    tok_node = tokid_to_node.get(token.tokid)
+                    if tok_node is not None and tok_node not in sent_tok_nodes_set:
+                        tok_node = None
+                # Fallback: if tokid lookup fails, try sentence-local ord mapping.
+                if tok_node is None and token.id:
+                    tok_node = sent_ord_to_node.get(token.id)
                 if tok_node is not None and tok_node not in matched_xml_nodes:
-                    # VERIFY: Even TokId-based matches must have matching forms
-                    if token.form:
+                    # VERIFY (raw-text only): pretokenized documents use stable w-* TokIds from
+                    # the same XML load; form checks here falsely reject e.g. backend '_' (UDPipe)
+                    # when the <tok> has empty inner text / stale @form for a hashtag placeholder.
+                    if from_raw_text and token.form:
                         token_form_check = token.form.strip()
-                        if token_form_check:
-                            if not verify_match(tok_node, token_form_check):
-                                # TokId matches but forms don't - skip this match
-                                tok_node = None
-                    
+                        if token_form_check and not verify_match(tok_node, token_form_check):
+                            tok_node = None
+
                     if tok_node is not None:
                         global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
                         matched_xml_nodes.add(tok_node)
@@ -2841,34 +2920,23 @@ def update_teitok(
             if tok_node is not None and token.form:
                 token_form_check = token.form.strip()
                 if token_form_check:  # Only verify if we have a form
+                    surf_chk = _xml_surface_form_like_load(tok_node)
                     candidate_text = get_full_text_content(tok_node).strip()
                     candidate_canonical = gettokform(tok_node, settings).strip()
                     
                     # Determine expected form
                     expected_form = matched_form if matched_form else token_form_check
                     
-                    # CRITICAL: Forms must match EXACTLY - no exceptions
-                    # Reject if lengths don't match
-                    if candidate_text and len(candidate_text) != len(expected_form):
-                        # Match failed verification - reject it
-                        tok_node = None
-                        matched_form = None
-                        # Remove from mappings
-                        if (sent_idx, token_idx) in global_token_to_tok_node:
-                            matched_xml_nodes.discard(global_token_to_tok_node[(sent_idx, token_idx)])
-                            del global_token_to_tok_node[(sent_idx, token_idx)]
-                        matched_backend_token_indices.discard(token_idx)
-                    elif candidate_canonical and len(candidate_canonical) != len(expected_form):
-                        # Match failed verification - reject it
-                        tok_node = None
-                        matched_form = None
-                        # Remove from mappings
-                        if (sent_idx, token_idx) in global_token_to_tok_node:
-                            matched_xml_nodes.discard(global_token_to_tok_node[(sent_idx, token_idx)])
-                            del global_token_to_tok_node[(sent_idx, token_idx)]
-                        matched_backend_token_indices.discard(token_idx)
-                    # Reject if content doesn't match exactly
-                    elif candidate_text != expected_form and candidate_canonical != expected_form:
+                    # Reject if content doesn't match (strict, plus quote-affix tolerance
+                    # in pretokenized mode).
+                    if not (
+                        _forms_match_strict_or_quote_affix(surf_chk, surf_chk, expected_form)
+                        or _forms_match_strict_or_quote_affix(
+                            candidate_text,
+                            candidate_canonical,
+                            expected_form,
+                        )
+                    ):
                         # Match failed verification - reject it
                         tok_node = None
                         matched_form = None
@@ -2917,13 +2985,23 @@ def update_teitok(
     for sent_idx, sent in enumerate(sanitized.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = None
+        # HEAD ordinals are sentence-local in CoNLL-U; rebuild maps per sentence.
+        sent_ord_to_tokid: Dict[int, str] = {}
+        sent_ord_to_token: Dict[int, Token] = {}
+        for _tok in sent.tokens:
+            if _tok.id:
+                sent_ord_to_token[_tok.id] = _tok
+                if _tok.tokid:
+                    sent_ord_to_tokid[_tok.id] = _tok.tokid
         
         # Try exact match first
         if sent_id:
             s_node = sentid_to_node.get(sent_id)
         
-        # If exact match failed, try position-based matching
-        if s_node is None and sent_idx < len(sentence_nodes_ordered):
+        # If exact match failed and we have no usable sentence ID, try position-based matching.
+        # Never fall back by position when an explicit sentence ID is present, otherwise
+        # we can bind a sentence to the wrong XML node and corrupt head mappings.
+        if s_node is None and not sent_id and sent_idx < len(sentence_nodes_ordered):
             s_node = sentence_nodes_ordered[sent_idx]
         
         if s_node is None:
@@ -2952,6 +3030,35 @@ def update_teitok(
                 s_node.set("text", sent.text)
             if sent.corr and not s_node.get("corr"):
                 s_node.set("corr", sent.corr)
+
+        # Build sentence-local ord -> tokid map from XML nodes when possible.
+        # This is the most reliable source for TEITOK head references and avoids
+        # accidental cross-sentence mappings if backend token IDs drift.
+        if s_node is not None:
+            attrs_to_try = getattr(settings, "sentence_tokref_attributes", None) if settings else None
+            if not attrs_to_try:
+                attrs_to_try = ["sameAs", "sameas", "corresp"]
+            ref_attr = ""
+            for a in attrs_to_try:
+                v = s_node.get(a)
+                if v:
+                    ref_attr = v
+                    break
+            if ref_attr and tokid_to_node:
+                ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
+                sent_tok_nodes_for_heads = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
+            else:
+                sent_tok_nodes_for_heads = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                if not sent_tok_nodes_for_heads:
+                    sent_tok_nodes_for_heads = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
+            for xml_tok in sent_tok_nodes_for_heads:
+                tokid_val = xml_tok.get("id") or xml_tok.get("{http://www.w3.org/XML/1998/namespace}id")
+                ord_val = xml_tok.get("ord")
+                if tokid_val and ord_val:
+                    try:
+                        sent_ord_to_tokid[int(ord_val)] = tokid_val
+                    except (TypeError, ValueError):
+                        pass
         
         # Update tokens using pre-built mapping
         # Track which XML nodes have been updated and which backend tokens are part of splits
@@ -3170,12 +3277,14 @@ def update_teitok(
                                 head_int = 0
                     
                     if head_int > 0:
-                        head_tokid = global_ord_to_tokid.get(head_int)
+                        if keep_ohead:
+                            _set_attr(dtok_node, "ohead", str(head_int))
+                        head_tokid = sent_ord_to_tokid.get(head_int)
                         if not head_tokid:
-                            head_token = ord_to_token.get(head_int)
+                            head_token = sent_ord_to_token.get(head_int)
                             if head_token and head_token.tokid:
                                 head_tokid = head_token.tokid
-                                global_ord_to_tokid[head_int] = head_tokid
+                                sent_ord_to_tokid[head_int] = head_tokid
                         if head_tokid:
                             _set_attr(dtok_node, "head", head_tokid)
                         else:
@@ -3250,12 +3359,14 @@ def update_teitok(
                                     head_int = 0
                         
                         if head_int > 0:
-                            head_tokid = global_ord_to_tokid.get(head_int)
+                            if keep_ohead:
+                                _set_attr(dtok_node, "ohead", str(head_int))
+                            head_tokid = sent_ord_to_tokid.get(head_int)
                             if not head_tokid:
-                                head_token = ord_to_token.get(head_int)
+                                head_token = sent_ord_to_token.get(head_int)
                                 if head_token and head_token.tokid:
                                     head_tokid = head_token.tokid
-                                    global_ord_to_tokid[head_int] = head_tokid
+                                    sent_ord_to_tokid[head_int] = head_tokid
                             if head_tokid:
                                 _set_attr(dtok_node, "head", head_tokid)
                             else:
@@ -3287,7 +3398,7 @@ def update_teitok(
                     else:
                         # Remaining subtokens - apply to their respective XML tokens
                         xml_node = subtoken_xml_nodes.get(sub_idx)
-                        if not xml_node:
+                        if xml_node is None:
                             continue
                     
                     # Apply subtoken annotations to this XML node
@@ -3320,12 +3431,14 @@ def update_teitok(
                                 head_int = 0
                     
                     if head_int > 0:
-                        head_tokid = global_ord_to_tokid.get(head_int)
+                        if keep_ohead:
+                            _set_attr(xml_node, "ohead", str(head_int))
+                        head_tokid = sent_ord_to_tokid.get(head_int)
                         if not head_tokid:
-                            head_token = ord_to_token.get(head_int)
+                            head_token = sent_ord_to_token.get(head_int)
                             if head_token and head_token.tokid:
                                 head_tokid = head_token.tokid
-                                global_ord_to_tokid[head_int] = head_tokid
+                                sent_ord_to_tokid[head_int] = head_tokid
                         if head_tokid:
                             _set_attr(xml_node, "head", head_tokid)
                         else:
@@ -3447,14 +3560,16 @@ def update_teitok(
                                 dtok_head_int = 0
                     
                     if dtok_head_int > 0:
-                        # Convert from ord to tokid using global mapping
-                        dtok_head_tokid = global_ord_to_tokid.get(dtok_head_int)
+                        if keep_ohead:
+                            _set_attr(dtok_node, "ohead", str(dtok_head_int))
+                        # Convert from ord to tokid (sentence-local first, then global fallback)
+                        dtok_head_tokid = sent_ord_to_tokid.get(dtok_head_int)
                         if not dtok_head_tokid:
                             # Fallback: use reverse mapping for efficient lookup
-                            dtok_head_token = ord_to_token.get(dtok_head_int)
+                            dtok_head_token = sent_ord_to_token.get(dtok_head_int)
                             if dtok_head_token and dtok_head_token.tokid:
                                 dtok_head_tokid = dtok_head_token.tokid
-                                global_ord_to_tokid[dtok_head_int] = dtok_head_tokid
+                                sent_ord_to_tokid[dtok_head_int] = dtok_head_tokid
                         
                         if dtok_head_tokid:
                             _set_attr(dtok_node, "head", dtok_head_tokid)
@@ -3502,15 +3617,23 @@ def update_teitok(
                             head_int = 0
                 
                 if head_int > 0:
-                    # Convert from ord to tokid using global mapping
-                    head_tokid = global_ord_to_tokid.get(head_int)
+                    if keep_ohead:
+                        _set_attr(tok_node, "ohead", str(head_int))
+                    # Convert from ord to tokid (sentence-local first, then global fallback)
+                    head_tokid = sent_ord_to_tokid.get(head_int)
+                    if verbose and sent_idx == 0 and token.id in (1, 2, 3):
+                        import sys
+                        print(
+                            f"[flexipipe] DEBUG head-convert tokid={token.tokid} ord={token.id} head_int={head_int} sent_head_tokid={head_tokid} sent_map={sent_ord_to_tokid}",
+                            file=sys.stderr,
+                        )
                     if not head_tokid:
                         # Fallback: use reverse mapping for efficient lookup
-                        head_token = ord_to_token.get(head_int)
+                        head_token = sent_ord_to_token.get(head_int)
                         if head_token and head_token.tokid:
                             head_tokid = head_token.tokid
-                            # Update mapping for future use
-                            global_ord_to_tokid[head_int] = head_tokid
+                            # Update mappings for future use
+                            sent_ord_to_tokid[head_int] = head_tokid
                     
                     if head_tokid:
                         _set_attr(tok_node, "head", head_tokid)

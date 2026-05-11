@@ -59,6 +59,7 @@ _LANGUAGE_MAPPINGS: List[Tuple[str, str, str, str, List[str]]] = [
     ("ja", "jpn", "jpn", "Japanese", ["japanese", "日本語"]),
     ("ko", "kor", "kor", "Korean", ["korean", "한국어"]),
     ("la", "lat", "lat", "Latin", ["latin", "latina"]),
+    ("my", "mya", "mya", "Burmese", ["burmese", "myanmar"]),
     ("lv", "lav", "lav", "Latvian", ["latvian", "latviešu"]),
     ("nl", "nld", "nld", "Dutch", ["dutch", "nederlands"]),
     ("no", "nor", "nor", "Norwegian", ["norwegian", "norsk"]),

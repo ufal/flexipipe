@@ -570,26 +570,26 @@ def create_backend(
         except ImportError as e:
             # Handle missing module gracefully
             error_str = str(e)
-            
-            # Check if this is a detailed error message from ensure_extra_installed
-            # These messages are already user-friendly and complete, so pass them through
+            import sys
+
             if "requires optional dependency" in error_str or "Install it manually with" in error_str:
-                # This is a detailed error from ensure_extra_installed - pass it through directly
-                raise RuntimeError(error_str) from e
-            
-            # Check if this is a SpaCy language support error (E048)
-            # For training, let the backend handle it (it will use 'xx' fallback)
+                msg = error_str.strip()
+                if not msg.startswith("[flexipipe]"):
+                    msg = f"[flexipipe] {msg}"
+                print(msg, file=sys.stderr)
+                raise SystemExit(1) from None
+
             if training and ("E048" in error_str or ("Can't import language" in error_str and "spacy.lang" in error_str)):
-                # Re-raise to let the backend handle it (SpaCy backend will use 'xx' for training)
                 raise
             if "E048" in error_str or ("Can't import language" in error_str and "spacy.lang" in error_str):
-                # Extract language code from error if possible
                 language = factory_kwargs.get("language", "unknown")
-                raise RuntimeError(
-                    f"Backend '{backend_type}' does not support language '{language}'. "
-                    f"SpaCy only supports certain languages out of the box. "
-                    f"For training, unsupported languages will automatically use 'xx' (multilingual)."
-                ) from e
+                print(
+                    f"[flexipipe] Backend {backend_type!r} (SpaCy) has no language data for {language!r}. "
+                    f"SpaCy only bundles some languages; use a supported code, add a community model, "
+                    f"or try another backend (e.g. Stanza/UDPipe).",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1) from None
             # Try to extract module name from common error patterns
             module_name = "unknown"
             # Pattern 1: "No module named 'X'"
@@ -601,24 +601,35 @@ def create_backend(
                         module_name = quoted[1:].split("'")[0]
                         # Skip if it's a spacy.lang.* module (language support issue, not missing spacy)
                         if module_name.startswith("spacy.lang."):
-                            language = module_name.replace("spacy.lang.", "")
-                            # For training, let the backend handle it
+                            lang_code = module_name.replace("spacy.lang.", "")
                             if training:
                                 raise
-                            raise RuntimeError(
-                                f"Backend '{backend_type}' does not support language '{language}'. "
-                                f"SpaCy only supports certain languages out of the box. "
-                                f"For training, unsupported languages will automatically use 'xx' (multilingual)."
-                            ) from e
-            # If we couldn't extract a module name, use a generic message
+                            print(
+                                f"[flexipipe] Backend {backend_type!r} (SpaCy) has no installed language "
+                                f"module for {lang_code!r}. Install a matching model/pipeline or use another backend.\n"
+                                f"Install SpaCy extras: pip install spacy   or   pip install \"flexipipe[{backend_type}]\"",
+                                file=sys.stderr,
+                            )
+                            raise SystemExit(1) from None
+            # Missing top-level package (e.g. stanza, spacy): clean stderr + exit, no traceback
+
             if module_name == "unknown":
-                raise RuntimeError(
-                    f"Backend '{backend_type}' import error: {error_str}"
-                ) from e
-            raise RuntimeError(
-                f"Backend '{backend_type}' requires the '{module_name}' module, but it is not installed. "
-                f"Please install it with: pip install \"flexipipe[{backend_type}]\""
-            ) from e
+                print(
+                    f"[flexipipe] Backend {backend_type!r} could not load a required import:\n"
+                    f"  {error_str}\n"
+                    f"Install optional extras with: pip install \"flexipipe[{backend_type}]\"",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1) from None
+            print(
+                f"[flexipipe] Backend {backend_type!r} needs the Python package {module_name!r}, "
+                f"which is not installed in this environment.\n"
+                f"Install one of:\n"
+                f"  pip install {module_name}\n"
+                f"  pip install \"flexipipe[{backend_type}]\"",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
     
     if not info.backend_class:
         raise ValueError(f"Backend '{backend_type}' does not have a backend class registered")

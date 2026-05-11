@@ -10,6 +10,101 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
+_CLASSLA_UPSTREAM_RESOURCES_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _load_classla_upstream_resources_dict() -> Optional[Dict[str, Any]]:
+    """
+    Load official ClassLA resources.json (wheel-bundled or from clarinsi/classla-resources).
+    Used to repair user resources.json entries missing default_dependencies / default_processors.
+    """
+    global _CLASSLA_UPSTREAM_RESOURCES_CACHE
+    if _CLASSLA_UPSTREAM_RESOURCES_CACHE is not None:
+        return _CLASSLA_UPSTREAM_RESOURCES_CACHE
+    data: Optional[Dict[str, Any]] = None
+    try:
+        import glob
+
+        import classla
+
+        root = Path(classla.__file__).resolve().parent
+        for pattern in (
+            str(root / "resources" / "resources_*.json"),
+            str(root / "resources_*.json"),
+        ):
+            matches = sorted(glob.glob(pattern))
+            if matches:
+                with open(matches[0], encoding="utf-8") as f:
+                    data = json.load(f)
+                    break
+    except Exception:
+        data = None
+    if data is None:
+        try:
+            from classla._version import __resources_version__
+            import urllib.request
+
+            url = (
+                "https://raw.githubusercontent.com/clarinsi/classla-resources/main/"
+                f"resources_{__resources_version__}.json"
+            )
+            with urllib.request.urlopen(url, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            data = None
+    _CLASSLA_UPSTREAM_RESOURCES_CACHE = data
+    return data
+
+
+def _ensure_classla_resources_language_complete(
+    classla_dir: Path,
+    lang: str,
+    *,
+    verbose: bool = False,
+) -> None:
+    """
+    ClassLA Pipeline requires resources.json[lang] to contain 'default_dependencies' and
+    'default_processors' (classla.resources.common.add_dependencies). Entries produced only
+    by flexipipe training registration can omit these keys — merge from upstream official data.
+    """
+    resources_path = classla_dir / "resources.json"
+    if not resources_path.is_file():
+        return
+    try:
+        with resources_path.open("r", encoding="utf-8") as f:
+            resources = json.load(f)
+    except Exception:
+        return
+    if not isinstance(resources, dict) or lang not in resources:
+        return
+    entry = resources[lang]
+    if not isinstance(entry, dict) or "alias" in entry:
+        return
+    needed = ("default_dependencies", "default_processors")
+    if all(k in entry for k in needed):
+        return
+    upstream_all = _load_classla_upstream_resources_dict()
+    if not upstream_all or lang not in upstream_all:
+        return
+    official = upstream_all[lang]
+    if not isinstance(official, dict):
+        return
+    merged = dict(official)
+    merged.update(entry)
+    resources[lang] = merged
+    try:
+        with resources_path.open("w", encoding="utf-8") as f:
+            json.dump(resources, f, indent=2, ensure_ascii=False)
+        if verbose:
+            print(
+                f"[flexipipe] Merged official ClassLA metadata into resources.json for '{lang}' "
+                f"(added missing {', '.join(needed)}).",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 from ..backend_spec import BackendSpec
 from ..doc import Document, Entity, Sentence, Token
 from ..language_utils import (
@@ -1325,6 +1420,11 @@ class ClassLABackend(BackendManager):
                         if self._verbose:
                             print(f"[flexipipe] Found trained model at root level with normalized code '{iso_1}', using that")
         
+        if classla_dir and classla_dir.exists():
+            _ensure_classla_resources_language_complete(
+                classla_dir, lang_to_use, verbose=self._verbose
+            )
+
         config: Dict[str, Union[str, bool]] = {
             "lang": lang_to_use,
             "processors": self._processors,
@@ -1339,7 +1439,22 @@ class ClassLABackend(BackendManager):
             return self.classla.Pipeline(**config)
         except Exception as e:
             error_str = str(e)
-            
+
+            if isinstance(e, KeyError):
+                missing = e.args[0] if e.args else None
+                if missing in ("default_dependencies", "default_processors"):
+                    rf = (classla_dir / "resources.json") if classla_dir else None
+                    rf_note = f" ({rf})" if rf and rf.is_file() else ""
+                    raise RuntimeError(
+                        f"ClassLA model index is incomplete for language {lang_to_use!r}: "
+                        f"resources.json is missing the {missing!r} block{rf_note}. "
+                        f"That usually means the file was partially overwritten (e.g. by training) without "
+                        f"merging the official ClassLA language metadata. "
+                        f"Fix: run with --download-model, or in Python: "
+                        f"classla.download({lang_to_use!r}, type={self._type!r}), "
+                        f"or delete/rename resources.json in the ClassLA models directory and download again."
+                    ) from e
+
             # Check for "No processor to load" error first - this is a common error that should be handled gracefully
             is_no_processor_error = (
                 "No processor to load" in error_str or

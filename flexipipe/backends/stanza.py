@@ -17,6 +17,7 @@ from ..language_utils import (
     cache_entries_standardized,
     clean_language_name,
 )
+from ..language_mapping import normalize_language_code
 from ..model_registry import get_remote_models_for_backend
 from ..model_storage import (
     get_backend_models_dir,
@@ -334,10 +335,24 @@ class StanzaBackend(BackendManager):
             stanza_logger.propagate = False
         self._model_name = model_name
         base_language = language or (model_name.split("_")[0] if model_name and "_" in model_name else "en")
-        self._language = base_language.lower()
+        normalized_iso1, _, _ = normalize_language_code(base_language)
+        # Stanza expects its own language IDs (mostly ISO-639-1); normalize when possible.
+        self._language = (normalized_iso1 or base_language).lower()
+        entries = get_stanza_model_entries(use_cache=True, refresh_cache=False, verbose=False)
+        # Catalog-first selection: when user provided only --language, pick the
+        # preferred model for that language from the model registry.
+        if not self._model_name and not package:
+            language_models = [
+                model_id
+                for model_id, entry in entries.items()
+                if (entry.get(LANGUAGE_FIELD_ISO) or "").lower() == self._language
+            ]
+            if language_models:
+                preferred = [m for m in language_models if entries.get(m, {}).get("preferred")]
+                self._model_name = preferred[0] if preferred else sorted(language_models)[0]
         inferred_package = None
-        if model_name and "_" in model_name:
-            parts = model_name.split("_", 1)
+        if self._model_name and "_" in self._model_name:
+            parts = self._model_name.split("_", 1)
             if len(parts) > 1:
                 inferred_package = parts[1]
         self._package = (
@@ -348,30 +363,24 @@ class StanzaBackend(BackendManager):
         default_processors = ["tokenize", "pos", "lemma", "depparse", "ner"]
         # Derive processors from registry components when available to avoid requesting
         # processors (e.g., ner) that the package does not provide.
-        if processors is None and model_name:
-            try:
-                from .stanza import get_stanza_model_entries  # circular-safe import (self-file)
-            except Exception:
-                get_stanza_model_entries = None
-            if get_stanza_model_entries:
-                entries = get_stanza_model_entries(use_cache=True, refresh_cache=False, verbose=False)
-                entry = entries.get(model_name)
-                if entry:
-                    comp_map = {
-                        "tokenizer": "tokenize",
-                        "mwt": "mwt",
-                        "tagger": "pos",
-                        "lemmatizer": "lemma",
-                        "parser": "depparse",
-                        "ner": "ner",
-                        "sentiment": "sentiment",
-                        "constituency": "constituency",
-                        "coref": "coref",
-                    }
-                    components = entry.get("components") or []
-                    mapped = [comp_map[c] for c in components if c in comp_map]
-                    if mapped:
-                        default_processors = mapped
+        if processors is None and self._model_name:
+            entry = entries.get(self._model_name)
+            if entry:
+                comp_map = {
+                    "tokenizer": "tokenize",
+                    "mwt": "mwt",
+                    "tagger": "pos",
+                    "lemmatizer": "lemma",
+                    "parser": "depparse",
+                    "ner": "ner",
+                    "sentiment": "sentiment",
+                    "constituency": "constituency",
+                    "coref": "coref",
+                }
+                components = entry.get("components") or []
+                mapped = [comp_map[c] for c in components if c in comp_map]
+                if mapped:
+                    default_processors = mapped
         if enable_wsd:
             print("[flexipipe] Warning: Stanza WSD is not supported; ignoring --stanza-wsd.")
         extra_flags = {
@@ -393,6 +402,8 @@ class StanzaBackend(BackendManager):
         self._download_model = download_model
         self._verbose = verbose
         self._pipeline = None
+        self._pretokenized_pipeline = None
+        self._effective_processors = self._processors
 
     def _ensure_pipeline(self):
         if self._pipeline:
@@ -410,22 +421,59 @@ class StanzaBackend(BackendManager):
                 dir=str(self._resources_dir),
             )
 
+        def _set_effective_processors(proc_str: str):
+            self._effective_processors = proc_str
+
         try:
             self._pipeline = _build_pipeline(self._processors)
+            _set_effective_processors(self._processors)
         except Exception:
             if self._download_model:
-                self._download(
-                    self._language,
-                    package=self._package,
-                    processors=self._processors,
-                    resource_dir=str(self._resources_dir),
-                )
-                self._pipeline = _build_pipeline(self._processors)
+                # Stanza download API varies by version: some releases accept
+                # model_dir, older ones only rely on STANZA_RESOURCES_DIR env.
+                downloaded = False
+                download_exc: Exception | None = None
+                for kwargs in (
+                    {"model_dir": str(self._resources_dir)},
+                    {},
+                ):
+                    try:
+                        self._download(
+                            self._language,
+                            package=self._package,
+                            processors=self._processors,
+                            **kwargs,
+                        )
+                        downloaded = True
+                        break
+                    except TypeError as exc:
+                        download_exc = exc
+                        continue
+                if not downloaded and download_exc is not None:
+                    raise download_exc
+                try:
+                    self._pipeline = _build_pipeline(self._processors)
+                    _set_effective_processors(self._processors)
+                except Exception as exc:
+                    suggested_pkg = DEFAULT_STANZA_PACKAGES.get(self._language)
+                    if suggested_pkg and self._package != suggested_pkg:
+                        suggested_model = f"{self._language}_{suggested_pkg}"
+                        raise RuntimeError(
+                            f"[flexipipe] Stanza package '{self._package}' is unavailable for language "
+                            f"'{self._language}'. Try '--model {suggested_model}' or "
+                            f"'--language {self._language} --download-model'."
+                        ) from exc
+                    raise
             else:
                 # Retry once without processors that are missing (e.g., ner absent for some langs)
                 proc_list = [p.strip() for p in self._processors.split(",") if p.strip()]
                 filtered = []
                 for p in proc_list:
+                    # Keep tokenize if requested: Stanza still requires it in the
+                    # processor graph (even with pretokenized input).
+                    if p == "tokenize":
+                        filtered.append(p)
+                        continue
                     # If corresponding directory is missing, drop it
                     proc_dir = self._resources_dir / self._language / p
                     if proc_dir.exists():
@@ -437,6 +485,7 @@ class StanzaBackend(BackendManager):
                     try:
                         attempted_processors = ",".join(filtered)
                         self._pipeline = _build_pipeline(attempted_processors)
+                        _set_effective_processors(attempted_processors)
                     except Exception:
                         raise
                 else:
@@ -462,8 +511,33 @@ class StanzaBackend(BackendManager):
             stanza_doc = pipeline(text)
             result_doc = _stanza_doc_to_document(stanza_doc)
         else:
-            pretokenized = [[token.form for token in sentence.tokens] for sentence in document.sentences]
-            stanza_doc = pipeline(pretokenized=pretokenized)
+            # Stanza pretokenized mode cannot handle empty token surfaces and can
+            # abort sentence processing (observed with zero-length XML tokens).
+            # Use "_" as a neutral placeholder to keep token counts stable.
+            pretokenized = [
+                [
+                    (token.form if token.form and token.form.strip() else "_")
+                    for token in sentence.tokens
+                ]
+                for sentence in document.sentences
+            ]
+            pretokenized_pipeline = self._pretokenized_pipeline
+            if pretokenized_pipeline is None:
+                # Stanza versions differ in how pretokenized input is passed. Build a dedicated
+                # pipeline configured for pretokenized tokenization and then try call variants.
+                pretokenized_pipeline = self._Pipeline(
+                    lang=self._language,
+                    package=self._package,
+                    processors=self._effective_processors,
+                    use_gpu=self._use_gpu,
+                    tokenize_pretokenized=True,
+                    dir=str(self._resources_dir),
+                )
+                self._pretokenized_pipeline = pretokenized_pipeline
+            try:
+                stanza_doc = pretokenized_pipeline(pretokenized)
+            except TypeError:
+                stanza_doc = pretokenized_pipeline(pretokenized=pretokenized)
             result_doc = _stanza_doc_to_document(stanza_doc, original_doc=document)
 
         elapsed = time.time() - start_time
@@ -533,6 +607,19 @@ def _stanza_doc_to_document(stanza_doc, original_doc: Optional[Document] = None)
         if sentence.tokens:
             sentence.tokens[-1].space_after = None
         doc.sentences.append(sentence)
+
+    # Preserve source sentence IDs when processing pretokenized input.
+    # Many Stanza models either omit sent_id or emit numeric IDs, which breaks
+    # TEITOK writeback matching that relies on stable XML sentence IDs.
+    if (
+        original_doc
+        and len(doc.sentences) == len(original_doc.sentences)
+    ):
+        for out_sent, src_sent in zip(doc.sentences, original_doc.sentences):
+            src_id = src_sent.sent_id or src_sent.id or ""
+            if src_id:
+                out_sent.id = src_id
+                out_sent.sent_id = src_id
 
     return doc
 

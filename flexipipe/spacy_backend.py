@@ -1095,6 +1095,8 @@ class SpacyBackend(BackendManager):
             components: Optional list of pipeline components to run (e.g., ["parser"] for parsing only)
         """
         import time
+
+        from flexipipe.doc_utils import get_effective_form
         
         start_time = time.time()
         
@@ -1170,7 +1172,10 @@ class SpacyBackend(BackendManager):
                 has_tokids = any(
                     tok.tokid for sent in document.sentences for tok in sent.tokens
                 ) or any(
-                    sub.tokid for sent in document.sentences for tok in sent.tokens if tok.is_mwt
+                    sub.tokid
+                    for sent in document.sentences
+                    for tok in sent.tokens
+                    if tok.is_mwt and tok.subtokens
                     for sub in tok.subtokens
                 )
                 
@@ -1184,12 +1189,13 @@ class SpacyBackend(BackendManager):
                     words = []
                     spaces = []
                     expanded_tokens = []  # Track which original tokens/subtokens map to which SpaCy tokens
-                    from ..doc_utils import get_effective_form
                     for tok in sent.tokens:
                         if tok.is_mwt and tok.subtokens:
                             # Expand MWT into subtokens
                             for sub_idx, sub in enumerate(tok.subtokens):
-                                words.append(get_effective_form(sub))
+                                sub_form = get_effective_form(sub)
+                                # spaCy Doc rejects empty-string tokens (E031).
+                                words.append(sub_form if sub_form and sub_form.strip() else "_")
                                 # Space after: only on the last subtoken of the MWT
                                 has_space = (sub_idx == len(tok.subtokens) - 1) and (
                                     tok.space_after is not False and (tok.space_after or tok.space_after is None)
@@ -1198,7 +1204,9 @@ class SpacyBackend(BackendManager):
                                 expanded_tokens.append(tok)  # Map back to parent MWT token
                         else:
                             # Regular token
-                            words.append(get_effective_form(tok))
+                            tok_form = get_effective_form(tok)
+                            # spaCy Doc rejects empty-string tokens (E031).
+                            words.append(tok_form if tok_form and tok_form.strip() else "_")
                             has_space = tok.space_after is not False and (tok.space_after or tok.space_after is None)
                             spaces.append(has_space)
                             expanded_tokens.append(tok)

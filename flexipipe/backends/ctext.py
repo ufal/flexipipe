@@ -911,11 +911,33 @@ class CTexTBackend(BackendManager):
         # CTexT POS/UPOS includes tokenization, so we can use it directly
         # For full pipeline, we combine multiple technologies: UPOS + lemma + NER
         techs_to_use = []
+        available_techs: Dict[str, List[str]] = {}
         if self._ctext_tech == "full" or self._ctext_tech is None:
             # Full pipeline: try to combine UPOS + lemma + NER
             # Get available technologies using list_available_techs()
             try:
-                available_techs = self._core.list_available_techs()
+                # Some CTExT Java builds on macOS emit noisy OCR warnings to stdout/stderr
+                # even for non-OCR paths; suppress that probe output.
+                import io
+                import os
+                import contextlib
+
+                devnull_fd_probe = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    original_stderr_probe = os.dup(2)
+                    original_stdout_probe = os.dup(1)
+                    try:
+                        os.dup2(devnull_fd_probe, 2)
+                        os.dup2(devnull_fd_probe, 1)
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            available_techs = self._core.list_available_techs()
+                    finally:
+                        os.dup2(original_stderr_probe, 2)
+                        os.dup2(original_stdout_probe, 1)
+                        os.close(original_stderr_probe)
+                        os.close(original_stdout_probe)
+                finally:
+                    os.close(devnull_fd_probe)
             except Exception:
                 available_techs = {}
             
@@ -923,8 +945,11 @@ class CTexTBackend(BackendManager):
             # UPOS gives universal POS tags, POS gives language-specific tags (xpos)
             upos_langs = available_techs.get("upos", [])
             pos_langs = available_techs.get("pos", [])
-            upos_available = self._ctext_language in upos_langs or (upos_langs == [] and "upos" in available_techs)
-            pos_available = self._ctext_language in pos_langs or (pos_langs == [] and "pos" in available_techs)
+            # If CTExT reports an empty list for a tech, that means models are not installed
+            # for any languages (at least for the language listing API), so we should not
+            # treat it as "available".
+            upos_available = self._ctext_language in upos_langs
+            pos_available = self._ctext_language in pos_langs
             
             if upos_available:
                 techs_to_use.append("upos")
@@ -933,19 +958,90 @@ class CTexTBackend(BackendManager):
             
             # If neither is available, try UPOS as fallback (will fail gracefully if not available)
             if not techs_to_use:
-                techs_to_use.append("upos")
+                # Keep empty; we'll raise a better error below.
+                pass
             
             # Add lemma if available
             lemma_langs = available_techs.get("lemma", [])
-            if self._ctext_language in lemma_langs or (lemma_langs == [] and "lemma" in available_techs):
+            if self._ctext_language in lemma_langs:
                 techs_to_use.append("lemma")
             
             # Add NER if available
             ner_langs = available_techs.get("ner", [])
-            if self._ctext_language in ner_langs or (ner_langs == [] and "ner" in available_techs):
+            if self._ctext_language in ner_langs:
                 techs_to_use.append("ner")
         else:
             techs_to_use = [self._ctext_tech]
+
+        # If full pipeline was requested but nothing is available yet, try to
+        # proactively download candidate full-pipeline technologies when
+        # flexipipe was started with --download-model.
+        if (self._ctext_tech == "full" or self._ctext_tech is None) and not techs_to_use:
+            auto_download_requested = bool(getattr(self, "_download_model", False))
+            if auto_download_requested:
+                download_func = getattr(self._core, "download_model", None)
+                if download_func is not None:
+                    for tech in ["upos", "pos", "lemma", "ner"]:
+                        try:
+                            try:
+                                download_func(self._ctext_language, tech)
+                            except TypeError:
+                                download_func(language=self._ctext_language, tech=tech)
+                        except Exception:
+                            # Continue; we'll re-check availability and raise a clear error if needed.
+                            continue
+                try:
+                    refreshed = self._core.list_available_techs() or {}
+                    available_techs = refreshed
+                except Exception:
+                    refreshed = {}
+
+                upos_langs = available_techs.get("upos", [])
+                pos_langs = available_techs.get("pos", [])
+                if self._ctext_language in upos_langs:
+                    techs_to_use.append("upos")
+                if self._ctext_language in pos_langs:
+                    techs_to_use.append("pos")
+                lemma_langs = available_techs.get("lemma", [])
+                if self._ctext_language in lemma_langs:
+                    techs_to_use.append("lemma")
+                ner_langs = available_techs.get("ner", [])
+                if self._ctext_language in ner_langs:
+                    techs_to_use.append("ner")
+        
+        if (self._ctext_tech == "full" or self._ctext_tech is None) and not techs_to_use:
+            # Provide a clear offline error instead of attempting process_text and
+            # getting empty results.
+            summary_keys = ["tok", "sent", "upos", "pos", "lemma", "ner"]
+            available_summary = {k: (k in available_techs and available_techs.get(k)) for k in summary_keys}
+            supports_tok = self._ctext_language in (available_techs.get("tok") or [])
+            supports_sent = self._ctext_language in (available_techs.get("sent") or [])
+            fallback_hint = ""
+            if supports_tok or supports_sent:
+                fallback_parts = []
+                if supports_tok:
+                    fallback_parts.append(f"--model {self._ctext_language}_tok")
+                if supports_sent:
+                    fallback_parts.append(f"--model {self._ctext_language}_sent")
+                fallback_hint = (
+                    f" Available for '{self._ctext_language}': "
+                    f"{', '.join([p.split()[-1] for p in fallback_parts])}. "
+                    f"Use one of: {' or '.join(fallback_parts)}"
+                )
+            # Which of these include our language:
+            available_for_lang = {
+                k: True
+                for k in summary_keys
+                if isinstance(available_techs.get(k), list) and self._ctext_language in available_techs.get(k, [])
+            }
+            raise RuntimeError(
+                f"CTExT models are not installed for language '{self._ctext_language}'. "
+                f"CTExT reports availability: {available_summary}. "
+                f"Requested CTExT full pipeline techs (upos/pos/lemma/ner) are unavailable. "
+                f"Use flexipipe's --download-model flag (passed through to CTExT) "
+                f"with network access to attempt installing full models."
+                f"{fallback_hint}"
+            )
         
         # Respect flexipipe's download_model directive before calling CTexT.
         # When download_model is enabled, try to trigger a non-interactive download
@@ -1025,6 +1121,8 @@ class CTexTBackend(BackendManager):
                     
                     # Helper function to call a single technology
                     # This needs to handle download prompts
+                    tech_fail_reasons: Dict[str, str] = {}
+                    techs_returned_empty: List[str] = []
                     def call_tech(tech_name: str, allow_prompt: bool = True) -> Optional[List[Dict[str, Any]]]:
                         """Call a single CTexT technology and return its result.
                         
@@ -1094,6 +1192,7 @@ class CTexTBackend(BackendManager):
                                         output_format="json",
                                     )
                                 except Exception as e:
+                                    tech_fail_reasons[tech_name] = str(e)
                                     # If it fails because we answered "N", that's expected - skip this technology
                                     error_str = str(e).lower()
                                     if "not installed" in error_str or "download" in error_str or "not available" in error_str:
@@ -1121,8 +1220,17 @@ class CTexTBackend(BackendManager):
                                     output_format="json",
                                 )
                         except Exception as e:
+                            tech_fail_reasons[tech_name] = str(e)
                             # If technology is not available, return None
                             error_str = str(e).lower()
+                            # CTExT may emit this on macOS even for non-OCR workflows.
+                            # Treat it as non-fatal unless it actually prevents all techs.
+                            if "ocr for mac is not currently supported" in error_str:
+                                if self._verbose:
+                                    logging.info(
+                                        "CTExT reported macOS OCR unsupported; continuing without OCR."
+                                    )
+                                return None
                             # Check if it's a download-related error
                             if "not installed" in error_str or "download" in error_str:
                                 if not allow_prompt:
@@ -1154,46 +1262,52 @@ class CTexTBackend(BackendManager):
                         # No need to redirect again here
                         with contextlib.redirect_stderr(io.StringIO()):
                             # Call all technologies and collect results
-                            # When auto_download is True, all technologies should auto-download
-                            # When auto_download is False, only essential technologies (upos, pos) should prompt
+                            # When auto_download is True, all technologies should auto-download.
+                            # When auto_download is False, stay non-interactive to avoid hidden prompts
+                            # from ctextcore (its prompt text can be suppressed by our stdout redirection).
                             essential_techs = ["upos", "pos"]
                             results_by_tech = {}
                             for tech in techs_to_use:
-                                # When auto_download is True, allow all technologies to download
-                                # When auto_download is False, only essential technologies can prompt
-                                allow_prompt = auto_download or (tech in essential_techs)
+                                # Prompts are only safe when auto-download is explicitly enabled.
+                                # Otherwise, answer "N" automatically for missing models.
+                                allow_prompt = auto_download
                                 tech_result = call_tech(tech, allow_prompt=allow_prompt)
                                 if tech_result:
                                     results_by_tech[tech] = tech_result
+                                else:
+                                    techs_returned_empty.append(tech)
                             
                             # Track which technologies were actually used successfully
-                            if results_by_tech:
-                                self._actual_techs_used = list(results_by_tech.keys())
-                                
-                                # Merge results if we have multiple technologies
-                                if len(results_by_tech) > 1:
-                                    result = _merge_ctext_results(results_by_tech)
-                                elif len(results_by_tech) == 1:
-                                    result = list(results_by_tech.values())[0]
-                                else:
-                                    # No technologies succeeded - try fallback
-                                    if "upos" in techs_to_use:
-                                        tech_result = call_tech("pos", allow_prompt=True)
-                                        if tech_result:
-                                            result = tech_result
-                                        else:
-                                            raise RuntimeError(
-                                                "No CTExT technologies available. "
-                                                "Use --download-model to auto-download missing models."
-                                            )
+                            if not results_by_tech:
+                                # No technologies succeeded - try fallback
+                                if "upos" in techs_to_use:
+                                    tech_result = call_tech("pos", allow_prompt=auto_download)
+                                    if tech_result:
+                                        result = tech_result
                                     else:
                                         raise RuntimeError(
                                             "No CTExT technologies available. "
-                                            "Use --download-model to auto-download missing models."
+                                            "Use --download-model to auto-download missing models. "
+                                            f"Attempted: {techs_to_use}; Empty results: {techs_returned_empty}; "
+                                            f"Reasons: {tech_fail_reasons}"
                                         )
+                                else:
+                                    raise RuntimeError(
+                                        "No CTExT technologies available. "
+                                        "Use --download-model to auto-download missing models. "
+                                        f"Attempted: {techs_to_use}; Empty results: {techs_returned_empty}; "
+                                        f"Reasons: {tech_fail_reasons}"
+                                    )
+                            else:
+                                self._actual_techs_used = list(results_by_tech.keys())
+                                # Merge results if we have multiple technologies
+                                if len(results_by_tech) > 1:
+                                    result = _merge_ctext_results(results_by_tech)
+                                else:
+                                    result = list(results_by_tech.values())[0]
                         # stdout is already redirected at outer level, no need to restore here
                     else:
-                        # Normal processing - allow interactive prompt for essential technologies only
+                        # Normal processing in non-auto-download mode: do not allow interactive prompts.
                         # stdout is already redirected to suppress Java errors
                         # For non-essential technologies (lemma, ner), suppress prompts
                         essential_techs = ["upos", "pos"]
@@ -1202,8 +1316,8 @@ class CTexTBackend(BackendManager):
                                 # Call all technologies and collect results
                                 results_by_tech = {}
                                 for tech in techs_to_use:
-                                    # Allow prompts only for essential technologies
-                                    allow_prompt = tech in essential_techs
+                                    # Keep CTexT non-interactive unless --download-model was requested.
+                                    allow_prompt = False
                                     
                                     # stdout is already redirected to devnull to suppress Java errors
                                     # call_tech will handle stdout redirection internally if needed
@@ -1211,35 +1325,40 @@ class CTexTBackend(BackendManager):
                                         tech_result = call_tech(tech, allow_prompt=allow_prompt)
                                         if tech_result:
                                             results_by_tech[tech] = tech_result
+                                        else:
+                                            techs_returned_empty.append(tech)
                                     finally:
                                         # Ensure stdout stays redirected (it should already be)
                                         pass
                                 
                                 # Track which technologies were actually used successfully
-                                if results_by_tech:
-                                    self._actual_techs_used = list(results_by_tech.keys())
-                                
-                                # Merge results if we have multiple technologies
-                                if len(results_by_tech) > 1:
-                                    result = _merge_ctext_results(results_by_tech)
-                                elif len(results_by_tech) == 1:
-                                    result = list(results_by_tech.values())[0]
-                                else:
+                                if not results_by_tech:
                                     # No technologies succeeded - try fallback
                                     if "upos" in techs_to_use:
-                                        tech_result = call_tech("pos", allow_prompt=True)
+                                        tech_result = call_tech("pos", allow_prompt=False)
                                         if tech_result:
                                             result = tech_result
                                         else:
                                             raise RuntimeError(
-                                                "No CTexT technologies available. "
-                                                "Use --download-model to auto-download missing models."
+                                                "No CTExT technologies available. "
+                                                "Use --download-model to auto-download missing models. "
+                                                f"Attempted: {techs_to_use}; Empty results: {techs_returned_empty}; "
+                                                f"Reasons: {tech_fail_reasons}"
                                             )
                                     else:
                                         raise RuntimeError(
-                                            "No CTexT technologies available. "
-                                            "Use --download-model to auto-download missing models."
+                                            "No CTExT technologies available. "
+                                            "Use --download-model to auto-download missing models. "
+                                            f"Attempted: {techs_to_use}; Empty results: {techs_returned_empty}; "
+                                            f"Reasons: {tech_fail_reasons}"
                                         )
+                                else:
+                                    self._actual_techs_used = list(results_by_tech.keys())
+                                    # Merge results if we have multiple technologies
+                                    if len(results_by_tech) > 1:
+                                        result = _merge_ctext_results(results_by_tech)
+                                    else:
+                                        result = list(results_by_tech.values())[0]
                         finally:
                             # stdout is already redirected, no need to restore here
                             pass

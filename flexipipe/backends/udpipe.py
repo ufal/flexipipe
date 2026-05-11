@@ -408,43 +408,66 @@ class UDPipeRESTBackend(BackendManager):
         # Reference: curl -F "data=# sent_id = 1..." -F model=english -F tokenizer= -F tagger= -F parser= ...
         # The data should be sent as a regular form field, not as a file upload
         if input_format == "conllu":
+            if self._log:
+                print("[flexipipe] --- UDPipe request CoNLL-U (full) ---", file=sys.stderr)
+                print(data, file=sys.stderr)
+                print("[flexipipe] --- end UDPipe request CoNLL-U ---", file=sys.stderr)
             # Build form data payload
-            form_data = {}
-            form_data["input"] = "conllu"
-            form_data["data"] = data  # Send as regular form field, not file upload
-            # Don't set tokenizer - it should not be set for CoNLL-U input
-            form_data["tagger"] = ""
-            form_data["parser"] = ""
-            
+            form_data_base: dict[str, str] = {"input": "conllu", "data": data}
+
             # Allow extra_params to override defaults, but don't let it add tokenizer
-            # (tokenizer should not be set for CoNLL-U input)
+            # (tokenizer should not be set for CoNLL-U input).
             extra_params = dict(self._extra_params) if self._extra_params else {}
-            extra_params.pop("tokenizer", None)  # Remove tokenizer if present
-            form_data.update(extra_params)
+            extra_params.pop("tokenizer", None)
+            form_data_base.update(extra_params)
             # Model is required for CoNLL-U input
             # UDPipe REST API accepts both model names and language codes
             if self._model:
-                form_data["model"] = self._model
+                form_data_base["model"] = self._model
             else:
                 # If no model is set, we need a model or language
                 raise ValueError(
                     "UDPipe REST API requires a model name or language code for CoNLL-U input. "
                     f"Model is currently '{self._model}'. Please specify a model or language."
                 )
-            
-            # Debug logging - always log on error, or if _log is enabled
-            import sys
-            should_log = self._log
-            if not should_log:
-                # Store original data for potential logging on error
-                _original_data = data
-            
-            response = self._session.post(
-                self._endpoint,
-                data=form_data,
-                headers=self._headers,
-                timeout=self._timeout,
-            )
+
+            # Endpoint compatibility matrix: some UDPipe deployments behave differently
+            # for empty analysis flags on CoNLL-U input. Prefer explicit tagger/parser
+            # first (ensures tagging/parsing is actually executed), then retry with a
+            # minimal payload if the endpoint rejects it.
+            conllu_payloads: list[dict[str, str]] = [
+                {**form_data_base, "tagger": "", "parser": ""},
+                dict(form_data_base),
+            ]
+
+            response = None
+            form_data = None
+            for idx, candidate in enumerate(conllu_payloads):
+                form_data = candidate
+                try:
+                    response = self._session.post(
+                        self._endpoint,
+                        data=form_data,
+                        headers=self._headers,
+                        timeout=self._timeout,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    model_label = self._model or "<unspecified>"
+                    raise RuntimeError(
+                        f"[flexipipe] UDPipe request failed ({type(exc).__name__}) while processing CoNLL-U "
+                        f"with model '{model_label}' at {self._endpoint}. "
+                        f"Check network connectivity/service availability or increase UDPipe timeout "
+                        f"(current: {self._timeout}s). Original error: {exc}"
+                    ) from exc
+                if response.status_code == 200:
+                    break
+                if response.status_code != 400:
+                    break
+                if self._log and idx < len(conllu_payloads) - 1:
+                    print(
+                        f"[flexipipe] UDPipe conllu attempt {idx + 1} returned 400; retrying with compatibility payload.",
+                        file=sys.stderr,
+                    )
         else:
             # For raw text, use regular form data
             payload = {"tagger": "", "parser": "", "data": data}
@@ -456,24 +479,38 @@ class UDPipeRESTBackend(BackendManager):
             if self._model:
                 payload["model"] = self._model
             
-            response = self._session.post(
-                self._endpoint,
-                data=payload,
-                headers=self._headers,
-                timeout=self._timeout,
-            )
+            try:
+                response = self._session.post(
+                    self._endpoint,
+                    data=payload,
+                    headers=self._headers,
+                    timeout=self._timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                model_label = self._model or "<unspecified>"
+                raise RuntimeError(
+                    f"[flexipipe] UDPipe request failed ({type(exc).__name__}) while processing raw text "
+                    f"with model '{model_label}' at {self._endpoint}. "
+                    f"Check network connectivity/service availability or increase UDPipe timeout "
+                    f"(current: {self._timeout}s). Original error: {exc}"
+                ) from exc
         
         if response.status_code != 200:
             # Log error details for debugging
-            import sys
             error_msg = response.text[:500] if response.text else "No error message"
             print(f"[flexipipe] UDPipe REST API error {response.status_code}: {error_msg}", file=sys.stderr)
             # If CoNLL-U input, also log the request details
             if input_format == "conllu":
                 print(f"[flexipipe] UDPipe request details: input=conllu, model={self._model}, data_length={len(data)}", file=sys.stderr)
                 print(f"[flexipipe] UDPipe form_data keys: {list(form_data.keys()) if 'form_data' in locals() else 'N/A'}", file=sys.stderr)
-                # Log first 500 chars of CoNLL-U data for debugging
-                print(f"[flexipipe] CoNLL-U data (first 500 chars):\n{data[:500]}", file=sys.stderr)
+                if self._log:
+                    print("[flexipipe] --- UDPipe request CoNLL-U (full, error path) ---", file=sys.stderr)
+                    print(data, file=sys.stderr)
+                    print("[flexipipe] --- end UDPipe request CoNLL-U ---", file=sys.stderr)
+                    if response.text:
+                        print("[flexipipe] --- UDPipe raw error response body (full) ---", file=sys.stderr)
+                        print(response.text, file=sys.stderr)
+                        print("[flexipipe] --- end UDPipe raw error response body ---", file=sys.stderr)
                 # Also check if data is valid UTF-8
                 try:
                     data.encode('utf-8')
@@ -484,13 +521,32 @@ class UDPipeRESTBackend(BackendManager):
                     print(f"[flexipipe] WARNING: CoNLL-U data contains null bytes", file=sys.stderr)
                 # Log the actual form_data being sent
                 print(f"[flexipipe] Form data types: {[(k, type(v).__name__) for k, v in form_data.items()]}", file=sys.stderr)
-                # Save full CoNLL-U to file for debugging
-                try:
-                    with open('/tmp/flexipipe_udpipe_debug.conllu', 'w', encoding='utf-8') as f:
-                        f.write(data)
-                    print(f"[flexipipe] Saved full CoNLL-U to /tmp/flexipipe_udpipe_debug.conllu for debugging", file=sys.stderr)
-                except Exception as e:
-                    print(f"[flexipipe] Could not save debug file: {e}", file=sys.stderr)
+                # In non-debug mode, persist error artifacts for inspection.
+                if not self._log:
+                    try:
+                        req_err_path = Path("/tmp/flexipipe_udpipe_error_request.conllu")
+                        req_err_path.write_text(data, encoding="utf-8")
+                        print(f"[flexipipe] Saved UDPipe error request to {req_err_path}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[flexipipe] Could not save UDPipe error request: {e}", file=sys.stderr)
+                    try:
+                        resp_err_path = Path("/tmp/flexipipe_udpipe_error_response.txt")
+                        resp_err_path.write_text(response.text or "", encoding="utf-8")
+                        print(f"[flexipipe] Saved UDPipe error response to {resp_err_path}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[flexipipe] Could not save UDPipe error response: {e}", file=sys.stderr)
+        elif self._log:
+            # In debug mode, print full backend response inline.
+            try:
+                result_text = response.json().get("result", "")
+                print("[flexipipe] --- UDPipe response CoNLL-U (full) ---", file=sys.stderr)
+                print(result_text, file=sys.stderr)
+                print("[flexipipe] --- end UDPipe response CoNLL-U ---", file=sys.stderr)
+            except Exception as exc:
+                print(
+                    f"[flexipipe] Could not print UDPipe response dump: {exc}",
+                    file=sys.stderr,
+                )
         response.raise_for_status()
         return response.json()
 
@@ -505,18 +561,15 @@ class UDPipeRESTBackend(BackendManager):
     ) -> NeuralResult:
         del overrides, preserve_pos_tags, components
         
-        # Default behavior: use raw_text mode for NLP processing, even if document has tokens
-        # This allows the NLP model to do its own tokenization, which is usually better
-        # Results will be mapped back to the original pretokenized Doc via parse_conllu_from_backend
-        # Only use pretokenized mode if explicitly forced (via document.meta["_force_pretokenized"])
-        has_sentence_text = any(sent.text for sent in document.sentences)
+        # Respect caller-selected mode first.
+        # The CLI decides whether we should preserve existing tokenization (CoNLL-U input)
+        # or allow retokenization (plain-text input). We only auto-fallback to raw text
+        # when pretokenized mode was requested but there are no tokens to serialize.
         force_pretokenized = document.meta.get("_force_pretokenized", False)
-        
-        # Use raw_text if:
-        # 1. use_raw_text is explicitly True, OR
-        # 2. We have sentence text and not forced to use pretokenized
-        # This ensures we use raw_text by default, which is better for NLP models
-        should_use_raw_text = use_raw_text or (has_sentence_text and not force_pretokenized)
+        has_tokens = any(sent.tokens for sent in document.sentences)
+        should_use_raw_text = bool(use_raw_text)
+        if not should_use_raw_text and not force_pretokenized and not has_tokens:
+            should_use_raw_text = True
         
         if should_use_raw_text:
             # Raw text mode: extract text from sentences and send as plain text
@@ -616,7 +669,28 @@ class UDPipeRESTBackend(BackendManager):
         # Parse the CoNLL-U result and return the tagged document
         # When using CoNLL-U input, TokIds should be preserved in MISC column
         # Use helper function that preserves flags from source document
-        tagged_doc = parse_conllu_from_backend(result_text, document)
+        if should_use_raw_text:
+            tagged_doc = parse_conllu_from_backend(result_text, document)
+        else:
+            # In pretokenized mode, preserve incoming tokenization exactly.
+            # Disable contraction/implicit MWT reconstruction while parsing
+            # backend output, otherwise strict writeback alignment can fail
+            # even when token-level mapping succeeds.
+            prev_disable_contraction_merge = document.meta.get("_disable_contraction_merge")
+            prev_create_implicit_mwt = document.meta.get("_create_implicit_mwt")
+            document.meta["_disable_contraction_merge"] = True
+            document.meta["_create_implicit_mwt"] = False
+            try:
+                tagged_doc = parse_conllu_from_backend(result_text, document)
+            finally:
+                if prev_disable_contraction_merge is None:
+                    document.meta.pop("_disable_contraction_merge", None)
+                else:
+                    document.meta["_disable_contraction_merge"] = prev_disable_contraction_merge
+                if prev_create_implicit_mwt is None:
+                    document.meta.pop("_create_implicit_mwt", None)
+                else:
+                    document.meta["_create_implicit_mwt"] = prev_create_implicit_mwt
         
         return NeuralResult(document=tagged_doc, stats={})
 

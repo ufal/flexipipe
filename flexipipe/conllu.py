@@ -540,7 +540,7 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
             continue
         seen_any_token = True
         tid = cols[0]
-        form = cols[1]
+        form = _unescape_form_column(cols[1])
         lemma = cols[2] if cols[2] != "_" else ""
         upos = cols[3] if cols[3] != "_" else ""
         xpos = cols[4] if cols[4] != "_" else ""
@@ -1145,7 +1145,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
             end_id = current_id + len(token.subtokens) - 1
             # Always use token.form for output (not get_effective_form)
             # get_effective_form is only for NLP processing, not for output
-            form = _escape(token.form)
+            form = _escape_form_column(token.form)
             # For MWT range, include TokId if requested (for UDPipe preservation)
             misc_range = _format_misc_for_range(space_after_range, token=token, include_tokid=include_tokid)
             # MWT range line
@@ -1240,7 +1240,7 @@ def _format_token_line(
         form_to_use = token.form
     
     return (
-        f"{token_id}\t{_escape(form_to_use)}\t{_escape(getattr(token, 'lemma', ''))}\t"
+        f"{token_id}\t{_escape_form_column(form_to_use)}\t{_escape(getattr(token, 'lemma', ''))}\t"
         f"{_escape(getattr(token, 'upos', ''))}\t{_escape(getattr(token, 'xpos', ''))}\t"
         f"{_escape(getattr(token, 'feats', ''))}\t{head_value}\t{_escape(deprel)}\t{_escape(deps)}\t{misc}"
     )
@@ -1314,7 +1314,9 @@ def _format_misc(
         is_auto_generated = bool(re.match(r'^s\d+-t\d+$', tokid))
         # Include if explicitly requested, or if it's not auto-generated (came from input)
         if include_tokid or not is_auto_generated:
-            entries.append(f"TokId={tokid}")
+            if "TokId" not in seen_keys:
+                seen_keys.add("TokId")
+                entries.append(f"TokId={tokid}")
     
     # Add custom attributes from attrs dictionary
     if custom_misc_attrs:
@@ -1397,6 +1399,34 @@ def _reconstruct_sentence_text(tokens: Iterable[Token]) -> str:
         if token.space_after:
             parts.append(" ")
     return "".join(parts).strip()
+
+
+# CoNLL-U uses "_" as the universal empty placeholder in non-FORM columns; in FORM,
+# "_" is also used for an empty field. Our _escape("") returns "_" — the same string as
+# a literal one-character underscore surface form "_". UDPipe (and other tools) then
+# cannot distinguish "missing form" from "token is the underscore character".
+# Encode a true ASCII "_" surface as backslash-underscore on the wire (field value \_,
+# two characters), which stays distinct from empty "_" and from a real U+FF3F character.
+_CONLLU_FORM_LITERAL_USCORE_ESCAPED = "\\_"  # backslash + underscore (not empty placeholder)
+
+
+def _escape_form_column(value: str) -> str:
+    """Escape FORM column only: disambiguate empty vs literal ASCII underscore."""
+    if not value:
+        return "_"
+    if value == "_":
+        return _CONLLU_FORM_LITERAL_USCORE_ESCAPED
+    return value
+
+
+def _unescape_form_column(value: str) -> str:
+    """Inverse of _escape_form_column when parsing CoNLL-U."""
+    if value == _CONLLU_FORM_LITERAL_USCORE_ESCAPED:
+        return "_"
+    # Older flexipipe builds used U+FF3F as sentinel; keep read-compat only.
+    if value == "\uff3f":
+        return "_"
+    return value
 
 
 def _escape(value: str) -> str:

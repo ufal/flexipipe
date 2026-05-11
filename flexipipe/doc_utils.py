@@ -174,9 +174,12 @@ def get_effective_form(token: Token | SubToken, *, use_reg_for_nlp: Optional[boo
         use_reg_for_nlp = get_use_reg_for_nlp()
     
     if use_reg_for_nlp:
-        reg = getattr(token, "reg", "") or token.attrs.get("reg", "")
-        if reg and reg != "_" and reg != "":
+        reg = getattr(token, "reg", "") or ""
+        attrs = getattr(token, "attrs", None)
+        if isinstance(attrs, dict):
+            reg = reg or (attrs.get("reg", "") or "")
+        if reg and reg != "_":
             return reg
     
-    return token.form or ""
+    return getattr(token, "form", "") or ""
 

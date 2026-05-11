@@ -159,11 +159,43 @@ def _propagate_token_ids(target: Document, source: Document) -> None:
     """
     if not source.sentences or not target.sentences:
         return
-    if len(target.sentences) != len(source.sentences):
-        return
-    
     propagated_count = 0
-    for tgt_sent, src_sent in zip(target.sentences, source.sentences):
+
+    def _sent_key(sent) -> str:
+        return (
+            (sent.sent_id or "").strip()
+            or getattr(sent, "source_id", "").strip()
+            or (sent.id or "").strip()
+        )
+
+    source_by_key: dict[str, Any] = {}
+    for src_sent in source.sentences:
+        key = _sent_key(src_sent)
+        if key and key not in source_by_key:
+            source_by_key[key] = src_sent
+
+    aligned_pairs: list[tuple[Any, Any]] = []
+    used_source_indices: set[int] = set()
+
+    # Prefer key-based alignment to avoid cross-sentence tokid propagation.
+    for tgt_sent in target.sentences:
+        key = _sent_key(tgt_sent)
+        src_sent = source_by_key.get(key) if key else None
+        if src_sent is not None:
+            aligned_pairs.append((tgt_sent, src_sent))
+            try:
+                used_source_indices.add(source.sentences.index(src_sent))
+            except ValueError:
+                pass
+
+    # Fallback positional alignment for sentences without reliable IDs.
+    if len(aligned_pairs) < len(target.sentences):
+        remaining_targets = [s for s in target.sentences if all(s is not t for t, _ in aligned_pairs)]
+        remaining_sources = [s for i, s in enumerate(source.sentences) if i not in used_source_indices]
+        for tgt_sent, src_sent in zip(remaining_targets, remaining_sources):
+            aligned_pairs.append((tgt_sent, src_sent))
+
+    for tgt_sent, src_sent in aligned_pairs:
         if not src_sent.tokens or not tgt_sent.tokens:
             continue
         
@@ -174,22 +206,23 @@ def _propagate_token_ids(target: Document, source: Document) -> None:
             src_tok = src_sent.tokens[i]
             tgt_tok = tgt_sent.tokens[i]
             
-            # If source token has a tokid, propagate it (even if target already has one)
-            # This ensures we preserve the original XML IDs
+            # If source token has a tokid, propagate it only when the target token
+            # does not already have one. Backends like UDPipe preserve TokId in
+            # response CoNLL-U; overwriting those can corrupt sentence-local mapping.
             if src_tok.tokid:
                 # For regular tokens, propagate directly
                 if not src_tok.is_mwt and not tgt_tok.is_mwt:
-                    if not tgt_tok.tokid or tgt_tok.tokid != src_tok.tokid:
+                    if not tgt_tok.tokid:
                         tgt_tok.tokid = src_tok.tokid
                         propagated_count += 1
                 # For MWTs, propagate parent tokid and subtoken tokids
                 elif src_tok.is_mwt and tgt_tok.is_mwt:
-                    if not tgt_tok.tokid or tgt_tok.tokid != src_tok.tokid:
+                    if not tgt_tok.tokid:
                         tgt_tok.tokid = src_tok.tokid
                         propagated_count += 1
                     if src_tok.subtokens and tgt_tok.subtokens:
                         for src_sub, tgt_sub in zip(src_tok.subtokens, tgt_tok.subtokens):
-                            if src_sub.tokid and (not tgt_sub.tokid or tgt_sub.tokid != src_sub.tokid):
+                            if src_sub.tokid and not tgt_sub.tokid:
                                 tgt_sub.tokid = src_sub.tokid
                                 propagated_count += 1
 
@@ -2160,6 +2193,7 @@ def build_parser() -> argparse.ArgumentParser:
         "process",
         help="Run NLP pipeline (tokenization, tagging, parsing, normalization, NER) on input text or files",
         parents=[parent_parser],
+        allow_abbrev=False,
     )
     process_parser.add_argument("--input", default=None, help="Input file (TEITOK XML, CoNLL-U, or raw text). If not provided and STDIN has data, reads from STDIN.")
     process_parser.add_argument(
@@ -2241,6 +2275,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--use-raw-text",
         action="store_true",
         help="Force backend to process raw text instead of pre-tokenized input (useful for UDPipe to retokenize)",
+    )
+    process_parser.add_argument(
+        "--mode",
+        choices=["raw", "pretokenized"],
+        default=None,
+        help="Backend input mode override: 'raw' to allow retokenization, or 'pretokenized' to preserve existing tokenization (CoNLL-U mode where supported).",
     )
     process_parser.add_argument(
         "--endpoint-url",
@@ -2440,6 +2480,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--writeback-insert-sentences",
         action="store_true",
         help="When using writeback on XML that had no <s> elements: insert <s> elements using sentence boundaries from the backend (e.g. UDPipe). Only applies when the original file had tokens but no sentences.",
+    )
+    process_parser.add_argument(
+        "--nobackup",
+        action="store_true",
+        help="When using --writeback in TEITOK mode, skip creating the once-per-day backup copy.",
     )
     process_parser.add_argument(
         "--tokenize",
@@ -3686,25 +3731,32 @@ def _parse_stanza_model_spec(
     """
     # If package is explicitly set, use it
     final_package = package
-    
-    # If model_name contains underscore, try to parse as lang_package
-    if model_name and "_" in model_name and not language:
-        parts = model_name.split("_", 1)
+
+    # Normalize common prefix used in registries/docs (e.g., stanza_my).
+    normalized_model = model_name
+    if normalized_model and normalized_model.lower().startswith("stanza_"):
+        normalized_model = normalized_model.split("_", 1)[1] or None
+
+    # If model looks like lang_package (e.g., cs_cac, my_alt), use its package part
+    # even when --language is provided.
+    if normalized_model and "_" in normalized_model:
+        parts = normalized_model.split("_", 1)
         if len(parts) == 2:
-            # Check if it looks like lang_package (first part is short, second is longer)
             lang_part, pkg_part = parts
             if len(lang_part) <= 3 and len(pkg_part) > 0:
-                # Looks like lang_package format
-                final_language = lang_part
+                final_language = language or lang_part
                 if not final_package:
                     final_package = pkg_part
-                final_model_name = None  # Don't pass model_name, use language instead
-                return (final_language, final_package, final_model_name)
-    
-    # Otherwise, use model_name as-is or language
+                return (final_language, final_package, None)
+
+    # If model is just a language code and --language is absent, treat it as language.
+    if normalized_model and len(normalized_model) <= 3 and normalized_model.isalpha() and not language:
+        return (normalized_model, final_package, None)
+
+    # Fallback: keep explicit language and pass model_name only when language is absent.
     final_language = language
-    final_model_name = model_name if model_name and not language else None
-    
+    final_model_name = normalized_model if normalized_model and not language else None
+
     return (final_language, final_package, final_model_name)
 
 
@@ -5352,7 +5404,8 @@ def run_tag(args: argparse.Namespace) -> int:
                     any(sent.tokens for sent in doc.sentences)
                 )
                 # CLI flag has highest priority, but if TEITOK file has tokens, warn if trying to use raw text
-                use_raw_text_cli = getattr(args, "use_raw_text", False)
+                mode_override = getattr(args, "mode", None)
+                use_raw_text_cli = getattr(args, "use_raw_text", False) or mode_override == "raw"
                 if use_raw_text_cli and has_existing_tokens and (args.verbose or args.debug):
                     print(
                         "[flexipipe] WARNING: --use-raw-text is set but TEITOK file has existing tokens. "
@@ -5366,6 +5419,8 @@ def run_tag(args: argparse.Namespace) -> int:
                     (input_format == "raw" and not getattr(args, "pretokenize", False)) or
                     (is_extracted_text and not getattr(args, "pretokenize", False))
                 )
+                if mode_override == "pretokenized":
+                    use_raw_text = False
                 if backend_type_lower == "udmorph":
                     use_raw_text = True
                 # If the file already has tokens and the user did not request tokenize, use
@@ -5474,7 +5529,13 @@ def run_tag(args: argparse.Namespace) -> int:
                         sent_count = len(neural_result.document.sentences)
                         tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
                         print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
-                except (ValueError, FileNotFoundError, RuntimeError, requests.exceptions.HTTPError) as e:
+                except (
+                    ValueError,
+                    FileNotFoundError,
+                    RuntimeError,
+                    requests.exceptions.HTTPError,
+                    requests.exceptions.RequestException,
+                ) as e:
                     print(f"[flexipipe] {e}", file=sys.stderr)
                     return 1
                 from .engine import FlexitagResult
@@ -5902,8 +5963,24 @@ def run_tag(args: argparse.Namespace) -> int:
                 if args.test:
                     if args.verbose or args.debug:
                         print("[flexipipe] Skipping backup (--test dry-run)", file=sys.stderr)
+                elif getattr(args, "nobackup", False):
+                    if args.verbose or args.debug:
+                        print("[flexipipe] Skipping backup (--nobackup)", file=sys.stderr)
                 elif settings_path and settings_path.exists():
-                    backup_path = create_teitok_backup(str(original_input_path))
+                    try:
+                        backup_path = create_teitok_backup(str(original_input_path))
+                    except PermissionError as exc:
+                        print(
+                            f"[flexipipe] Warning: could not create TEITOK backup due to file permissions: {exc}. Continuing without backup.",
+                            file=sys.stderr,
+                        )
+                        backup_path = None
+                    except OSError as exc:
+                        print(
+                            f"[flexipipe] Warning: TEITOK backup failed ({exc}). Continuing without backup.",
+                            file=sys.stderr,
+                        )
+                        backup_path = None
                     if backup_path:
                         if args.verbose or args.debug:
                             print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
@@ -5950,6 +6027,21 @@ def run_tag(args: argparse.Namespace) -> int:
                         # Determine if this was processed from raw text
                         # Check if use_raw_text was used (stored in document metadata)
                         processed_from_raw = output_doc.meta.get("_processed_from_raw_text", False)
+                        if getattr(args, "debug", False) and output_doc.sentences:
+                            dbg_sent = output_doc.sentences[0]
+                            dbg_rows = [
+                                (
+                                    tok.id,
+                                    tok.tokid,
+                                    tok.head,
+                                    tok.deprel,
+                                )
+                                for tok in dbg_sent.tokens
+                            ]
+                            print(
+                                f"[flexipipe] DEBUG pre-writeback sentence1 token map: sent_id={dbg_sent.sent_id or dbg_sent.id} rows={dbg_rows}",
+                                file=sys.stderr,
+                            )
                         # Decide whether to insert <s> elements on writeback.
                         # If the original TEITOK XML had tokens but no <s>, and the user
                         # requested segmentation, auto-enable sentence insertion so that
@@ -5972,17 +6064,26 @@ def run_tag(args: argparse.Namespace) -> int:
                             unicode_normalization=output_unicode_normalize,
                             insert_sentences=auto_insert_sentences,
                             verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
+                            keep_ohead=bool(getattr(args, "debug", False)),
                         )
                         if args.verbose or args.debug:
                             target = str(target_writeback_path) if not output_path else output_path
                             print(f"[flexipipe] Updated TEITOK file in-place: {target}")
                 except Exception as e:
-                    print(
-                        f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
-                        file=sys.stderr,
-                    )
+                    if use_writeback and not output_path:
+                        print(
+                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because --writeback was requested without --output.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
+                            file=sys.stderr,
+                        )
                     if args.test and temp_writeback_path:
                         temp_writeback_path.unlink(missing_ok=True)
+                    if use_writeback and not output_path:
+                        return 1
                 else:
                     if args.test and temp_writeback_path:
                         with open(temp_writeback_path, "r", encoding="utf-8") as tf:
