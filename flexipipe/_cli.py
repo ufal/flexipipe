@@ -424,6 +424,66 @@ def _parse_transformers_context_arg(value: Optional[str]) -> Optional[List[str]]
     return cleaned or None
 
 
+
+
+def _merge_ner_entities(primary, ner_doc) -> None:
+    from .doc_utils import collect_span_entities_by_sentence
+
+    for idx, sent in enumerate(primary.sentences):
+        if idx >= len(ner_doc.sentences):
+            break
+        ner_sent = ner_doc.sentences[idx]
+        existing = {(e.start, e.end, e.label) for e in sent.entities}
+        for ent in ner_sent.entities:
+            key = (ent.start, ent.end, ent.label)
+            if key not in existing:
+                sent.entities.append(ent)
+                existing.add(key)
+    span_entities = collect_span_entities_by_sentence(ner_doc, "ner")
+    for idx, sent in enumerate(primary.sentences):
+        existing = {(e.start, e.end, e.label) for e in sent.entities}
+        if idx in span_entities:
+            for ent in span_entities[idx]:
+                key = (ent.start, ent.end, ent.label)
+                if key not in existing:
+                    sent.entities.append(ent)
+                    existing.add(key)
+    if getattr(ner_doc, "spans", None) and ner_doc.spans.get("ner"):
+        primary.spans.setdefault("ner", [])
+        primary.spans["ner"].extend(ner_doc.spans["ner"])
+
+
+def _run_secondary_ner_backend(
+    document,
+    args,
+    primary_backend: str,
+    requested_tasks: set,
+    *,
+    verbose: bool = False,
+) -> None:
+    if "ner" not in requested_tasks:
+        return
+    ner_backend = getattr(args, "ner_backend", None)
+    if not ner_backend:
+        return
+    ner_backend = ner_backend.lower()
+    if ner_backend == primary_backend:
+        return
+    if ner_backend != "nametag":
+        return
+
+    from .backend_registry import create_backend
+
+    backend_kwargs = _build_nametag_backend_kwargs(args)
+    backend_kwargs.setdefault("log_requests", verbose)
+    ner = create_backend("nametag", training=False, **backend_kwargs)
+    if verbose:
+        print("[flexipipe] Running secondary NER backend 'nametag' on pretokenized document", file=sys.stderr)
+    ner_result = ner.tag(document, use_raw_text=False, components=["ner"])
+    _merge_ner_entities(document, ner_result.document)
+    document.meta.setdefault("_backends_used", []).append("nametag")
+
+
 def _tasks_to_backend_components(tasks: set[str], backend: Optional[str]) -> Optional[List[str]]:
     backend_lower = (backend or "").lower()
     if backend_lower == "flair":
@@ -2323,6 +2383,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_udpipe_args(process_parser)
     add_udmorph_args(process_parser)
     add_nametag_args(process_parser)
+    process_parser.add_argument(
+        "--ner-backend",
+        choices=["nametag"],
+        default=None,
+        help="Run NER with a second backend after the primary backend (e.g. UDPipe then NameTag).",
+    )
+    process_parser.add_argument(
+        "--rejoin-linebreaks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rejoin historic line-break hyphenation before NLP (default: on).",
+    )
     add_treetagger_args(process_parser)
     process_parser.add_argument(
         "--transformers-task",
@@ -3585,7 +3657,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_key_value_pairs(pairs: list[str] | None) -> dict[str, str]:
+def _parse_key_value_pairs(pairs: Optional[List[str]]) -> Dict[str, str]:
     """Parse KEY=VALUE arguments into a dictionary."""
     params: dict[str, str] = {}
     if not pairs:
@@ -3677,7 +3749,7 @@ def _load_and_merge_teitok_settings(
     return settings, merged_mappings
 
 
-def _parse_attrs_map(attrs_map: list[str] | None) -> dict[str, str]:
+def _parse_attrs_map(attrs_map: Optional[List[str]]) -> Dict[str, str]:
     """
     Parse --attrs-map arguments into attribute mappings.
     
@@ -4723,7 +4795,13 @@ def run_tag(args: argparse.Namespace) -> int:
                         # Extract plain text using same logic as insert_tokens so backend and writeback match
                         textnode_xpath = getattr(args, "textnode", ".//text")
                         include_notes = getattr(args, "textnotes", False)
-                        raw_text = extract_plaintext_for_teitok_backend(tmp_path, textnode_xpath, include_notes=include_notes)
+                        raw_text = extract_plaintext_for_teitok_backend(
+                            tmp_path,
+                            textnode_xpath,
+                            include_notes=include_notes,
+                            rejoin_linebreaks=getattr(args, "rejoin_linebreaks", True),
+                            unicode_normalize=unicode_normalize,
+                        )
                         # Normalize input text before processing
                         if unicode_normalize != "none":
                             raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
@@ -4848,7 +4926,13 @@ def run_tag(args: argparse.Namespace) -> int:
                     # Extract plain text using same logic as insert_tokens so backend and writeback match
                     textnode_xpath = getattr(args, "textnode", ".//text")
                     include_notes = getattr(args, "textnotes", False)
-                    raw_text = extract_plaintext_for_teitok_backend(args.input, textnode_xpath, include_notes=include_notes)
+                    raw_text = extract_plaintext_for_teitok_backend(
+                        args.input,
+                        textnode_xpath,
+                        include_notes=include_notes,
+                        rejoin_linebreaks=getattr(args, "rejoin_linebreaks", True),
+                        unicode_normalize=unicode_normalize,
+                    )
                     if args.debug:
                         print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
                         print("=" * 80)
@@ -4876,6 +4960,15 @@ def run_tag(args: argparse.Namespace) -> int:
                         segment=segment_locally,
                         tokenize=tokenize_locally,
                     )
+                    from .insert_tokens import get_rejoin_meta
+                    _rejoin_meta = get_rejoin_meta(args.input)
+                    if _rejoin_meta:
+                        doc.meta["_teitok_rejoin_meta"] = _rejoin_meta
+                        doc.meta["_teitok_block_nlp_ranges"] = _rejoin_meta.get("block_nlp_ranges", [])
+                        doc.meta["_teitok_block_display_ranges"] = _rejoin_meta.get(
+                            "block_display_ranges", []
+                        )
+                        doc.meta["_teitok_extracted_nlp"] = _rejoin_meta.get("nlp_plaintext", raw_text)
                     # Store original input path in doc metadata for writeback
                     doc.meta["original_input_path"] = args.input
                     doc.meta["original_input_xpath"] = textnode_xpath
@@ -5529,6 +5622,13 @@ def run_tag(args: argparse.Namespace) -> int:
                         sent_count = len(neural_result.document.sentences)
                         tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
                         print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
+                    _run_secondary_ner_backend(
+                        neural_result.document,
+                        args,
+                        backend_type_lower,
+                        requested_tasks,
+                        verbose=bool(args.verbose or args.debug),
+                    )
                 except (
                     ValueError,
                     FileNotFoundError,
@@ -5542,6 +5642,41 @@ def run_tag(args: argparse.Namespace) -> int:
                 result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
                 _propagate_sentence_metadata(result.document, doc)
                 _propagate_token_ids(result.document, doc)
+
+                if doc.meta.get("_teitok_block_nlp_ranges"):
+                    from .teitok_block_align import (
+                        build_block_sentence_map,
+                        build_sentence_nlp_offsets,
+                    )
+                    nlp_for_map = doc.meta.get("_teitok_extracted_nlp", "")
+                    sent_spans = build_sentence_nlp_offsets(
+                        result.document,
+                        nlp_for_map,
+                        verbose=bool(args.verbose or args.debug),
+                    )
+                    result.document.meta["_teitok_sentence_nlp_spans"] = sent_spans
+                    result.document.meta["_teitok_block_sentence_map"] = build_block_sentence_map(
+                        result.document,
+                        nlp_for_map,
+                        doc.meta["_teitok_block_nlp_ranges"],
+                        verbose=bool(args.verbose or args.debug),
+                    )
+                    if doc.meta.get("_teitok_rejoin_meta"):
+                        result.document.meta["_teitok_rejoin_meta"] = doc.meta["_teitok_rejoin_meta"]
+                        result.document.meta["_teitok_extracted_nlp"] = nlp_for_map
+                        result.document.meta["_teitok_block_nlp_ranges"] = doc.meta[
+                            "_teitok_block_nlp_ranges"
+                        ]
+                    if args.verbose or args.debug:
+                        bmap = result.document.meta["_teitok_block_sentence_map"]
+                        mapped = sum(1 for b in bmap if b)
+                        anchored = len(sent_spans)
+                        total_s = len(result.document.sentences)
+                        print(
+                            f"[flexipipe] Block map: {mapped}/{len(bmap)} blocks, "
+                            f"sentences anchored {anchored}/{total_s}",
+                            file=sys.stderr,
+                        )
             
                 # Copy normalization map from original doc to result doc meta if it exists
                 # (needed for restoration after backend processing)
@@ -6019,6 +6154,7 @@ def run_tag(args: argparse.Namespace) -> int:
                             use_minidom_rebuild=(engine == "minidom"),
                             use_string_rebuild=(engine == "string"),
                             use_teitok_rebuild=(engine == "teitok"),
+                            align_debug=bool(getattr(args, "debug", False)),
                         )
                         if args.verbose or args.debug:
                             target = str(target_writeback_path) if not output_path else output_path
@@ -7458,7 +7594,7 @@ def _render_tree_style(sent, token_id_to_idx: dict[int, int]) -> str:
 
 def _write_document(
     document: Document,
-    output: str | None,
+    output: Optional[str],
     fmt: str,
     pretty_print: bool = False,
     *,
@@ -7758,7 +7894,7 @@ def _write_document(
     raise SystemExit(f"Unsupported output format '{fmt}'")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     else:

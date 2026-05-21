@@ -30,6 +30,16 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from flexipipe.doc import Document, Token, Sentence
 
+from .linebreak_rejoin import (
+    RejoinSpan,
+    apply_rejoin_to_token_positions,
+    build_nlp_plaintext,
+    detect_rejoin_spans,
+    merged_form_for_display_span,
+    slice_rejoin_spans_for_block,
+)
+from .teitok_block_align import clip_sentences_to_nlp_range, find_sentences_for_block_nlp_slice
+
 
 def _teitok_local_tag(elem: ET.Element) -> str:
     """Local tag name (no namespace)."""
@@ -115,6 +125,7 @@ def insert_tokens_into_teitok(
     use_minidom_rebuild: bool = False,
     use_string_rebuild: bool = False,
     use_teitok_rebuild: bool = False,
+    align_debug: bool = False,
 ) -> None:
     """
     Insert tokens and sentences into a non-tokenized TEITOK XML file.
@@ -135,7 +146,7 @@ def insert_tokens_into_teitok(
     if block_elements is None:
         block_elements = ['div', 'head', 'p', 'u', 'speaker']
     if extract_elements is None:
-        extract_elements = ['note', 'desc', 'gap', 'pb', 'fw', 'rdg']
+        extract_elements = ['note', 'desc', 'gap', 'fw', 'rdg']
     
     original_path_obj = Path(original_path)
     if not original_path_obj.exists():
@@ -149,7 +160,7 @@ def insert_tokens_into_teitok(
         from .teitok import _add_change_to_tei_header
         from datetime import datetime
         raw_xml = original_path_obj.read_text(encoding="utf-8")
-        notok = "|".join(extract_elements) if extract_elements else "note|desc|gap|pb|fw|rdg"
+        notok = "|".join(extract_elements) if extract_elements else "note|desc|gap|fw|rdg"
         tokenized = tokenize_teitok_style(
             raw_xml,
             text_tag="text",
@@ -277,10 +288,7 @@ def insert_tokens_into_teitok(
     
     # Helper functions
     def get_tag_name(elem: ET.Element) -> str:
-        tag = elem.tag
-        if '}' in tag:
-            tag = tag.split('}')[1]
-        return tag.lower()
+        return _teitok_local_tag(elem)
     
     def is_extract_element(elem: ET.Element) -> bool:
         return get_tag_name(elem) in extract_elements_set
@@ -292,7 +300,7 @@ def insert_tokens_into_teitok(
         """Check if an element is self-closing (like <lb/>, <pb/>, etc.).
         These elements should never have content - if they do, it's malformed XML."""
         tag_name = get_tag_name(elem)
-        self_closing_tags = {'lb', 'pb', 'milestone', 'anchor', 'gap', 'fw'}
+        self_closing_tags = {'lb', 'pb', 'cb', 'milestone', 'anchor', 'gap', 'fw'}
         return tag_name in self_closing_tags
     
     # Extract content from extract elements (like notes)
@@ -333,7 +341,27 @@ def insert_tokens_into_teitok(
     used_token_count = 0
     global_tok_id = 1  # Global token ID counter across all block elements
     global_sent_idx = 0  # Global sentence index counter across all block elements
-    
+    block_sentence_map: List[List[int]] = document.meta.get("_teitok_block_sentence_map") or []
+    block_index = 0
+    _align_stats = {"tokenized": 0, "align_skip": 0, "no_sentences": 0, "empty_skip": 0}
+
+    rejoin_meta = get_rejoin_meta(str(original_path_obj)) or document.meta.get("_teitok_rejoin_meta")
+    block_display_ranges: List[Tuple[int, int]] = []
+    block_nlp_ranges_meta: List[Tuple[int, int]] = []
+    global_rejoin_spans: List[RejoinSpan] = []
+    if rejoin_meta:
+        block_display_ranges = list(rejoin_meta.get("block_display_ranges") or [])
+        block_nlp_ranges_meta = list(rejoin_meta.get("block_nlp_ranges") or [])
+        global_rejoin_spans = list(rejoin_meta.get("rejoin_spans") or [])
+    if block_sentence_map and block_nlp_ranges_meta:
+        if len(block_sentence_map) != len(block_nlp_ranges_meta):
+            import sys
+            print(
+                f"\nWARNING: block_sentence_map length {len(block_sentence_map)} != "
+                f"block_nlp_ranges {len(block_nlp_ranges_meta)}",
+                file=sys.stderr,
+            )
+
     # Build standoff representation for each text node
     for text_node in text_nodes:
         # Find block elements within text node
@@ -345,180 +373,181 @@ def insert_tokens_into_teitok(
         if not block_elems and len(text_node) == 1:
             single = text_node[0]
             if get_tag_name(single) in ('body', 'div'):
-                block_elems = list(single)
+                block_elems = [c for c in single if is_block_element(c)]
         if not block_elems:
             # No block elements, process text_node directly
             block_elems = [text_node]
         
         for block_elem in block_elems:
             # Build standoff representation for this block element
-            plaintext, markup = build_standoff_representation(
-                block_elem, 
-                block_elements_set, 
-                extract_elements_set, 
+            display_plaintext, markup = build_standoff_representation(
+                block_elem,
+                block_elements_set,
+                extract_elements_set,
                 include_notes,
                 is_self_closing_element  # Pass the function
             )
-            
-            # Print plain text and standoff representation
-            
-            # Create a subset document with only unused sentences/tokens
-            # Try to match the plaintext with remaining sentences
-            remaining_sentences = [sent for i, sent in enumerate(document.sentences) if i not in used_sentence_indices]
-            
-            # Try to find matching sentences for this block
-            # Match by comparing normalized text
-            import re
-            plaintext_norm = re.sub(r'\s+', ' ', plaintext).strip()
-            matched_sentences = []
-            matched_sentence_indices = []
-            
-            accumulated_text = ""
-            for i, sent in enumerate(remaining_sentences):
-                sent_idx = len(used_sentence_indices) + i
-                sent_text_norm = re.sub(r'\s+', ' ', sent.text or "").strip()
-                
-                # Try adding this sentence to the accumulated text
-                if accumulated_text:
-                    # Add sentence - allow flexible whitespace between sentences
-                    # Sentences might be separated by space, period+space, etc.
-                    accumulated_text_norm = re.sub(r'\s+', ' ', accumulated_text + " " + sent_text_norm).strip()
-                else:
-                    accumulated_text_norm = sent_text_norm
-                
-                # Check if the plaintext starts with the accumulated text (allowing for flexible whitespace)
-                # Normalize both for comparison
-                accumulated_norm = re.sub(r'\s+', ' ', accumulated_text_norm).strip()
-                plaintext_norm_compare = re.sub(r'\s+', ' ', plaintext_norm).strip()
-                
-                if plaintext_norm_compare.startswith(accumulated_norm):
-                    matched_sentences.append(sent)
-                    matched_sentence_indices.append(sent_idx)
-                    accumulated_text = accumulated_text_norm
-                    
-                    # If we've matched the entire plaintext exactly (allowing for whitespace differences), stop
-                    if accumulated_norm == plaintext_norm_compare:
-                        break
-                    # Continue to try matching more sentences
-                elif accumulated_norm.startswith(plaintext_norm_compare):
-                    # The accumulated text is longer than plaintext - we've gone too far
-                    # Use the sentences we've matched so far (if any)
-                    if matched_sentences:
-                        break
-                    # If no sentences matched yet, try with just this sentence if it matches
-                    sent_norm_compare = re.sub(r'\s+', ' ', sent_text_norm).strip()
-                    if sent_norm_compare == plaintext_norm_compare or plaintext_norm_compare.startswith(sent_norm_compare):
-                        matched_sentences = [sent]
-                        matched_sentence_indices = [sent_idx]
-                        break
-                    # Otherwise, stop trying
-                    break
-                else:
-                    # Can't match this sentence - if we have matched sentences, use those
-                    if matched_sentences:
-                        break
-                    # If no sentences matched yet, try with just this sentence if it matches
-                    sent_norm_compare = re.sub(r'\s+', ' ', sent_text_norm).strip()
-                    if sent_norm_compare == plaintext_norm_compare or plaintext_norm_compare.startswith(sent_norm_compare):
-                        matched_sentences = [sent]
-                        matched_sentence_indices = [sent_idx]
-                        break
-                    # Otherwise, stop trying - can't match anything
-                    break
-            
-            if not matched_sentences:
-                # No match found, skip this block
-                print(f"\nWARNING: Could not match plaintext for block element, skipping...")
-                continue
-            
-            # Check if we've matched all the plaintext
-            # Normalize both for comparison
-            matched_text_norm = re.sub(r'\s+', ' ', accumulated_text).strip() if accumulated_text else ""
-            plaintext_norm_check = re.sub(r'\s+', ' ', plaintext_norm).strip()
-            
-            # If we haven't matched all the plaintext, try to match more sentences
-            if matched_text_norm != plaintext_norm_check and len(matched_sentences) < len(remaining_sentences):
-                # We have more sentences available - try to match them
-                remaining_plaintext = plaintext_norm_check[len(matched_text_norm):].strip() if len(matched_text_norm) < len(plaintext_norm_check) else ""
-                if remaining_plaintext:
-                    # Try to match remaining sentences to remaining plaintext
-                    for i in range(len(matched_sentences), len(remaining_sentences)):
-                        sent = remaining_sentences[i]
-                        sent_idx = len(used_sentence_indices) + i
-                        sent_text_norm = re.sub(r'\s+', ' ', sent.text or "").strip()
-                        
-                        # Check if remaining plaintext starts with this sentence
-                        if remaining_plaintext.startswith(sent_text_norm) or sent_text_norm.startswith(remaining_plaintext):
-                            matched_sentences.append(sent)
-                            matched_sentence_indices.append(sent_idx)
-                            # Update accumulated text
-                            if accumulated_text:
-                                accumulated_text = re.sub(r'\s+', ' ', accumulated_text + " " + sent_text_norm).strip()
-                            else:
-                                accumulated_text = sent_text_norm
-                            # Update remaining plaintext
-                            if remaining_plaintext.startswith(sent_text_norm):
-                                remaining_plaintext = remaining_plaintext[len(sent_text_norm):].strip()
-                            else:
-                                remaining_plaintext = ""
-                            
-                            # If we've matched all remaining text, stop
-                            if not remaining_plaintext:
-                                break
-            
-            # Only rebuild if we matched the full block plaintext; otherwise skip to avoid
-            # clearing the block and leaving it partially filled (structure would differ).
-            matched_text_norm = re.sub(r'\s+', ' ', accumulated_text).strip() if accumulated_text else ""
-            plaintext_norm_check = re.sub(r'\s+', ' ', plaintext_norm).strip()
-            len_diff = abs(len(matched_text_norm) - len(plaintext_norm_check))
-            # Allow when equal, or when the only difference is leading/trailing whitespace, or 1-char prefix/suffix
-            allow_rebuild = matched_text_norm == plaintext_norm_check
-            if not allow_rebuild and len_diff <= 2:
-                if matched_text_norm.strip() == plaintext_norm_check.strip():
-                    allow_rebuild = True
-                elif plaintext_norm_check.startswith(matched_text_norm) or matched_text_norm.startswith(plaintext_norm_check):
-                    allow_rebuild = True
-                # One extra/missing char at end: longer[:len(shorter)] == shorter
-                elif len_diff == 1:
-                    if len(matched_text_norm) > len(plaintext_norm_check):
-                        allow_rebuild = matched_text_norm[: len(plaintext_norm_check)] == plaintext_norm_check
-                    else:
-                        allow_rebuild = plaintext_norm_check[: len(matched_text_norm)] == matched_text_norm
-                # Single-char difference in the middle (e.g. backend has space where XML has letter): if removing
-                # that character from the longer string makes it equal to the shorter, allow rebuild.
-                if not allow_rebuild and len_diff == 1:
-                    diff_pos = None
-                    for i, (a, b) in enumerate(zip(matched_text_norm, plaintext_norm_check)):
-                        if a != b:
-                            diff_pos = i
-                            break
-                    if diff_pos is not None and len(matched_text_norm) > len(plaintext_norm_check):
-                        trimmed = matched_text_norm[:diff_pos] + matched_text_norm[diff_pos + 1:]
-                        if trimmed == plaintext_norm_check:
-                            allow_rebuild = True
-                    elif diff_pos is None and len_diff == 1:
-                        allow_rebuild = matched_text_norm[: len(plaintext_norm_check)] == plaintext_norm_check
-            if not allow_rebuild:
-                msg = (
-                    f"\nWARNING: Matched text does not cover full block plaintext (matched {len(matched_text_norm)} vs {len(plaintext_norm_check)} chars), skipping block to preserve structure. "
-                    "A small length difference is often due to spacing or encoding; the block is left unchanged."
+            block_nlp_range = (
+                block_nlp_ranges_meta[block_index]
+                if block_index < len(block_nlp_ranges_meta)
+                else (0, 0)
+            )
+            rejoin_spans_block: List[RejoinSpan] = []
+            if (
+                global_rejoin_spans
+                and block_index < len(block_display_ranges)
+                and block_index < len(block_nlp_ranges_meta)
+            ):
+                rejoin_spans_block = slice_rejoin_spans_for_block(
+                    block_display_ranges[block_index],
+                    block_nlp_range,
+                    global_rejoin_spans,
                 )
-                if len_diff == 1:
-                    for i, (a, b) in enumerate(zip(matched_text_norm, plaintext_norm_check)):
-                        if a != b:
-                            msg += f" First difference at position {i}: matched {a!r} vs plaintext {b!r}."
-                            break
-                    else:
-                        msg += " (Lengths differ by 1; difference is at end of string.)"
-                print(msg)
+            nlp_full = document.meta.get("_teitok_extracted_nlp", "")
+            match_source = "display"
+            if nlp_full and block_nlp_range[1] > block_nlp_range[0]:
+                match_plaintext = nlp_full[block_nlp_range[0] : block_nlp_range[1]]
+                match_source = "nlp_slice"
+            elif rejoin_spans_block:
+                match_plaintext, rejoin_spans_block = build_nlp_plaintext(
+                    display_plaintext, rejoin_spans_block
+                )
+                match_source = "rejoin_rebuild"
+            else:
+                match_plaintext = display_plaintext
+                match_source = "display"
+            plaintext = display_plaintext
+
+            preassigned: Optional[List[int]] = None
+            if block_index < len(block_sentence_map) and block_sentence_map[block_index]:
+                preassigned = list(block_sentence_map[block_index])
+            block_index += 1
+
+            if not display_plaintext.strip() and not match_plaintext.strip():
+                _align_stats["empty_skip"] += 1
                 continue
+
+            matched_sentences: List[Sentence] = []
+            matched_sentence_indices: List[int] = []
+            used_preassigned = False
+
+            if preassigned:
+                matched_sentences = [document.sentences[i] for i in preassigned]
+                matched_sentence_indices = list(preassigned)
+                used_preassigned = True
+            elif block_nlp_range[1] > block_nlp_range[0]:
+                nlp_full = document.meta.get("_teitok_extracted_nlp", "")
+                fallback = find_sentences_for_block_nlp_slice(
+                    document,
+                    nlp_full,
+                    block_nlp_range[0],
+                    block_nlp_range[1],
+                    exclude=used_sentence_indices,
+                )
+                if fallback:
+                    matched_sentences = [document.sentences[i] for i in fallback]
+                    matched_sentence_indices = list(fallback)
+
+            fully_consumed_sentence_indices: List[int] = list(matched_sentence_indices)
+            nlp_full_for_clip = document.meta.get("_teitok_extracted_nlp", "")
+            if (
+                matched_sentences
+                and nlp_full_for_clip
+                and block_nlp_range[1] > block_nlp_range[0]
+            ):
+                clipped_sents, _clip_sources, fully_consumed_sentence_indices = (
+                    clip_sentences_to_nlp_range(
+                        document,
+                        matched_sentence_indices,
+                        nlp_full_for_clip,
+                        block_nlp_range[0],
+                        block_nlp_range[1],
+                    )
+                )
+                if not clipped_sents:
+                    block_id = block_elem.get("id") or block_elem.get(
+                        "{http://www.w3.org/XML/1998/namespace}id"
+                    )
+                    import sys
+                    print(
+                        f"\nWARNING: No tokens in block NLP slice for block "
+                        f"(index={block_index - 1}, id={block_id!r}), skipping...",
+                        file=sys.stderr,
+                    )
+                    _align_stats["no_sentences"] += 1
+                    continue
+                matched_sentences = clipped_sents
+
+            if not matched_sentences:
+                block_id = block_elem.get("id") or block_elem.get(
+                    "{http://www.w3.org/XML/1998/namespace}id"
+                )
+                print(
+                    f"\nWARNING: Could not assign sentences for block element "
+                    f"(index={block_index - 1}, id={block_id!r}), skipping..."
+                )
+                _align_stats["no_sentences"] += 1
+                continue
+
+            overlap = set(fully_consumed_sentence_indices) & used_sentence_indices
+            if overlap:
+                print(
+                    f"\nWARNING: block {block_index - 1}: sentences {sorted(overlap)} "
+                    f"already used; continuing with map assignment",
+                    file=__import__("sys").stderr,
+                )
             
             # Create a temporary document with matched sentences
             temp_document = Document(id=document.id)
             temp_document.sentences = matched_sentences
-            
-            # Map tokens and sentences to character positions using the matched sentences
-            token_positions = map_tokens_to_positions(plaintext, temp_document)
+
+            token_positions = map_tokens_to_positions(match_plaintext, temp_document)
+            expected_toks = _count_mappable_tokens(temp_document)
+            coverage = (len(token_positions) / expected_toks) if expected_toks else 1.0
+            if expected_toks and coverage < 0.95:
+                block_id = block_elem.get("id") or block_elem.get(
+                    "{http://www.w3.org/XML/1998/namespace}id"
+                )
+                import sys
+                print(
+                    f"\nWARNING: Token alignment failed for block (index={block_index - 1}, "
+                    f"id={block_id!r}, mapped {len(token_positions)}/{expected_toks} tokens), skipping..."
+                    + ("" if align_debug else " (use --debug for details)"),
+                    file=sys.stderr,
+                )
+                _align_stats["align_skip"] += 1
+                if align_debug:
+                    _print_token_align_debug(
+                        block_index=block_index - 1,
+                        block_id=block_id,
+                        block_nlp_range=block_nlp_range,
+                        block_display_range=(
+                            block_display_ranges[block_index - 1]
+                            if block_index - 1 < len(block_display_ranges)
+                            else None
+                        ),
+                        match_source=match_source,
+                        display_plaintext=display_plaintext,
+                        match_plaintext=match_plaintext,
+                        token_positions=token_positions,
+                        expected_toks=expected_toks,
+                        temp_document=temp_document,
+                        preassigned=preassigned,
+                        used_preassigned=used_preassigned,
+                        nlp_slice_global=(
+                            block_nlp_range if match_source == "nlp_slice" else None
+                        ),
+                    )
+                continue
+
+            if rejoin_spans_block:
+                token_positions = apply_rejoin_to_token_positions(
+                    token_positions, rejoin_spans_block
+                )
+            token_positions = clamp_token_positions_at_milestones(
+                token_positions, markup, plaintext,
+                rejoin_spans=rejoin_spans_block if rejoin_spans_block else None,
+            )
             sentence_positions = map_sentences_to_positions(plaintext, temp_document, token_positions)
             
             adjusted_markup = _split_markup_for_sentence_boundaries(
@@ -584,14 +613,27 @@ def insert_tokens_into_teitok(
                     note_content_map,
                     start_tok_id=global_tok_id,
                     start_sent_idx=global_sent_idx,
-                    settings=settings
+                    settings=settings,
+                    rejoin_spans=rejoin_spans_block if rejoin_spans_block else None,
                 )
                 global_tok_id += tokens_used
                 global_sent_idx += sentences_used
             
-            # Mark these sentences as used
-            for sent_idx in matched_sentence_indices:
+            # Mark only sentences wholly inside this block (partial overlap stays for next block)
+            for sent_idx in fully_consumed_sentence_indices:
                 used_sentence_indices.add(sent_idx)
+            _align_stats["tokenized"] += 1
+
+    if align_debug:
+        import sys
+        total_blocks = block_index
+        print(
+            f"[flexipipe] ALIGN DEBUG summary: blocks_seen={total_blocks} "
+            f"tokenized={_align_stats['tokenized']} align_skip={_align_stats['align_skip']} "
+            f"no_sentences={_align_stats['no_sentences']} empty_skip={_align_stats['empty_skip']} "
+            f"sentences_in_doc={len(document.sentences)}",
+            file=sys.stderr,
+        )
     
     # Restore note content
     def restore_note_content(root: ET.Element) -> None:
@@ -615,7 +657,8 @@ def insert_tokens_into_teitok(
         original_root_snapshot,
         root,
         ignore_tags={"s", "tok", "dtok"},  # Also ignore dtok tags (sub-tokens of MWTs)
-        ignore_attrs={"id", "rpt"}
+        ignore_attrs={"id", "rpt"},
+        debug=align_debug,
     )
     
     # Add change element to TEI header
@@ -663,6 +706,9 @@ def insert_tokens_into_teitok(
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
     change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
     
+    from .teitok_name_wrap import apply_name_wrappers_to_tree
+    apply_name_wrappers_to_tree(root, document)
+
     _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
     
     # Write updated XML (without pretty-printing)
@@ -677,6 +723,8 @@ def verify_structure_preserved(
     modified_root: ET.Element,
     ignore_tags: Set[str],
     ignore_attrs: Set[str],
+    *,
+    debug: bool = False,
 ) -> None:
     """
     Compare original vs modified XML by converting both to strings and stripping:
@@ -733,18 +781,40 @@ def verify_structure_preserved(
     original_text = remove_attributes(original_text, ignore_attrs)
     modified_text = remove_attributes(modified_text, ignore_attrs)
 
+    _SELF_CLOSING_COMPARE = {"lb", "pb", "cb", "milestone", "anchor", "gap", "fw"}
+    _sc_pattern = (
+        r"<(" + "|".join(re.escape(t) for t in _SELF_CLOSING_COMPARE) + r")(\s[^<>]*?)?></\1>"
+    )
+
+    def normalize_empty_self_closing(text: str) -> str:
+        return re.sub(_sc_pattern, r"<\1\2/>", text, flags=re.IGNORECASE)
+
+    original_text = normalize_empty_self_closing(original_text)
+    modified_text = normalize_empty_self_closing(modified_text)
+
     if original_text != modified_text:
         diff_pos = 0
         max_len = min(len(original_text), len(modified_text))
         while diff_pos < max_len and original_text[diff_pos] == modified_text[diff_pos]:
             diff_pos += 1
-        snippet_original = original_text[diff_pos:diff_pos + 120]
-        snippet_modified = modified_text[diff_pos:diff_pos + 120]
+        snippet_len = 400 if debug else 120
+        snippet_original = original_text[diff_pos:diff_pos + snippet_len]
+        snippet_modified = modified_text[diff_pos:diff_pos + snippet_len]
+        len_msg = (
+            f"\nNormalized lengths: original={len(original_text)} modified={len(modified_text)}"
+            if debug
+            else ""
+        )
+        ctx_before = 80 if debug else 0
+        before_orig = original_text[max(0, diff_pos - ctx_before):diff_pos]
+        before_mod = modified_text[max(0, diff_pos - ctx_before):diff_pos]
         raise ValueError(
             "Modified XML differs from original once token/sentence tags and ignorable attrs are stripped.\n"
-            f"First difference at position {diff_pos}:\n"
-            f"Original: {snippet_original!r}\n"
-            f"Modified: {snippet_modified!r}"
+            f"First difference at position {diff_pos}:{len_msg}\n"
+            + (f"Context before (orig): {before_orig!r}\n" if debug else "")
+            + (f"Context before (mod):  {before_mod!r}\n" if debug else "")
+            + f"Original: {snippet_original!r}\n"
+            + f"Modified: {snippet_modified!r}"
         )
 def build_standoff_representation(
     elem: ET.Element,
@@ -776,10 +846,7 @@ def build_standoff_representation(
     open_elements = []  # Stack of open elements
     
     def get_tag_name(e: ET.Element) -> str:
-        tag = e.tag
-        if '}' in tag:
-            tag = tag.split('}')[1]
-        return tag.lower()
+        return _teitok_local_tag(e)
     
     def is_extract_element(e: ET.Element) -> bool:
         return get_tag_name(e) in extract_elements
@@ -789,6 +856,12 @@ def build_standoff_representation(
     
     def process_element(e: ET.Element) -> None:
         nonlocal char_pos, order, level
+
+        if not isinstance(e.tag, str):
+            if e.tail:
+                plaintext_parts.append(e.tail)
+                char_pos += len(e.tail)
+            return
         
         tag_name = get_tag_name(e)
         order += 1
@@ -871,12 +944,27 @@ def build_standoff_representation(
     return plaintext, markup
 
 
+def _join_teitok_blocks(block_texts: List[str]) -> str:
+    """Join per-block plaintext with \\n\\n separators (matches block offset accounting)."""
+    if not block_texts:
+        return ""
+    out: List[str] = []
+    for i, part in enumerate(block_texts):
+        if i > 0:
+            out.append("\n\n")
+        out.append(part)
+    return "".join(out)
+
+
 def extract_plaintext_for_teitok_backend(
     path: str,
     textnode_xpath: str = ".//text",
     include_notes: bool = False,
     block_elements: Optional[List[str]] = None,
     extract_elements: Optional[List[str]] = None,
+    *,
+    rejoin_linebreaks: bool = True,
+    unicode_normalize: Optional[str] = None,
 ) -> str:
     """
     Extract plain text from TEITOK XML using the same block structure and
@@ -890,7 +978,7 @@ def extract_plaintext_for_teitok_backend(
     if block_elements is None:
         block_elements = ['div', 'head', 'p', 'u', 'speaker']
     if extract_elements is None:
-        extract_elements = ['note', 'desc', 'gap', 'pb', 'fw', 'rdg']
+        extract_elements = ['note', 'desc', 'gap', 'fw', 'rdg']
 
     path_obj = Path(path)
     if not path_obj.exists():
@@ -908,17 +996,14 @@ def extract_plaintext_for_teitok_backend(
     extract_elements_set = {elem.lower() for elem in extract_elements}
 
     def get_tag_name(elem: ET.Element) -> str:
-        tag = elem.tag
-        if '}' in tag:
-            tag = tag.split('}')[1]
-        return tag.lower()
+        return _teitok_local_tag(elem)
 
     def is_block_element(elem: ET.Element) -> bool:
         return get_tag_name(elem) in block_elements_set
 
     def is_self_closing_element(elem: ET.Element) -> bool:
         tag_name = get_tag_name(elem)
-        self_closing_tags = {'lb', 'pb', 'milestone', 'anchor', 'gap', 'fw'}
+        self_closing_tags = {'lb', 'pb', 'cb', 'milestone', 'anchor', 'gap', 'fw'}
         return tag_name in self_closing_tags
 
     try:
@@ -932,27 +1017,124 @@ def extract_plaintext_for_teitok_backend(
         text_nodes = [root]
 
     all_plaintexts: List[str] = []
+    all_nlp_plaintexts: List[str] = []
+    block_nlp_ranges: List[Tuple[int, int]] = []
+    block_display_ranges: List[Tuple[int, int]] = []
+    global_rejoin_spans: List[RejoinSpan] = []
+    global_offset = 0
+    nlp_offset = 0
+    normalize_mode = unicode_normalize if unicode_normalize and unicode_normalize != "none" else None
+    if normalize_mode:
+        from .unicode_utils import normalize_unicode
+
     for text_node in text_nodes:
         block_elems = [child for child in text_node if is_block_element(child)]
         if not block_elems and len(text_node) == 1:
             single = text_node[0]
             if get_tag_name(single) in ('body', 'div'):
-                block_elems = list(single)
+                block_elems = [c for c in single if is_block_element(c)]
         if not block_elems:
             block_elems = [text_node]
         for block_elem in block_elems:
-            plaintext, _ = build_standoff_representation(
+            display_block, markup = build_standoff_representation(
                 block_elem,
                 block_elements_set,
                 extract_elements_set,
                 include_notes,
                 is_self_closing_element,
             )
-            all_plaintexts.append(plaintext)
+            if normalize_mode:
+                display_block = normalize_unicode(display_block, normalize_mode) or ""
+            block_display_ranges.append((global_offset, global_offset + len(display_block)))
+            all_plaintexts.append(display_block)
+            if rejoin_linebreaks:
+                block_spans = detect_rejoin_spans(display_block, markup)
+                if block_spans:
+                    nlp_block, block_spans = build_nlp_plaintext(display_block, block_spans)
+                    for span in block_spans:
+                        global_rejoin_spans.append(
+                            RejoinSpan(
+                                display_start=span.display_start + global_offset,
+                                display_end=span.display_end + global_offset,
+                                merged_form=span.merged_form,
+                                nlp_start=span.nlp_start + nlp_offset,
+                                nlp_end=span.nlp_end + nlp_offset,
+                                removed_display_start=span.removed_display_start + global_offset,
+                                removed_display_end=span.removed_display_end + global_offset,
+                            )
+                        )
+                else:
+                    nlp_block = display_block
+                all_nlp_plaintexts.append(nlp_block)
+                block_nlp_ranges.append((nlp_offset, nlp_offset + len(nlp_block)))
+                nlp_offset += len(nlp_block) + 2
+            global_offset += len(display_block) + 2
 
-    # Join with double newline so backend can segment on paragraph boundaries;
-    # block boundaries then align with what we use when matching per block.
-    return "\n\n".join(p for p in all_plaintexts if p)
+    display = _join_teitok_blocks(all_plaintexts)
+    if not rejoin_linebreaks:
+        return display
+
+    nlp_text = _join_teitok_blocks(all_nlp_plaintexts)
+    _LAST_REJOIN_META[str(path_obj)] = {
+        "display_plaintext": display,
+        "nlp_plaintext": nlp_text,
+        "rejoin_spans": global_rejoin_spans,
+        "block_nlp_ranges": block_nlp_ranges,
+        "block_display_ranges": block_display_ranges,
+    }
+    return nlp_text
+
+
+_LAST_REJOIN_META: Dict[str, Dict[str, Any]] = {}
+
+
+def get_rejoin_meta(path: str) -> Optional[Dict[str, Any]]:
+    return _LAST_REJOIN_META.get(path)
+
+
+def store_rejoin_meta(path: str, meta: Dict[str, Any]) -> None:
+    _LAST_REJOIN_META[str(path)] = meta
+
+
+def count_teitok_blocks_in_xml(
+    path: str,
+    textnode_xpath: str = ".//text",
+    block_elements: Optional[List[str]] = None,
+) -> int:
+    """Count block elements the same way extract/writeback iterate them."""
+    if block_elements is None:
+        block_elements = ["div", "head", "p", "u", "speaker"]
+    block_elements_set = {e.lower() for e in block_elements}
+    path_obj = Path(path)
+    if HAS_LXML:
+        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
+        root = ET.parse(str(path_obj), parser).getroot()
+    else:
+        root = ET.parse(str(path_obj)).getroot()
+    try:
+        text_nodes = root.findall(textnode_xpath.replace(".//", ".//{*}"))
+        if not text_nodes:
+            text_nodes = root.findall(textnode_xpath)
+    except (SyntaxError, ValueError):
+        text_nodes = root.findall(textnode_xpath)
+    if not text_nodes:
+        text_nodes = [root]
+
+    def is_block(elem: ET.Element) -> bool:
+        tag = _teitok_local_tag(elem)
+        return tag in block_elements_set
+
+    count = 0
+    for text_node in text_nodes:
+        block_elems = [c for c in text_node if is_block(c)]
+        if not block_elems and len(text_node) == 1:
+            single = text_node[0]
+            if _teitok_local_tag(single) in ("body", "div"):
+                block_elems = list(single)
+        if not block_elems:
+            block_elems = [text_node]
+        count += len(block_elems)
+    return count
 
 
 def _split_markup_for_sentence_boundaries(
@@ -1047,6 +1229,305 @@ def build_element_contents(elem: ET.Element) -> str:
             key = key.split('}')[1]
         parts.append(f'{key}="{value}"')
     return ' ' + ' '.join(parts) if parts else ''
+
+
+def _mappable_token_forms(document: Document) -> List[str]:
+    """Return surface forms in map_tokens_to_positions walk order (skip MWT subtokens)."""
+    subtoken_ids: Set[int] = set()
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.is_mwt and token.subtokens:
+                for st in token.subtokens[1:]:
+                    if st.id:
+                        subtoken_ids.add(st.id)
+    forms: List[str] = []
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.id and token.id in subtoken_ids:
+                continue
+            forms.append(token.form)
+    return forms
+
+
+def _diagnose_token_alignment(
+    plaintext: str,
+    document: Document,
+) -> Dict[str, Any]:
+    """
+    Mirror map_tokens_to_positions; report first token that cannot be placed.
+    """
+    subtoken_ids: Set[int] = set()
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.is_mwt and token.subtokens:
+                for st in token.subtokens[1:]:
+                    if st.id:
+                        subtoken_ids.add(st.id)
+
+    text_pos = 0
+    mapped = 0
+    token_ordinal = 0
+    first_failure: Optional[Dict[str, Any]] = None
+    failures: List[Dict[str, Any]] = []
+
+    for sent_idx, sent in enumerate(document.sentences):
+        for tok_idx, token in enumerate(sent.tokens):
+            if token.id and token.id in subtoken_ids:
+                continue
+            token_ordinal += 1
+            while text_pos < len(plaintext) and plaintext[text_pos].isspace():
+                text_pos += 1
+            if text_pos >= len(plaintext):
+                info = {
+                    "reason": "plaintext_exhausted",
+                    "text_pos": text_pos,
+                    "plaintext_len": len(plaintext),
+                    "sent_idx": sent_idx,
+                    "tok_idx": tok_idx,
+                    "token_id": token.id,
+                    "form": token.form,
+                    "token_ordinal": token_ordinal,
+                }
+                failures.append(info)
+                if first_failure is None:
+                    first_failure = info
+                continue
+            tok_form = token.form
+            if plaintext[text_pos:].startswith(tok_form):
+                text_pos += len(tok_form)
+                mapped += 1
+            elif plaintext[text_pos:].lower().startswith(tok_form.lower()):
+                text_pos += len(tok_form)
+                mapped += 1
+            else:
+                remaining = plaintext[text_pos:]
+                match = re.search(re.escape(tok_form), remaining, re.IGNORECASE)
+                if match:
+                    text_pos += match.end()
+                    mapped += 1
+                else:
+                    ctx_end = min(len(plaintext), text_pos + 60)
+                    info = {
+                        "reason": "form_not_found",
+                        "text_pos": text_pos,
+                        "plaintext_len": len(plaintext),
+                        "sent_idx": sent_idx,
+                        "tok_idx": tok_idx,
+                        "token_id": token.id,
+                        "form": tok_form,
+                        "token_ordinal": token_ordinal,
+                        "at_pos": repr(plaintext[text_pos:ctx_end]),
+                        "search_remaining_len": len(remaining),
+                    }
+                    failures.append(info)
+                    if first_failure is None:
+                        first_failure = info
+
+    tail_start = text_pos
+    while tail_start < len(plaintext) and plaintext[tail_start].isspace():
+        tail_start += 1
+    unconsumed = plaintext[tail_start:] if tail_start < len(plaintext) else ""
+
+    return {
+        "mapped": mapped,
+        "expected": _count_mappable_tokens(document),
+        "first_failure": first_failure,
+        "failures": failures[:12],
+        "unconsumed_tail": unconsumed,
+        "token_forms": _mappable_token_forms(document),
+    }
+
+
+def _snippet(text: str, max_len: int = 240) -> str:
+    text = text.replace("\n", "\\n")
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _print_token_align_debug(
+    *,
+    block_index: int,
+    block_id: Optional[str],
+    block_nlp_range: Tuple[int, int],
+    block_display_range: Optional[Tuple[int, int]],
+    match_source: str,
+    display_plaintext: str,
+    match_plaintext: str,
+    token_positions: List[Tuple[int, int, Token]],
+    expected_toks: int,
+    temp_document: Document,
+    preassigned: Optional[List[int]],
+    used_preassigned: bool,
+    nlp_slice_global: Optional[Tuple[int, int]],
+) -> None:
+    import sys
+
+    diag = _diagnose_token_alignment(match_plaintext, temp_document)
+    forms = diag.get("token_forms") or []
+    joined = " ".join(forms)
+    clipped_toks = _count_mappable_tokens(temp_document)
+    lines = [
+        f"[flexipipe] ALIGN DEBUG block index={block_index} id={block_id!r}",
+        f"  match_source={match_source} block_nlp_range={block_nlp_range} "
+        f"block_display_range={block_display_range} nlp_slice_global={nlp_slice_global}",
+        f"  display_len={len(display_plaintext)} match_len={len(match_plaintext)} "
+        f"mapped={len(token_positions)}/{expected_toks} diagnose_mapped={diag.get('mapped')}/{diag.get('expected')} "
+        f"clipped_mappable_tokens={clipped_toks}",
+        f"  preassigned={preassigned} used_preassigned={used_preassigned}",
+        f"  display_plaintext[{_snippet(display_plaintext)}]",
+        f"  match_plaintext[{_snippet(match_plaintext)}]",
+        f"  token_forms_joined[{_snippet(joined)}]",
+    ]
+    if display_plaintext != match_plaintext:
+        lines.append(
+            f"  display!=match (first diff may matter for rebuild; align uses match_plaintext)"
+        )
+    ff = diag.get("first_failure")
+    if ff:
+        lines.append(f"  first_failure: {ff}")
+    for extra in diag.get("failures") or []:
+        if extra is not ff:
+            lines.append(f"  also_failed: {extra}")
+    tail = diag.get("unconsumed_tail") or ""
+    if tail.strip():
+        lines.append(f"  unconsumed_match_tail[{_snippet(tail)}]")
+    if forms and match_plaintext:
+        # Character-level prefix comparison (first diverging token)
+        pos = 0
+        for i, form in enumerate(forms[:6]):
+            while pos < len(match_plaintext) and match_plaintext[pos].isspace():
+                pos += 1
+            if pos >= len(match_plaintext):
+                lines.append(f"  prefix_check: token[{i}] form={form!r} but match_plaintext ended at {pos}")
+                break
+            if not match_plaintext[pos:].startswith(form):
+                lines.append(
+                    f"  prefix_check: token[{i}] form={form!r} expected at pos={pos} "
+                    f"got={match_plaintext[pos:pos + min(40, len(match_plaintext) - pos)]!r}"
+                )
+                break
+            pos += len(form)
+    print("\n".join(lines), file=sys.stderr)
+
+
+def _count_mappable_tokens(document: Document) -> int:
+    subtoken_ids: Set[int] = set()
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.is_mwt and token.subtokens:
+                for st in token.subtokens[1:]:
+                    if st.id:
+                        subtoken_ids.add(st.id)
+    count = 0
+    for sent in document.sentences:
+        for token in sent.tokens:
+            if token.id and token.id in subtoken_ids:
+                continue
+            count += 1
+    return count
+
+
+_SELF_CLOSING_MARKUP_TAGS = frozenset(
+    {"lb", "pb", "cb", "milestone", "anchor", "gap", "fw"}
+)
+
+
+def _token_covers_rejoin_span(
+    tok_start: int,
+    tok_end: int,
+    rejoin_spans: Optional[List[RejoinSpan]],
+) -> bool:
+    """True if the token span fully contains a line-break rejoin span.
+
+    Such a token is *meant* to straddle <lb/>/<pc/> markup: the word was split
+    across a line break and the merged token must keep that inline markup inside
+    the <tok> element. Clamping it away from the milestone would both drop the
+    rejoin and corrupt the surrounding text.
+    """
+    if not rejoin_spans:
+        return False
+    for span in rejoin_spans:
+        if span.display_end <= span.display_start:
+            continue
+        if tok_start <= span.display_start and span.display_end <= tok_end:
+            return True
+    return False
+
+
+def _mwt_surface_is_plain(
+    tok_start: int,
+    tok_end: int,
+    token: Token,
+    plaintext: str,
+    markup: List[Dict[str, Any]],
+    block_elem: ET.Element,
+) -> bool:
+    """True if an MWT may be rendered with <tok> text taken straight from its form.
+
+    That shortcut (``tok_elem.text = token.form``) is only safe when the token's
+    display span is a contiguous run of text that exactly equals the combined
+    form. If inline markup (<lb/>, <pc/>, ...) falls inside the span, or the span
+    no longer matches the form (e.g. it was clamped at a milestone), the surface
+    must be rebuilt character-by-character so the original markup is preserved
+    rather than dropped, and the pre-markup text is not duplicated.
+    """
+    if plaintext[tok_start:tok_end] != (token.form or ""):
+        return False
+    for m in markup:
+        if m.get("element") is block_elem:
+            continue
+        ms = m.get("start")
+        if isinstance(ms, int) and tok_start < ms < tok_end:
+            return False
+    return True
+
+
+def clamp_token_positions_at_milestones(
+    token_positions: List[Tuple[int, int, Token]],
+    markup: List[Dict[str, Any]],
+    plaintext: str,
+    rejoin_spans: Optional[List[RejoinSpan]] = None,
+) -> List[Tuple[int, int, Token]]:
+    """Keep <lb/>/<cb/> outside token spans when rejoin mapping overlaps a milestone.
+
+    Tokens that legitimately span a milestone -- line-break rejoin spans and
+    multi-word tokens -- are left untouched so that the <lb/>/<pc/> markup of a
+    hyphenated, line-broken word stays inside the merged <tok> element.
+    """
+    milestones = sorted(
+        m["start"]
+        for m in markup
+        if m.get("name") in _SELF_CLOSING_MARKUP_TAGS
+        and m.get("start") == m.get("end")
+    )
+    if not milestones:
+        return token_positions
+    out: List[Tuple[int, int, Token]] = []
+    for s, e, tok in token_positions:
+        # Tokens that legitimately span markup -- line-break rejoins and
+        # multi-word tokens -- must keep the <lb/>/<pc/> inside the <tok>.
+        # The rebuild reconstructs their surface from the original text and
+        # markup, so clamping them here would only drop or duplicate text.
+        if getattr(tok, "is_mwt", False) or _token_covers_rejoin_span(
+            s, e, rejoin_spans
+        ):
+            out.append((s, e, tok))
+            continue
+        ns, ne = s, e
+        form = tok.form or ""
+        for z in milestones:
+            if ns < z < ne:
+                suffix = plaintext[z:ne]
+                if form and suffix.startswith(form):
+                    ns = z
+                elif form and plaintext[ns:z].strip().endswith(form):
+                    ne = z
+                else:
+                    ns = max(ns, z)
+        if ne > ns:
+            out.append((ns, ne, tok))
+    return out
 
 
 def map_tokens_to_positions(plaintext: str, document: Document) -> List[Tuple[int, int, Token]]:
@@ -1288,6 +1769,7 @@ def rebuild_xml_with_tokens(
     start_tok_id: int = 1,
     start_sent_idx: int = 0,
     settings: Optional[Any] = None,
+    rejoin_spans: Optional[List[RejoinSpan]] = None,
 ) -> Tuple[int, int]:
     """
     Rebuild XML by inserting <s> and <tok> elements at correct positions.
@@ -1551,7 +2033,23 @@ def rebuild_xml_with_tokens(
                                     # The element ends, but the token continues outside it
                                     tok_start, tok_end, token = token_positions[token_idx] if token_idx < len(token_positions) else (None, None, None)
                                     parent_of_element = parent_map.get(open_elem, block_elem)
-                                    
+                                    merged_rejoin = (
+                                        merged_form_for_display_span(
+                                            tok_start, tok_end, rejoin_spans
+                                        )
+                                        if rejoin_spans
+                                        and tok_start is not None
+                                        and tok_end is not None
+                                        else None
+                                    )
+                                    if merged_rejoin:
+                                        # Line-break rejoin: preserve inline XML; do not splice
+                                        # plaintext[char_pos:tok_end] (drops hyphen/lb structure).
+                                        markup_token_state.pop(open_elem, None)
+                                        current_elem = parent_of_element
+                                        open_markup_stack.pop(i)
+                                        break
+
                                     if tok_end is not None and tok_end > char_pos:
                                         # Move token to be a sibling of the element (outside)
                                         token_parent = parent_map.get(current_tok_elem)
@@ -1632,18 +2130,24 @@ def rebuild_xml_with_tokens(
                 if item_type == 'sentence':
                     start_pos, end_pos = item_data[0], item_data[1]
                     length = end_pos - start_pos
-                    return (-length, 0, -end_pos)  # Longest first, type 0 (sentence), then by end position
+                    # Tier 0: sentences (outermost)
+                    return (0, -length, 0, -end_pos)
                 elif item_type == 'token':
                     start_pos, end_pos = item_data[0], item_data[1]
                     length = end_pos - start_pos
-                    return (-length, 1, -end_pos)  # Longest first, type 1 (token), then by end position
-                else:  # markup: preserve document order (order) so siblings open in original sequence
+                    # Tier 2: tokens after zero-width milestones at the same offset
+                    return (2, -length, 0, -end_pos)
+                else:  # markup
                     end_pos = item_data['end']
                     start_pos = item_data['start']
                     length = end_pos - start_pos
                     level = item_data.get('level', 0)
                     order = item_data.get('order', 0)
-                    return (2, order, -length, -end_pos, level)  # Type 2, then document order, then length/end/level
+                    if start_pos == end_pos:
+                        # Tier 1: <lb/>, <cb/>, etc. before <tok> at the same char index
+                        return (1, order, level, -end_pos)
+                    # Tier 3: regular markup in document order
+                    return (3, order, -length, -end_pos, level)
             
             to_open = sorted(opens_at[char_pos], key=get_open_key)
             
@@ -1690,8 +2194,20 @@ def rebuild_xml_with_tokens(
                         # Skip tokens that are subtokens of MWT tokens (they're handled as part of the MWT)
                         if token.id and token.id in mwt_subtoken_ids:
                             continue
-                        # Check if this is an MWT token with subtokens
-                        if token.is_mwt and token.subtokens:
+                        # Check if this is an MWT token with subtokens.
+                        # An MWT may only use the form-as-text shortcut when its
+                        # display span is a contiguous run of plain text. If the
+                        # span straddles inline markup (a line-broken / hyphenated
+                        # word) or was clamped at a milestone, render it as a plain
+                        # token so the surface is rebuilt from the original text
+                        # and markup instead of duplicating the combined form.
+                        if (
+                            token.is_mwt
+                            and token.subtokens
+                            and _mwt_surface_is_plain(
+                                tok_start, tok_end, token, plaintext, markup, block_elem
+                            )
+                        ):
                             # Create parent <tok> element with combined form
                             tok_elem = ET.Element("tok")
                             tok_id = f"w-{global_tok_id}"
@@ -1788,7 +2304,11 @@ def rebuild_xml_with_tokens(
                             tok_id = f"w-{global_tok_id}"
                             global_tok_id += 1
                             tok_elem.set("id", tok_id)  # id is always "id", not mapped
-                            tok_elem.set("form", token.form)  # form is always "form", not mapped
+                            merged = merged_form_for_display_span(
+                                tok_start, tok_end, rejoin_spans
+                            ) if rejoin_spans else None
+                            form_val = merged if merged else token.form
+                            tok_elem.set("form", form_val)
                             
                             # Store mapping from ord to tokid for head conversion
                             if token.id:
@@ -1850,7 +2370,7 @@ def rebuild_xml_with_tokens(
                     
                     # Check if it's an extract element (like note)
                     tag_name = m['name']
-                    self_closing_tags = {'lb', 'pb', 'milestone', 'anchor', 'gap', 'fw'}
+                    self_closing_tags = {'lb', 'pb', 'cb', 'milestone', 'anchor', 'gap', 'fw'}
                     is_self_closing = tag_name in self_closing_tags
                     
                     if tag_name in extract_elements:
@@ -1863,11 +2383,19 @@ def rebuild_xml_with_tokens(
                     elif is_self_closing:
                         # Self-closing element: insert as empty, handle tail separately
                         new_elem = ET.Element(m['element'].tag, m['element'].attrib)
-                        current_elem.append(new_elem)
-                        # Update parent map
-                        parent_map[new_elem] = current_elem
-                        # Track this element for tail text handling
-                        # Use the actual element we just created, not the original
+                        insert_parent = current_elem
+                        # Milestone inside an already-open token span (e.g. rejoin merged
+                        # "wšewědau<pc>-</pc><lb/>cností" into one UDPipe token) belongs
+                        # inside <tok> after markup already emitted, not before the token.
+                        if (
+                            current_tok_elem is not None
+                            and token_idx < len(token_positions)
+                        ):
+                            ts, te, _ = token_positions[token_idx]
+                            if ts < m['start'] < te:
+                                insert_parent = current_tok_elem
+                        insert_parent.append(new_elem)
+                        parent_map[new_elem] = insert_parent
                         self_closing_elements[(m['start'], m['end'])] = new_elem
                         # Don't add to stack - self-closing elements don't need to be closed
                         # Don't change current_elem - we want to continue adding to the parent
@@ -1936,31 +2464,6 @@ def rebuild_xml_with_tokens(
                                     tail_elem.tail = char
                                 # Skip the rest - we've handled this character
                                 continue
-                    
-                    # If no explicit tail range, check if there's a self-closing element
-                    # that was inserted at a position before or at char_pos and is a child of the token
-                    # For self-closing elements without explicit tail, all subsequent characters
-                    # (within the token) should go to the element's tail
-                    # Find the most recently inserted self-closing element (highest start position <= char_pos)
-                    # that's a child of the token
-                    tail_elem = None
-                    best_start = -1
-                    for (start, end), elem in self_closing_elements.items():
-                        # Check if this element is a child of current_tok_elem
-                        if parent_map.get(elem) == current_tok_elem:
-                            # Check if the element was inserted at or before char_pos
-                            if start <= char_pos and start > best_start:
-                                tail_elem = elem
-                                best_start = start
-                    
-                    # If we found a self-closing element, route the character to its tail
-                    if tail_elem is not None:
-                        if tail_elem.tail:
-                            tail_elem.tail += char
-                        else:
-                            tail_elem.tail = char
-                        # Skip the rest - we've handled this character
-                        continue
             
             if token_idx < len(token_positions):
                 tok_start, tok_end, token = token_positions[token_idx]
@@ -1985,10 +2488,32 @@ def rebuild_xml_with_tokens(
                             has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in current_tok_elem)
                             if not has_dtoks:
                                 # Not an MWT token - append text as usual
-                                # Append after any existing children to preserve order
                                 if len(current_tok_elem):
                                     last_child = current_tok_elem[-1]
-                                    if last_child.tail:
+                                    last_tag = (
+                                        last_child.tag.split("}")[-1]
+                                        if isinstance(last_child.tag, str)
+                                        else last_child.tag
+                                    )
+                                    sc_tags = {
+                                        "lb", "pb", "cb",
+                                        "milestone", "anchor", "gap", "fw",
+                                    }
+                                    tail_info = char_to_tail_elem.get(char_pos)
+                                    if tail_info and tail_info[0].get("name") == last_tag:
+                                        _, t_start, t_end = tail_info
+                                        if t_start <= char_pos < t_end:
+                                            if last_child.tail:
+                                                last_child.tail += char
+                                            else:
+                                                last_child.tail = char
+                                            continue
+                                    if last_tag in sc_tags:
+                                        if last_child.tail:
+                                            last_child.tail += char
+                                        else:
+                                            last_child.tail = char
+                                    elif last_child.tail:
                                         last_child.tail += char
                                     else:
                                         last_child.tail = char

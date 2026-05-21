@@ -3825,6 +3825,19 @@ def update_teitok(
                     else:
                         root.append(s_elem)
     
+    from .teitok_name_wrap import apply_name_wrappers_to_tree
+    from .doc_utils import collect_span_entities_by_sentence
+    span_entities = collect_span_entities_by_sentence(sanitized, "ner")
+    for idx, sent in enumerate(sanitized.sentences):
+        existing = {(e.start, e.end, e.label) for e in sent.entities}
+        if idx in span_entities:
+            for ent in span_entities[idx]:
+                key = (ent.start, ent.end, ent.label)
+                if key not in existing:
+                    sent.entities.append(ent)
+                    existing.add(key)
+    apply_name_wrappers_to_tree(root, sanitized)
+
     # Add change element to TEI header
     # Extract change information from document metadata
     from datetime import datetime
