@@ -38,7 +38,12 @@ from .linebreak_rejoin import (
     merged_form_for_display_span,
     slice_rejoin_spans_for_block,
 )
-from .teitok_block_align import clip_sentences_to_nlp_range, find_sentences_for_block_nlp_slice
+from .teitok_block_align import (
+    _sentence_tokens,
+    clip_sentences_to_nlp_range,
+    find_sentences_for_block_nlp_slice,
+    find_tokens_at,
+)
 
 
 def _teitok_local_tag(elem: ET.Element) -> str:
@@ -1514,6 +1519,14 @@ def clamp_token_positions_at_milestones(
         ):
             out.append((s, e, tok))
             continue
+        # A token whose display span already matches its form was aligned to the
+        # full surface (e.g. kwašení<lb/>národů → form kwašenínárodů). Zero-width
+        # milestones inside that span must stay within the <tok>, not be clamped
+        # away — which would leave the pre-<lb/> text bare in the XML.
+        form = tok.form or ""
+        if form and plaintext[s:e] == form:
+            out.append((s, e, tok))
+            continue
         ns, ne = s, e
         form = tok.form or ""
         for z in milestones:
@@ -1530,81 +1543,137 @@ def clamp_token_positions_at_milestones(
     return out
 
 
+_LOCAL_TOKEN_SEARCH_WINDOW = 48
+
+
+def _token_form(token: Token) -> str:
+    return token.form or ""
+
+
+def _map_token_at_cursor(
+    plaintext: str, token: Token, cursor: int
+) -> Optional[Tuple[int, int]]:
+    """Map one token at or shortly after cursor (never jump far ahead in the block)."""
+    form = _token_form(token)
+    if not form:
+        return None
+    pos = cursor
+    while pos < len(plaintext) and plaintext[pos].isspace():
+        pos += 1
+    if pos >= len(plaintext):
+        return None
+    if plaintext[pos : pos + len(form)] == form:
+        return pos, pos + len(form)
+    tail = plaintext[pos : pos + _LOCAL_TOKEN_SEARCH_WINDOW]
+    lower_tail = tail.lower()
+    lower_form = form.lower()
+    if lower_tail.startswith(lower_form):
+        return pos, pos + len(form)
+    rel = lower_tail.find(lower_form)
+    if rel >= 0:
+        return pos + rel, pos + rel + len(form)
+    return None
+
+
 def map_tokens_to_positions(plaintext: str, document: Document) -> List[Tuple[int, int, Token]]:
     """
     Map tokens to character positions in plain text.
-    
-    For MWT tokens, only map the parent token (not subtokens) to avoid text duplication.
-    
-    Returns:
-        List of (start_pos, end_pos, token) tuples
+
+    Each sentence is anchored with find_tokens_at so common short forms (e.g. "a", "se")
+    are not matched far ahead via a global regex search, which left bare words between
+    tokens and between </s> boundaries.
     """
-    positions = []
-    text_pos = 0
-    
-    # Track subtoken IDs to skip them (they're handled as part of the MWT parent)
-    subtoken_ids = set()
+    subtoken_ids: Set[int] = set()
     for sent in document.sentences:
         for token in sent.tokens:
             if token.is_mwt and token.subtokens:
-                # Mark all subtokens (except the first one, which is the token itself) as subtokens to skip
                 for st in token.subtokens[1:]:
                     if st.id:
                         subtoken_ids.add(st.id)
-    
+
+    positions: List[Tuple[int, int, Token]] = []
+    search_from = 0
+
+    for sent in document.sentences:
+        tokens = _sentence_tokens(sent)
+        if not tokens:
+            continue
+
+        anchor = find_tokens_at(plaintext, tokens, search_from)
+        cursor = anchor if anchor >= 0 else search_from
+
+        for token in tokens:
+            mapped = _map_token_at_cursor(plaintext, token, cursor)
+            if mapped is None:
+                continue
+            start_pos, end_pos = mapped
+            positions.append((start_pos, end_pos, token))
+            cursor = end_pos
+
+        search_from = max(search_from, cursor)
+
+    positions = _recover_missing_token_positions(
+        plaintext, positions, document, subtoken_ids
+    )
+    return positions
+
+
+def _recover_missing_token_positions(
+    plaintext: str,
+    positions: List[Tuple[int, int, Token]],
+    document: Document,
+    subtoken_ids: Set[int],
+) -> List[Tuple[int, int, Token]]:
+    """Place tokens that map_tokens skipped, searching only between neighbors."""
+    pos_by_id: Dict[int, Tuple[int, int, Token]] = {}
+    for s, e, tok in positions:
+        if tok.id:
+            pos_by_id[tok.id] = (s, e, tok)
+
+    recovered = list(positions)
+    ordered: List[Token] = []
     for sent in document.sentences:
         for token in sent.tokens:
-            # Skip subtokens of MWT tokens (they're handled as part of the MWT parent)
             if token.id and token.id in subtoken_ids:
                 continue
-            
-            # Skip whitespace
-            while text_pos < len(plaintext) and plaintext[text_pos].isspace():
-                text_pos += 1
-            
-            if text_pos >= len(plaintext):
+            ordered.append(token)
+
+    for i, token in enumerate(ordered):
+        if token.id and token.id in pos_by_id:
+            continue
+        form = _token_form(token)
+        if not form:
+            continue
+        prev_end = 0
+        for j in range(i - 1, -1, -1):
+            prev = ordered[j]
+            if prev.id and prev.id in pos_by_id:
+                prev_end = pos_by_id[prev.id][1]
                 break
-            
-            # For MWT tokens, use the combined form
-            if token.is_mwt and token.subtokens:
-                tok_form = token.form  # Combined form (e.g., "awesome-align")
-            else:
-                tok_form = token.form
-            
-            # Try to find token
-            if plaintext[text_pos:].startswith(tok_form):
-                start_pos = text_pos
-                end_pos = text_pos + len(tok_form)
-                positions.append((start_pos, end_pos, token))
-                text_pos = end_pos
-            else:
-                # Try case-insensitive
-                remaining = plaintext[text_pos:].lower()
-                if remaining.startswith(tok_form.lower()):
-                    actual_len = len(tok_form)
-                    start_pos = text_pos
-                    end_pos = text_pos + actual_len
-                    positions.append((start_pos, end_pos, token))
-                    text_pos = end_pos
-                else:
-                    # Token not found at expected position - try to find it anywhere in remaining text
-                    # This handles cases where there's extra whitespace or the token appears later
-                    remaining_text = plaintext[text_pos:]
-                    # Try to find the token form in the remaining text (case-insensitive)
-                    import re
-                    pattern = re.escape(tok_form)
-                    match = re.search(pattern, remaining_text, re.IGNORECASE)
-                    if match:
-                        start_pos = text_pos + match.start()
-                        end_pos = text_pos + match.end()
-                        positions.append((start_pos, end_pos, token))
-                        text_pos = end_pos
-                    else:
-                        # Still can't find it - skip this token but warn
-                        # This shouldn't happen often, but if it does, we continue
-                        continue
-    
-    return positions
+        next_start = len(plaintext)
+        for j in range(i + 1, len(ordered)):
+            nxt = ordered[j]
+            if nxt.id and nxt.id in pos_by_id:
+                next_start = pos_by_id[nxt.id][0]
+                break
+        if next_start <= prev_end:
+            continue
+        chunk = plaintext[prev_end:next_start]
+        idx = chunk.find(form)
+        if idx < 0:
+            idx = chunk.lower().find(form.lower())
+        if idx < 0:
+            continue
+        start = prev_end + idx
+        end = start + len(form)
+        if any(not (end <= s or start >= e) for s, e, _ in recovered):
+            continue
+        recovered.append((start, end, token))
+        if token.id:
+            pos_by_id[token.id] = (start, end, token)
+
+    recovered.sort(key=lambda x: x[0])
+    return recovered
 
 
 def map_sentences_to_positions(
@@ -1687,36 +1756,15 @@ def map_sentences_to_positions(
                         next_sentence_start = last_token_end + match.start()
                         max_sentence_end = next_sentence_start
         
-        # Start with sentence end at the last token's end position
+        # Sentence span covers mapped tokens plus trailing whitespace only (never bare
+        # words between the last </tok> and </s>, nor between </s> and the next <s>).
         sentence_end = last_token_end
-        
-        # If sentence text is available, try to extend to include trailing whitespace/punctuation
-        # But STRICTLY enforce that we never exceed max_sentence_end (next sentence's start)
-        if sent.text:
-            sent_text_clean = sent.text.strip()
-            if sent_text_clean:
-                # Look for the sentence text in plaintext starting from first_token_start
-                search_start = max(0, first_token_start)
-                # Search only up to max_sentence_end - never beyond
-                search_end = max_sentence_end
-                if search_end > search_start:
-                    search_text = plaintext[search_start:search_end]
-                    
-                    # Try to find the sentence text (allowing for whitespace normalization)
-                    import re
-                    # Escape special regex characters but allow flexible whitespace
-                    sent_text_pattern = re.escape(sent_text_clean)
-                    sent_text_pattern = sent_text_pattern.replace(r'\ ', r'\s+')
-                    match = re.search(sent_text_pattern, search_text, re.IGNORECASE)
-                    if match:
-                        # Found the sentence text - use its end position
-                        found_end = search_start + match.end()
-                        # CRITICAL: Never exceed max_sentence_end (next sentence's start)
-                        # If the match extends beyond, truncate it
-                        sentence_end = min(found_end, max_sentence_end)
-        
-        # Ensure sentence_end is at least last_token_end (sentence must contain all its tokens)
-        sentence_end = max(sentence_end, last_token_end)
+        while (
+            sentence_end < max_sentence_end
+            and sentence_end < len(plaintext)
+            and plaintext[sentence_end].isspace()
+        ):
+            sentence_end += 1
         
         # FINAL CHECK: Ensure sentence doesn't extend beyond max_sentence_end (next sentence's start)
         # This is a hard limit - never exceed it
@@ -2541,11 +2589,19 @@ def rebuild_xml_with_tokens(
                             else:
                                 current_elem.text += char
                 elif char_pos == tok_end:
-                    # Close token
-                    current_elem = parent_map.get(current_tok_elem, block_elem)
-                    current_tok_elem = None
+                    # Close token (closes_at may have done this already)
+                    if current_tok_elem is not None:
+                        current_elem = parent_map.get(current_tok_elem, block_elem)
+                        current_tok_elem = None
                     token_idx += 1
-                    
+                    # Do not emit bare text when the next token starts at this offset
+                    # (e.g. "našemu" + "!" with SpaceAfter=No).
+                    next_starts_here = (
+                        token_idx < len(token_positions)
+                        and token_positions[token_idx][0] == char_pos
+                    )
+                    if next_starts_here:
+                        continue
                     # Add character after token
                     if char_pos < len(plaintext):
                         if tail_elem is not None:

@@ -24,6 +24,40 @@ from .engine import (
 )
 
 XML_NS = "{http://www.w3.org/XML/1998/namespace}"
+TEI_NS = "http://www.tei-c.org/ns/1.0"
+
+
+def _element_local_tag(tag: Any) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.split("}", 1)[-1] if tag.startswith("{") else tag
+
+
+def _tei_namespace_for(elem: ET.Element) -> Optional[str]:
+    """Default TEI namespace from element tag or xmlns attribute."""
+    tag = elem.tag
+    if isinstance(tag, str) and tag.startswith("{"):
+        return tag[1:].split("}", 1)[0]
+    xmlns = elem.get("xmlns")
+    if xmlns:
+        return xmlns
+    return None
+
+
+def _tei_qname(local: str, ns: Optional[str]) -> str:
+    return f"{{{ns}}}{local}" if ns else local
+
+
+def _find_teitok_child(parent: ET.Element, local: str, *, ns: Optional[str] = None) -> Optional[ET.Element]:
+    """Find a direct child by local name (namespace-aware)."""
+    if ns:
+        hit = parent.find(_tei_qname(local, ns))
+        if hit is not None:
+            return hit
+    for child in parent:
+        if _element_local_tag(child.tag) == local:
+            return child
+    return None
 
 
 def _normalize_annotation_attr(value: str, unicode_normalization: Optional[str] = None) -> str:
@@ -2024,17 +2058,18 @@ def _add_change_to_tei_header(
         import xml.etree.ElementTree as _ET  # type: ignore
         ElementFactory = _ET.Element
 
-    # Find or create teiHeader (non-namespaced; TEITOK headers are usually flat)
-    tei_header = root.find("teiHeader")
+    # Find or create teiHeader (PressMint/TEI P5 use default xmlns on <TEI>)
+    root_ns = _tei_namespace_for(root)
+    tei_header = _find_teitok_child(root, "teiHeader", ns=root_ns)
     if tei_header is None:
-        tei_header = ElementFactory("teiHeader")
-        # Insert at the beginning (before <text>)
+        header_ns = root_ns
+        tei_header = ElementFactory(_tei_qname("teiHeader", header_ns))
         root.insert(0, tei_header)
-    
-    # Find or create revisionDesc
-    revision_desc = tei_header.find("revisionDesc")
+    header_ns = _tei_namespace_for(tei_header) or root_ns
+
+    revision_desc = _find_teitok_child(tei_header, "revisionDesc", ns=header_ns)
     if revision_desc is None:
-        revision_desc = ElementFactory("revisionDesc")
+        revision_desc = ElementFactory(_tei_qname("revisionDesc", header_ns))
         tei_header.append(revision_desc)
 
     # If the latest existing <change> already has the same tasks and text,
@@ -2044,7 +2079,7 @@ def _add_change_to_tei_header(
         last_change = None
         # Find last element child named "change"
         for child in reversed(list(revision_desc)):
-            tag_local = child.tag.split("}")[-1] if "}" in str(child.tag) else child.tag
+            tag_local = _element_local_tag(child.tag)
             if tag_local == "change":
                 last_change = child
                 break
@@ -2060,7 +2095,7 @@ def _add_change_to_tei_header(
     # (machine-readable), in addition to the textual description.
     if tasks:
         change_attrs["tasks"] = tasks
-    change_elem = ElementFactory("change", change_attrs)
+    change_elem = ElementFactory(_tei_qname("change", header_ns), change_attrs)
     change_elem.text = change_text
     revision_desc.append(change_elem)
 

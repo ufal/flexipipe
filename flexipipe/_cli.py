@@ -313,43 +313,50 @@ def _augment_tei_output(
     """Inject notesStmt/revisionDesc metadata into TEI output."""
     import xml.etree.ElementTree as ET
 
+    from .teitok import (
+        _element_local_tag,
+        _find_teitok_child,
+        _tei_namespace_for,
+        _tei_qname,
+    )
+
     try:
         root = ET.fromstring(tei_xml)
     except ET.ParseError:
         return tei_xml
 
-    tei_header = root.find("teiHeader")
+    root_ns = _tei_namespace_for(root)
+    tei_header = _find_teitok_child(root, "teiHeader", ns=root_ns)
     if tei_header is None:
-        tei_header = ET.Element("teiHeader")
+        tei_header = ET.Element(_tei_qname("teiHeader", root_ns))
         root.insert(0, tei_header)
+    header_ns = _tei_namespace_for(tei_header) or root_ns
 
-    notes_stmt = tei_header.find("notesStmt")
+    notes_stmt = _find_teitok_child(tei_header, "notesStmt", ns=header_ns)
     if notes_stmt is None:
-        notes_stmt = ET.SubElement(tei_header, "notesStmt")
+        notes_stmt = ET.SubElement(tei_header, _tei_qname("notesStmt", header_ns))
     
     # Add orgfile note if provided
     if note_value:
         for existing in list(notes_stmt):
-            if existing.tag == "note" and existing.get("n") == "orgfile":
+            if _element_local_tag(existing.tag) == "note" and existing.get("n") == "orgfile":
                 notes_stmt.remove(existing)
-        note_elem = ET.SubElement(notes_stmt, "note", {"n": "orgfile"})
+        note_elem = ET.SubElement(notes_stmt, _tei_qname("note", header_ns), {"n": "orgfile"})
         note_elem.text = note_value
     
     # Add API response notes if provided
     if api_notes:
         for note_type, note_content in api_notes:
-            note_elem = ET.SubElement(notes_stmt, "note", {"n": note_type.lower().replace(" ", "-")})
+            note_elem = ET.SubElement(
+                notes_stmt,
+                _tei_qname("note", header_ns),
+                {"n": note_type.lower().replace(" ", "-")},
+            )
             note_elem.text = note_content
 
-    revision_desc = tei_header.find("revisionDesc")
-    if revision_desc is None:
-        revision_desc = ET.SubElement(tei_header, "revisionDesc")
-    change_elem = ET.SubElement(
-        revision_desc,
-        "change",
-        {"when": change_when, "who": "flexipipe"},
-    )
-    change_elem.text = change_text
+    from .teitok import _add_change_to_tei_header
+
+    _add_change_to_tei_header(root, change_text, change_when)
 
     # Convert back to string
     updated = ET.tostring(root, encoding="unicode")
@@ -2330,6 +2337,65 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--normalizer-language",
         help="Language code for the normalizer backend (if different from main --language).",
+    )
+    process_parser.add_argument(
+        "--norm-profile",
+        choices=["typo", "historic", "learner"],
+        default=None,
+        help="FlexiNorm normalization profile: typo (spelling), historic (diachronic orthography), learner (student text). "
+             "Implies normalization when set (use with --normalizer or alone for profile defaults).",
+    )
+    process_parser.add_argument(
+        "--norm-mode",
+        choices=["light", "strong"],
+        default="light",
+        help="Normalization aggressiveness: light applies only high-confidence corrections; strong is more aggressive (default: light).",
+    )
+    process_parser.add_argument(
+        "--norm-subtype",
+        choices=["standard_shift", "minority_standard", "deep_diachronic"],
+        default=None,
+        help="Historic profile subtype: standard_shift (e.g. Czech 1848), minority_standard (new orthography), deep_diachronic (spelling + lexicon).",
+    )
+    process_parser.add_argument(
+        "--norm-lexicon",
+        type=Path,
+        default=None,
+        help="Path to form→reg lexicon TSV/JSON for historic normalization.",
+    )
+    process_parser.add_argument(
+        "--norm-rules",
+        type=Path,
+        default=None,
+        help="Path to YAML rules file for historic normalization.",
+    )
+    process_parser.add_argument(
+        "--with-ocr",
+        action="store_true",
+        help="Run OCR correction before the main normalization profile (scanned/PressMint text).",
+    )
+    process_parser.add_argument(
+        "--ocr-lexicon",
+        type=Path,
+        default=None,
+        help="Lexicon TSV for OCR pass (form→corrected).",
+    )
+    process_parser.add_argument(
+        "--ocr-rules",
+        type=Path,
+        default=None,
+        help="YAML rules for OCR cleanup.",
+    )
+    process_parser.add_argument(
+        "--ocr-model",
+        default=None,
+        help="HuggingFace GEC model for contextual OCR correction (target language).",
+    )
+    process_parser.add_argument(
+        "--jamspell-model",
+        type=Path,
+        default=None,
+        help="JamSpell .bin language model for contextual OCR correction.",
     )
     process_parser.add_argument(
         "--use-raw-text",
@@ -5583,6 +5649,18 @@ def run_tag(args: argparse.Namespace) -> int:
                     doc,
                     backend_type,
                     normalizer_spec=normalizer_spec,
+                    norm_profile=getattr(args, "norm_profile", None),
+                    norm_mode=getattr(args, "norm_mode", "light") or "light",
+                    norm_subtype=getattr(args, "norm_subtype", None),
+                    lexicon_path=str(args.norm_lexicon) if getattr(args, "norm_lexicon", None) else None,
+                    rules_path=str(args.norm_rules) if getattr(args, "norm_rules", None) else None,
+                    with_ocr=getattr(args, "with_ocr", False),
+                    ocr_lexicon_path=str(args.ocr_lexicon) if getattr(args, "ocr_lexicon", None) else None,
+                    ocr_rules_path=str(args.ocr_rules) if getattr(args, "ocr_rules", None) else None,
+                    ocr_model_name=getattr(args, "ocr_model", None),
+                    jamspell_model_path=str(args.jamspell_model)
+                    if getattr(args, "jamspell_model", None)
+                    else None,
                     language=normalizer_lang,
                     model_name=model_name,
                     use_cache=True,
@@ -7894,6 +7972,62 @@ def _write_document(
     raise SystemExit(f"Unsupported output format '{fmt}'")
 
 
+_TASK_SET = frozenset(TASK_CHOICES)
+# Root-level flags that may appear before the subcommand (argparse needs subcommand first).
+_ROOT_FLAGS_BEFORE_TASK = frozenset({"--debug", "--verbose", "--refresh-cache", "-V", "--version"})
+_ROOT_VALUE_OPTS_BEFORE_TASK = frozenset({"--backend"})
+
+
+def _normalize_cli_argv(argv: List[str]) -> List[str]:
+    """
+    Normalize argv for argparse subparsers and optional inline --data shorthand.
+
+    - ``flexipipe --verbose process --input f`` → ``process --verbose --input f``
+    - ``flexipipe --debug Some text`` → ``process --debug --data Some text``
+    - ``flexipipe process process`` → unchanged (second ``process`` is input text)
+    - ``flexipipe hello`` → ``process --data hello``
+    """
+    if not argv:
+        return ["process"]
+    if argv[0] in ("-h", "--help"):
+        return argv
+    if argv[0] == "show":
+        return ["info", *argv[1:]]
+    if argv[0] not in _TASK_SET and not argv[0].startswith("-"):
+        if "--data" not in argv and "-d" not in argv:
+            return ["process", "--data", *argv]
+        return ["process", *argv]
+    if not argv[0].startswith("-"):
+        return argv
+
+    sub_idx = next((i for i, tok in enumerate(argv) if tok in _TASK_SET), None)
+    if sub_idx is not None:
+        return [argv[sub_idx], *argv[:sub_idx], *argv[sub_idx + 1 :]]
+
+    original = list(argv)
+    if "--data" in original or "-d" in original:
+        return ["process", *original]
+
+    i = 0
+    while i < len(original):
+        tok = original[i]
+        if not tok.startswith("-"):
+            break
+        if tok in _ROOT_FLAGS_BEFORE_TASK:
+            i += 1
+            continue
+        if tok in _ROOT_VALUE_OPTS_BEFORE_TASK:
+            i += 2
+            continue
+        if tok.startswith("--backend="):
+            i += 1
+            continue
+        return ["process", *original]
+    if i < len(original):
+        return ["process", *original[:i], "--data", *original[i:]]
+    return ["process", *original]
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -7918,9 +8052,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if argv and argv[0] == "--detect-language":
         return _run_detect_language_standalone(argv)
 
-    if not argv:
-        argv = ["process"]
-    elif argv[0] in ("-h", "--help"):
+    argv = _normalize_cli_argv(argv)
+
+    if argv and argv[0] in ("-h", "--help"):
         parser = build_parser()
         try:
             parser.parse_args(argv)
@@ -7932,39 +8066,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
             raise
         return 0
-    # Backward compatibility: old `show ...` command maps to `info ...`
-    elif argv[0] == "show":
-        argv = ["info", *argv[1:]]
-    elif argv[0] not in TASK_CHOICES and not argv[0].startswith("-"):
-        # If the first argument is not a task name and not an option, treat it as inline text for `process`
-        # This restores the “process by default” behavior for commands like:
-        #   flexipipe "Some text here"
-        argv = ["process", "--data", *argv]
-    elif argv[0].startswith("-"):
-        # If options are provided without an explicit task, assume "process".
-        # Additionally, if only flag options are present (e.g., --debug/--verbose)
-        # followed by free text, treat the free text as --data for convenience.
-        # Example: flexipipe --debug "Some text"
-        original = list(argv)
-        # Default to just prefixing "process"
-        argv = ["process", *original]
-        # If --data already present, do nothing else
-        if "--data" not in original and "-d" not in original:
-            flag_only_opts = {"--debug", "--verbose", "--refresh-cache"}
-            text_start_idx = None
-            # Skip over flag-only options; stop when we hit the first non-flag token
-            for idx, tok in enumerate(original):
-                if tok.startswith("-"):
-                    if tok not in flag_only_opts:
-                        # Option that takes a value or unknown: don't rewrite
-                        text_start_idx = None
-                        break
-                    continue
-                text_start_idx = idx
-                break
-            if text_start_idx is not None:
-                # Insert --data before the text segment
-                argv = ["process", *original[:text_start_idx], "--data", *original[text_start_idx:]]
 
     parser = build_parser()
     try:
