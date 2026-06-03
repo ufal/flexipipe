@@ -6106,6 +6106,8 @@ def run_tag(args: argparse.Namespace) -> int:
             # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
             # But defer this until we know if we're in writeback mode and updating existing tokens
             output_doc = result.document
+            if getattr(args, "debug", False):
+                output_doc.meta["_flexipipe_debug"] = True
             # Record which tasks were requested for this run (as provided by the user),
             # so downstream consumers (e.g. TEITOK header writer) can report what was
             # asked for rather than inferring tasks from whatever annotations happen
@@ -6402,6 +6404,13 @@ def run_tag(args: argparse.Namespace) -> int:
                             target = str(target_writeback_path) if not output_path else output_path
                             print(f"[flexipipe] Updated TEITOK file in-place: {target}")
                 except Exception as e:
+                    if getattr(args, "debug", False):
+                        dump_hint = output_doc.meta.get("_xt_fold_debug_dump")
+                        if dump_hint:
+                            print(
+                                f"[flexipipe] inspect malformed folded XML: {dump_hint}",
+                                file=sys.stderr,
+                            )
                     if use_writeback and not output_path:
                         print(
                             f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because --writeback was requested without --output.",

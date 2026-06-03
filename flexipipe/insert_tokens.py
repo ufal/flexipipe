@@ -187,6 +187,15 @@ def insert_tokens_into_teitok(
                 )
                 return
             except XmltokenizerWritebackError as exc:
+                if align_debug or document.meta.get("_flexipipe_debug"):
+                    dump_hint = document.meta.get("_xt_fold_debug_dump")
+                    if dump_hint:
+                        import sys as _sys_dbg
+
+                        print(
+                            f"[flexipipe] inspect malformed folded XML: {dump_hint}",
+                            file=_sys_dbg.stderr,
+                        )
                 if not writeback_fallback:
                     raise
                 import sys as _sys

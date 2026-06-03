@@ -40,6 +40,68 @@ class XmltokenizerNotAvailable(XmltokenizerWritebackError):
     """The xmltokenizer package is not installed."""
 
 
+# When ``align_debug`` is on (``--debug``), malformed folded XML is written here
+# before raising, so the failure line/column can be inspected off-line.
+DEBUG_FOLD_DUMP_PATH = "/tmp/wrong.xml"
+
+
+def _debug_dump_enabled(document: Document, align_debug: bool) -> bool:
+    """True when ``--debug`` (or explicit ``_flexipipe_debug`` on document.meta)."""
+    if align_debug:
+        return True
+    return bool(document.meta.get("_flexipipe_debug"))
+
+
+def _dump_folded_xml_for_debug(
+    folded_bytes: bytes,
+    document: Document,
+    *,
+    align_debug: bool,
+    dump_path: Optional[str] = None,
+) -> Optional[Path]:
+    if not _debug_dump_enabled(document, align_debug):
+        return None
+    path = Path(dump_path or DEBUG_FOLD_DUMP_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(folded_bytes)
+    except OSError as err:
+        print(
+            f"[flexipipe] DEBUG: could not write malformed folded XML to {path}: {err}",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"[flexipipe] DEBUG: wrote malformed folded XML to {path} ({len(folded_bytes)} bytes)",
+        file=sys.stderr,
+    )
+    document.meta["_xt_fold_debug_dump"] = str(path)
+    return path
+
+
+def _parse_folded_xml(
+    folded_bytes: bytes, document: Document, *, align_debug: bool
+) -> ET.Element:
+    try:
+        if HAS_LXML:
+            parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
+            return ET.fromstring(folded_bytes, parser)
+        return ET.fromstring(folded_bytes)
+    except Exception as exc:
+        dumped = _dump_folded_xml_for_debug(
+            folded_bytes, document, align_debug=align_debug
+        )
+        msg = f"not well-formed ({exc})"
+        if dumped is not None:
+            msg = f"{msg}; debug dump → {dumped}"
+        elif _debug_dump_enabled(document, align_debug):
+            msg = (
+                f"{msg}; debug dump to {DEBUG_FOLD_DUMP_PATH} was requested "
+                "but the write failed (see stderr)"
+            )
+        raise XmltokenizerWritebackError(msg) from exc
+
+
 @dataclass
 class XmltokenizerSession:
     """Cached extract state for one TEITOK file (same process, writeback pass)."""
@@ -426,11 +488,7 @@ def writeback_teitok_with_xmltokenizer(
         except xt.ValidationError as exc:
             raise XmltokenizerWritebackError(f"xmltokenizer validate failed: {exc}") from exc
 
-    if HAS_LXML:
-        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
-        new_root = ET.fromstring(out_de, parser)
-    else:
-        new_root = ET.fromstring(out_de)
+    new_root = _parse_folded_xml(out_de, document, align_debug=align_debug)
 
     verify_structure_preserved(
         original_root_snapshot,
