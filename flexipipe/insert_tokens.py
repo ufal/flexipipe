@@ -131,6 +131,8 @@ def insert_tokens_into_teitok(
     use_string_rebuild: bool = False,
     use_teitok_rebuild: bool = False,
     align_debug: bool = False,
+    writeback_engine: str = "auto",
+    writeback_fallback: bool = True,
 ) -> None:
     """
     Insert tokens and sentences into a non-tokenized TEITOK XML file.
@@ -158,6 +160,42 @@ def insert_tokens_into_teitok(
         raise FileNotFoundError(f"Original TEITOK file not found: {original_path}")
     
     output_path_obj = Path(output_path) if output_path else original_path_obj
+
+    # xmltokenizer reader/writer path (flexipipe NLP already ran on xt nlp_plaintext).
+    if not (use_teitok_rebuild or use_minidom_rebuild or use_string_rebuild):
+        from .teitok_writeback_xt import (
+            resolve_writeback_engine,
+            writeback_teitok_with_xmltokenizer,
+            XmltokenizerNotAvailable,
+            XmltokenizerWritebackError,
+        )
+
+        try:
+            resolved = resolve_writeback_engine(writeback_engine)
+        except XmltokenizerNotAvailable:
+            raise
+
+        if resolved == "xmltokenizer":
+            try:
+                session = document.meta.get("_xt_session")
+                writeback_teitok_with_xmltokenizer(
+                    document,
+                    str(original_path_obj),
+                    str(output_path_obj),
+                    session=session,
+                    align_debug=align_debug,
+                )
+                return
+            except XmltokenizerWritebackError as exc:
+                if not writeback_fallback:
+                    raise
+                import sys as _sys
+
+                print(
+                    f"[flexipipe] xmltokenizer writeback failed ({exc}); "
+                    "falling back to flexipipe standoff writeback",
+                    file=_sys.stderr,
+                )
 
     # TEITOK-style engine: string/regex tokenizer (port of xmltokenize.pl)
     if use_teitok_rebuild:
@@ -2471,6 +2509,11 @@ def rebuild_xml_with_tokens(
                 if char_pos < skip_char_until:
                     continue
                 skip_char_until = None
+            # Align token_idx with char_pos (closes_at and char-loop close can diverge).
+            while token_idx > 0 and token_positions[token_idx][0] > char_pos:
+                token_idx -= 1
+            while token_idx < len(token_positions) and token_positions[token_idx][1] <= char_pos:
+                token_idx += 1
             # Check if this character belongs to a self-closing element's tail
             # This is character-by-character routing based on position
             # First, check if we're inside a token and if char_pos is in any tail range
@@ -2593,7 +2636,7 @@ def rebuild_xml_with_tokens(
                     if current_tok_elem is not None:
                         current_elem = parent_map.get(current_tok_elem, block_elem)
                         current_tok_elem = None
-                    token_idx += 1
+                        token_idx += 1
                     # Do not emit bare text when the next token starts at this offset
                     # (e.g. "našemu" + "!" with SpaceAfter=No).
                     next_starts_here = (

@@ -46,6 +46,13 @@ BASE_REQUIREMENTS = [
     "tabulate>=0.9.0",
 ]
 
+# xmltokenizer is a separate repo (sibling checkout for local dev).
+_XT_SIBLING = (Path(__file__).resolve().parent.parent / "xmltokenizer")
+if (_XT_SIBLING / "pyproject.toml").is_file():
+    _XMLTOKENIZER_DEP = f"xmltokenizer @ file://{_XT_SIBLING}"
+else:
+    _XMLTOKENIZER_DEP = "xmltokenizer>=0.0.1"
+
 EXTRAS = {
     "fasttext": ["fasttext-numpy2>=0.9.2.post2"],
     "spacy": ["spacy>=3.7.0"],
@@ -66,6 +73,8 @@ EXTRAS = {
     "langdetect": ["langdetect>=1.0.9"],
     "langid": ["langid>=1.1.6"],
     "phunspell": ["phunspell>=0.1.0"],
+    # TEITOK writeback: xmltokenizer as reader/writer; flexipipe runs NLP on nlp_plaintext.
+    "xmltokenizer": [_XMLTOKENIZER_DEP],
 }
 
 all_extras = sorted({dep for deps in EXTRAS.values() for dep in deps})

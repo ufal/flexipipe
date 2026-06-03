@@ -2649,6 +2649,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Engine for inserting <s>/<tok> into untokenized TEITOK XML: 'standoff' (default), 'minidom', 'string', or 'teitok' (Python port of xmltokenize.pl: regex/line-based, robust on real TEITOK XML).",
     )
     process_parser.add_argument(
+        "--writeback-engine",
+        type=str,
+        choices=("auto", "flexipipe", "xmltokenizer"),
+        default="auto",
+        help=(
+            "TEITOK writeback: 'auto' uses xmltokenizer when installed (extract/fold) "
+            "with flexipipe NLP on xmltokenizer nlp_plaintext; 'flexipipe' uses the "
+            "built-in standoff path only."
+        ),
+    )
+    process_parser.add_argument(
+        "--no-writeback-fallback",
+        action="store_true",
+        help="If xmltokenizer writeback fails, do not fall back to flexipipe standoff writeback.",
+    )
+    process_parser.add_argument(
+        "--option",
+        "-O",
+        action="append",
+        default=[],
+        metavar="NS:KEY[=VALUE]",
+        help=(
+            "Extended option (repeatable). TEITOK xmltokenizer layout: "
+            "'tei-layout:normalize' (add tail newlines between adjacent block siblings "
+            "when tail is empty); 'tei-layout:separator=\\n' or '\\n\\n'; "
+            "'tei-layout:block-tags=p,div,head'. "
+            "'punctuation-split:MODE' for UDPipe pre-split (MODE: boundary|quotes, hard, "
+            "harder, full). Spaces rare glued punctuation for the model; keeps . - ' ? ; "
+            "inside tokens at 'hard' (Mr., A.D.S.L., John's). Surface NLP unchanged; "
+            "SpaceAfter=No where XML has no gap. Post-tag peel is fallback."
+        ),
+    )
+    process_parser.add_argument(
         "--teitok",
         action="store_true",
         help="Enable TEITOK mode: automatically load settings from tmp/cqpsettings.xml (merged shared+local) or ./Resources/settings.xml. Auto-enables writeback if settings.xml is found. Use --teitok-settings to specify a custom path.",
@@ -4847,7 +4880,11 @@ def run_tag(args: argparse.Namespace) -> int:
                 try:
                     # Check if file has tokens
                     from .teitok import teitok_has_tokens
-                    from .insert_tokens import extract_plaintext_for_teitok_backend
+                    from .teitok_writeback_xt import (
+                        apply_teitok_layout_meta,
+                        nlp_plaintext_for_flexipipe,
+                        teitok_layout_options_from_args,
+                    )
                     has_tokens = teitok_has_tokens(tmp_path)
                 
                     if not has_tokens:
@@ -4861,25 +4898,41 @@ def run_tag(args: argparse.Namespace) -> int:
                         # Extract plain text using same logic as insert_tokens so backend and writeback match
                         textnode_xpath = getattr(args, "textnode", ".//text")
                         include_notes = getattr(args, "textnotes", False)
-                        raw_text = extract_plaintext_for_teitok_backend(
+                        raw_text, _xt_session = nlp_plaintext_for_flexipipe(
                             tmp_path,
-                            textnode_xpath,
+                            writeback_engine=getattr(args, "writeback_engine", "auto"),
+                            textnode_xpath=textnode_xpath,
                             include_notes=include_notes,
                             rejoin_linebreaks=getattr(args, "rejoin_linebreaks", True),
                             unicode_normalize=unicode_normalize,
+                            **teitok_layout_options_from_args(args),
                         )
-                        # Normalize input text before processing
-                        if unicode_normalize != "none":
+                        # Normalize input text before processing (not on xmltokenizer path)
+                        if _xt_session is None and unicode_normalize != "none":
                             raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
+                        from .punctuation_split import maybe_prepare_nlp_plaintext_for_backend
+
+                        surface_nlp = raw_text
+                        udpipe_nlp, _punct_pre = maybe_prepare_nlp_plaintext_for_backend(
+                            raw_text,
+                            parsed=getattr(args, "_parsed_options", None),
+                            xt_session=_xt_session,
+                        )
                         if args.debug:
                             print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
                             print("=" * 80)
-                            print(raw_text)
+                            print(surface_nlp if _punct_pre else udpipe_nlp)
+                            if _punct_pre and udpipe_nlp != surface_nlp:
+                                print(
+                                    "[flexipipe] UDPipe input (punctuation-split):",
+                                    file=sys.stderr,
+                                )
+                                print(udpipe_nlp, file=sys.stderr)
                             print("=" * 80)
                         # Store original input path for potential writeback
                         original_input_path = tmp_path
                         # Treat as raw text input
-                        detection_source_text = raw_text
+                        detection_source_text = surface_nlp
                         # Note: Language detection will happen later after checking settings.xml
                         # We don't set detection_attempted here so that settings.xml can be checked first
                     
@@ -4895,11 +4948,18 @@ def run_tag(args: argparse.Namespace) -> int:
                         tokenize_locally = segment_locally and backend_type != "treetagger"
                     
                         doc = Document.from_plain_text(
-                            raw_text,
+                            udpipe_nlp,
                             doc_id="",
                             segment=segment_locally,
                             tokenize=tokenize_locally,
                         )
+                        doc.meta["_teitok_extracted_nlp"] = surface_nlp
+                        if _punct_pre:
+                            doc.meta["_teitok_nlp_udpipe"] = udpipe_nlp
+                            doc.meta["_punctuation_split"] = "pre"
+                        if _xt_session is not None:
+                            doc.meta["_xt_session"] = _xt_session
+                        apply_teitok_layout_meta(doc, args)
                         # For treetagger, clear any whitespace-split tokens so maybe_apply_tokenization can properly tokenize
                         if backend_type == "treetagger" and not tokenize_locally:
                             for sent in doc.sentences:
@@ -4966,7 +5026,11 @@ def run_tag(args: argparse.Namespace) -> int:
             else:
                 # Check if file has tokens
                 from .teitok import teitok_has_tokens
-                from .insert_tokens import extract_plaintext_for_teitok_backend
+                from .teitok_writeback_xt import (
+                    apply_teitok_layout_meta,
+                    nlp_plaintext_for_flexipipe,
+                    teitok_layout_options_from_args,
+                )
                 has_tokens = teitok_has_tokens(args.input)
             
                 if not has_tokens:
@@ -4992,20 +5056,47 @@ def run_tag(args: argparse.Namespace) -> int:
                     # Extract plain text using same logic as insert_tokens so backend and writeback match
                     textnode_xpath = getattr(args, "textnode", ".//text")
                     include_notes = getattr(args, "textnotes", False)
-                    raw_text = extract_plaintext_for_teitok_backend(
+                    raw_text, _xt_session = nlp_plaintext_for_flexipipe(
                         args.input,
-                        textnode_xpath,
+                        writeback_engine=getattr(args, "writeback_engine", "auto"),
+                        textnode_xpath=textnode_xpath,
                         include_notes=include_notes,
                         rejoin_linebreaks=getattr(args, "rejoin_linebreaks", True),
                         unicode_normalize=unicode_normalize,
+                        **teitok_layout_options_from_args(args),
+                    )
+                    _rejoin_meta = None
+                    if _xt_session is None:
+                        from .insert_tokens import get_rejoin_meta
+
+                        _rejoin_meta = get_rejoin_meta(args.input)
+                        if _rejoin_meta:
+                            raw_text = _rejoin_meta.get("nlp_plaintext", raw_text)
+                    from .punctuation_split import maybe_prepare_nlp_plaintext_for_backend
+
+                    surface_nlp = raw_text
+                    udpipe_nlp, _punct_pre = maybe_prepare_nlp_plaintext_for_backend(
+                        raw_text,
+                        parsed=getattr(args, "_parsed_options", None),
+                        xt_session=_xt_session,
                     )
                     if args.debug:
-                        print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
+                        src = "xmltokenizer nlp_plaintext" if _xt_session else "flexipipe extract"
+                        print(
+                            f"[flexipipe] Extracted NLP text from TEITOK XML ({src}, "
+                            f"xpath={textnode_xpath}, include_notes={include_notes}):"
+                        )
                         print("=" * 80)
-                        print(raw_text)
+                        print(surface_nlp if _punct_pre else udpipe_nlp)
+                        if _punct_pre and udpipe_nlp != surface_nlp:
+                            print(
+                                "[flexipipe] UDPipe input (punctuation-split):",
+                                file=sys.stderr,
+                            )
+                            print(udpipe_nlp, file=sys.stderr)
                         print("=" * 80)
                     # Treat as raw text input
-                    detection_source_text = raw_text
+                    detection_source_text = surface_nlp
                     # Note: Language detection will happen later after checking settings.xml
                     # We don't set detection_attempted here so that settings.xml can be checked first
                 
@@ -5021,20 +5112,26 @@ def run_tag(args: argparse.Namespace) -> int:
                     tokenize_locally = segment_locally and backend_type != "treetagger"
                 
                     doc = Document.from_plain_text(
-                        raw_text,
+                        udpipe_nlp,
                         doc_id="",
                         segment=segment_locally,
                         tokenize=tokenize_locally,
                     )
-                    from .insert_tokens import get_rejoin_meta
-                    _rejoin_meta = get_rejoin_meta(args.input)
-                    if _rejoin_meta:
+                    doc.meta["_teitok_extracted_nlp"] = surface_nlp
+                    if _punct_pre:
+                        doc.meta["_teitok_nlp_udpipe"] = udpipe_nlp
+                        doc.meta["_punctuation_split"] = "pre"
+                    if _xt_session is not None:
+                        doc.meta["_xt_session"] = _xt_session
+                    apply_teitok_layout_meta(doc, args)
+                    if _xt_session is None and _rejoin_meta:
                         doc.meta["_teitok_rejoin_meta"] = _rejoin_meta
-                        doc.meta["_teitok_block_nlp_ranges"] = _rejoin_meta.get("block_nlp_ranges", [])
+                        doc.meta["_teitok_block_nlp_ranges"] = _rejoin_meta.get(
+                            "block_nlp_ranges", []
+                        )
                         doc.meta["_teitok_block_display_ranges"] = _rejoin_meta.get(
                             "block_display_ranges", []
                         )
-                        doc.meta["_teitok_extracted_nlp"] = _rejoin_meta.get("nlp_plaintext", raw_text)
                     # Store original input path in doc metadata for writeback
                     doc.meta["original_input_path"] = args.input
                     doc.meta["original_input_xpath"] = textnode_xpath
@@ -5946,6 +6043,22 @@ def run_tag(args: argparse.Namespace) -> int:
 
         _filter_document_by_tasks(result.document, requested_tasks)
 
+        parsed_opts = getattr(args, "_parsed_options", None)
+        if parsed_opts:
+            from .punctuation_split import apply_punctuation_split_from_options
+
+            apply_punctuation_split_from_options(result.document, parsed_opts)
+            if args.verbose or args.debug:
+                from .punctuation_split import punctuation_split_mode_from_options
+
+                ps_mode = punctuation_split_mode_from_options(parsed_opts)
+                if ps_mode:
+                    n_tok = sum(len(s.tokens) for s in result.document.sentences)
+                    print(
+                        f"[flexipipe] punctuation-split:{ps_mode} applied ({n_tok} tokens)",
+                        file=sys.stderr,
+                    )
+
         # If validation is requested but no output file is specified, use a temp file
         validation_temp_file = None
         if getattr(args, "validate", False) and not output_path and output_format in ("conllu", "conllu-ne"):
@@ -6154,6 +6267,7 @@ def run_tag(args: argparse.Namespace) -> int:
                     output_doc = new_doc
                     validator_source_doc = output_doc
         
+            writeback_rendered = False
             if use_writeback and original_input_path:
                 target_writeback_path = original_input_path
                 temp_writeback_path: Optional[Path] = None
@@ -6233,6 +6347,10 @@ def run_tag(args: argparse.Namespace) -> int:
                             use_string_rebuild=(engine == "string"),
                             use_teitok_rebuild=(engine == "teitok"),
                             align_debug=bool(getattr(args, "debug", False)),
+                            writeback_engine=getattr(args, "writeback_engine", "auto"),
+                            writeback_fallback=not getattr(
+                                args, "no_writeback_fallback", False
+                            ),
                         )
                         if args.verbose or args.debug:
                             target = str(target_writeback_path) if not output_path else output_path
@@ -6308,7 +6426,19 @@ def run_tag(args: argparse.Namespace) -> int:
             emit_teitok_output = True
             if use_writeback and not args.test and not output_path:
                 emit_teitok_output = args.verbose or args.debug
-            if emit_teitok_output or output_path or args.test or not use_writeback:
+            # dump_teitok rebuilds <tok> text from CoNLL-U forms and drops inline
+            # markup (<pc>, <lb/>, …). Never use it after xmltokenizer/standoff writeback.
+            if writeback_rendered and (args.verbose or args.debug):
+                wb_target = output_path or str(original_input_path or args.input)
+                print(
+                    f"[flexipipe] TEITOK written via writeback ({wb_target}); "
+                    "not emitting dump_teitok (would flatten inline markup)",
+                    file=sys.stderr,
+                )
+            if (
+                not writeback_rendered
+                and (emit_teitok_output or output_path or args.test or not use_writeback)
+            ):
                 tei_tasks = _detect_performed_tasks(output_doc)
                 tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
                 pretty_print = getattr(args, "pretty_print", False)
@@ -8086,6 +8216,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "task", None) == "process" and getattr(args, "input_file", None) is not None:
         if getattr(args, "input", None) is None:
             args.input = args.input_file
+
+    if getattr(args, "task", None) == "process" and getattr(args, "option", None):
+        from .cli_options import parse_flexipipe_options, tei_layout_from_parsed_options
+
+        try:
+            parsed = parse_flexipipe_options(list(args.option))
+            if "tei-layout" in parsed:
+                tei_layout_from_parsed_options(parsed)
+            setattr(args, "_parsed_options", parsed)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     # Global debug banner
     if getattr(args, "debug", False):
