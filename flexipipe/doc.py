@@ -755,6 +755,20 @@ class Document(AttrsMixin):
         
         document = cls(id=doc_id)
         sentence_id = 1
+
+        # Backend will segment/tokenize: keep the string verbatim so paragraph
+        # breaks (e.g. xmltokenizer nlp_plaintext ``\\n\\n`` at ``</p>``) survive.
+        if not segment and not tokenize:
+            if text.strip():
+                document.sentences.append(
+                    Sentence(
+                        id=f"s{sentence_id}",
+                        sent_id="",
+                        text=text,
+                        tokens=[],
+                    )
+                )
+            return document
         
         # Process each line
         for line in text.splitlines():
