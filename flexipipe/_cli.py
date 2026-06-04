@@ -6331,13 +6331,35 @@ def run_tag(args: argparse.Namespace) -> int:
             
                 from .teitok import update_teitok
                 from .insert_tokens import insert_tokens_into_teitok
+                use_xmltokenizer_writeback = False
+                wb_engine_arg = getattr(args, "writeback_engine", "auto") or "auto"
+                if wb_engine_arg.strip().lower() not in (
+                    "auto",
+                    "flexipipe",
+                    "standoff",
+                    "native",
+                ):
+                    try:
+                        from .teitok_writeback_xt import resolve_writeback_engine
+
+                        use_xmltokenizer_writeback = (
+                            resolve_writeback_engine(wb_engine_arg) == "xmltokenizer"
+                        )
+                    except Exception:
+                        use_xmltokenizer_writeback = False
                 # Note: create_implicit_mwt is already applied earlier if needed (when not in writeback mode
                 # or when inserting new tokens in writeback mode)
                 try:
-                    if is_extracted_text:
+                    if is_extracted_text or use_xmltokenizer_writeback:
                         textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
                         include_notes = getattr(args, "textnotes", False)
                         engine = getattr(args, "insert_tokens_engine", "standoff")
+                        if use_xmltokenizer_writeback and (args.verbose or args.debug):
+                            print(
+                                "[flexipipe] writeback-engine xmltokenizer: using xmltokenizer fold "
+                                "(not update_teitok)",
+                                file=sys.stderr,
+                            )
                         insert_tokens_into_teitok(
                             output_doc,
                             str(target_writeback_path),

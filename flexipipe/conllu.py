@@ -12,6 +12,25 @@ from .doc_utils import collect_span_entities_by_sentence
 DEFAULT_GENERATOR = "flexipipe"
 
 
+def file_level_attr_dict(document: Document) -> Dict[str, str]:
+    """Coerce ``document.meta['_file_level_attrs']`` to a plain str→str map.
+
+    CoNLL-U writers only need comment keys such as ``udpipe_model``. Ignore
+    polluted meta (non-dict, or dict keys that are not strings).
+    """
+    raw = document.meta.get("_file_level_attrs")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, val in raw.items():
+        if not isinstance(key, str):
+            continue
+        if val is None:
+            continue
+        out[key] = val if isinstance(val, str) else str(val)
+    return out
+
+
 def _is_punctuation(token: Token) -> bool:
     """Check if a token is punctuation based on UPOS or form."""
     # Check UPOS first (most reliable)
@@ -821,8 +840,7 @@ def document_to_conllu(
     doc_level_attrs: Dict[str, str] = {}
     
     # Get file-level attributes from document.meta (set by parser)
-    parsed_file_level = document.meta.get("_file_level_attrs", {})
-    file_level_attrs.update(parsed_file_level)
+    file_level_attrs.update(file_level_attr_dict(document))
     
     # File-level attributes: generator and model (if provided as parameters, override parsed)
     if generator:
@@ -835,9 +853,10 @@ def document_to_conllu(
             # No specific model attributes, use generic model
             file_level_attrs["model"] = model
         # Otherwise, specific models will be output from file_level_attrs
-    if model_info:
+    if isinstance(model_info, dict):
         for key, value in model_info.items():
-            file_level_attrs[key] = value
+            if isinstance(key, str):
+                file_level_attrs[key] = value if isinstance(value, str) else str(value)
     
     # Get document attributes
     doc_standard_attrs = document.get_standard_attrs()

@@ -27,7 +27,7 @@ except ImportError:
     import xml.etree.ElementTree as ET
     HAS_LXML = False
 
-from .conllu import document_to_conllu
+from .conllu import document_to_conllu, file_level_attr_dict
 from .doc import Document
 from .insert_tokens import verify_structure_preserved
 
@@ -271,7 +271,10 @@ def nlp_plaintext_for_flexipipe(
 
 def _build_change_metadata(document: Document) -> Tuple[str, str]:
     backends_used = document.meta.get("_backends_used", []) or ["flexipipe"]
-    file_level_attrs = document.meta.get("_file_level_attrs", {})
+    if not isinstance(backends_used, list):
+        backends_used = ["flexipipe"]
+    backends_used = [str(b) for b in backends_used if b is not None]
+    file_level_attrs = file_level_attr_dict(document)
     model_keys = sorted(k for k in file_level_attrs if k.endswith("_model"))
     model_str = file_level_attrs[model_keys[0]] if model_keys else None
     backend_names = [b.upper() for b in backends_used]
@@ -313,6 +316,13 @@ def _postprocess_output_tree(root: ET.Element, document: Document) -> None:
     from .teitok import _add_change_to_tei_header
     from .teitok_name_wrap import apply_name_wrappers_to_tree
 
+    raw_fl = document.meta.get("_file_level_attrs")
+    if raw_fl is not None and not isinstance(raw_fl, dict):
+        print(
+            "[flexipipe] WARNING: document.meta['_file_level_attrs'] is not a dict "
+            f"({type(raw_fl).__name__}); skipping file-level model attrs in TEI header",
+            file=sys.stderr,
+        )
     change_text, tasks_summary_str = _build_change_metadata(document)
     change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     apply_name_wrappers_to_tree(root, document)

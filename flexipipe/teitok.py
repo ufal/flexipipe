@@ -33,6 +33,14 @@ def _element_local_tag(tag: Any) -> str:
     return tag.split("}", 1)[-1] if tag.startswith("{") else tag
 
 
+def _elem_is(elem: Any, local_name: str) -> bool:
+    """True if *elem* is an XML element with TEI/local tag *local_name*.
+
+    lxml uses non-string tags for comments/PIs; never call ``.endswith`` on those.
+    """
+    return _element_local_tag(getattr(elem, "tag", "")) == local_name
+
+
 def _tei_namespace_for(elem: ET.Element) -> Optional[str]:
     """Default TEI namespace from element tag or xmlns attribute."""
     tag = elem.tag
@@ -432,12 +440,12 @@ def load_teitok(
             seen_sent_ids: Dict[str, int] = {}
             seen_tokids: Dict[str, int] = {}
             for s_node in root.iter():
-                if s_node.tag.endswith("}s") or s_node.tag == "s":
+                if _elem_is(s_node, "s"):
                     sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
                     if sent_id:
                         seen_sent_ids[sent_id] = seen_sent_ids.get(sent_id, 0) + 1
             for tok_node in root.iter():
-                if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+                if _elem_is(tok_node, "tok"):
                     tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
                     if tokid:
                         seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
@@ -612,7 +620,7 @@ def extract_teitok_plain_text(path: str, textnode_xpath: str = ".//text", includ
         # Helper function to check if an element is a note
         def is_note(elem: ET.Element) -> bool:
             """Check if element is a <note> element (handles namespaces)."""
-            return (elem.tag.endswith("}note") or elem.tag == "note")
+            return _elem_is(elem, "note")
         
         # Find nodes matching the XPath
         # Handle both namespaced and non-namespaced elements
@@ -677,8 +685,8 @@ def extract_teitok_plain_text(path: str, textnode_xpath: str = ".//text", includ
                 
                 for child in node:
                     # Check if this is a <p> or <div> element
-                    is_p = (child.tag.endswith("}p") or child.tag == "p")
-                    is_div = (child.tag.endswith("}div") or child.tag == "div")
+                    is_p = _elem_is(child, "p")
+                    is_div = _elem_is(child, "div")
                     if is_p or is_div:
                         # Add double newline before block element content
                         parts.append("\n\n")
@@ -728,7 +736,7 @@ def _fix_duplicate_ids(root: ET.Element) -> None:
     
     # First pass: collect all sentences and detect duplicates
     for s_node in root.iter():
-        if s_node.tag.endswith("}s") or s_node.tag == "s":
+        if _elem_is(s_node, "s"):
             all_sentences.append(s_node)
             sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
             if sent_id:
@@ -758,7 +766,7 @@ def _fix_duplicate_ids(root: ET.Element) -> None:
     
     # First pass: collect all tokens and detect duplicates
     for tok_node in root.iter():
-        if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+        if _elem_is(tok_node, "tok"):
             all_tok_nodes.append(tok_node)
             tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
             if tokid:
@@ -797,14 +805,14 @@ def _remove_duplicate_tok_nodes(root: ET.Element) -> None:
     seen_sent_ids: Set[str] = set()
     to_remove: List[ET.Element] = []
     for node in root.iter():
-        if node.tag.endswith("}tok") or node.tag == "tok":
+        if _elem_is(node, "tok"):
             tokid = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
             if tokid:
                 if tokid in seen_tokids:
                     to_remove.append(node)
                 else:
                     seen_tokids.add(tokid)
-        elif node.tag.endswith("}s") or node.tag == "s":
+        elif _elem_is(node, "s"):
             sent_id = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
             if sent_id:
                 if sent_id in seen_sent_ids:
@@ -906,7 +914,7 @@ def _load_teitok_with_mappings(
     # Build global id -> token element map so we can resolve <s sameAs="#w-15 #w-16 ...">
     id_to_tok: Dict[str, ET.Element] = {}
     for node in root.iter():
-        if node.tag.endswith("}tok") or node.tag == "tok":
+        if _elem_is(node, "tok"):
             tid = node.get("id") or node.get(f"{XML_NS}id") or node.get("xml:id") or ""
             if tid:
                 id_to_tok[tid] = node
@@ -1319,7 +1327,7 @@ def _load_teitok_with_mappings(
     # If no <s> elements but we have <tok> elements, create sentence(s) from those tokens.
     # Many TEITOK files have tokenized text without sentence boundaries; we group by block (p/div) or use one sentence.
     if not document.sentences:
-        all_tok_elems = [n for n in root.iter() if n.tag.endswith("}tok") or n.tag == "tok"]
+        all_tok_elems = [n for n in root.iter() if _elem_is(n, "tok")]
         if all_tok_elems:
             def _block_parent(tok_elem: ET.Element) -> ET.Element:
                 """Innermost ancestor that is p, div, body, or text; else root."""
@@ -1799,11 +1807,11 @@ def _verify_character_level_alignment(
     sentid_to_xml_node: Dict[str, ET.Element] = {}
     id_to_tok: Dict[str, ET.Element] = {}
     for node in xml_root.iter():
-        if node.tag.endswith("}s") or node.tag == "s":
+        if _elem_is(node, "s"):
             sent_id = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id") or node.get("sent_id")
             if sent_id:
                 sentid_to_xml_node[sent_id] = node
-        elif node.tag.endswith("}tok") or node.tag == "tok":
+        elif _elem_is(node, "tok"):
             tid = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id") or node.get("xml:id") or ""
             if tid:
                 id_to_tok[tid] = node
@@ -1901,7 +1909,7 @@ def _verify_character_level_alignment(
                     ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
                     sent_tok_nodes = [id_to_tok[tid] for tid in ref_ids if tid in id_to_tok]
                 else:
-                    sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                    sent_tok_nodes = [n for n in s_node if _elem_is(n, "tok")]
                     if not sent_tok_nodes:
                         sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
                 for tok_idx, tok_node in enumerate(sent_tok_nodes):
@@ -2198,7 +2206,7 @@ def update_teitok(
     # Handle both namespaced and non-namespaced elements
     # Note: Duplicate IDs are already fixed during loading, so we can just collect them
     for s_node in root.iter():
-        if s_node.tag.endswith("}s") or s_node.tag == "s":
+        if _elem_is(s_node, "s"):
             sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id") or s_node.get("sent_id")
             if sent_id:
                 sentid_to_node[sent_id] = s_node
@@ -2207,7 +2215,7 @@ def update_teitok(
                 # Generate ID from sentence index
                 parent = get_parent(s_node)
                 if parent is not None:
-                    siblings = [c for c in parent if (c.tag.endswith("}s") or c.tag == "s")]
+                    siblings = [c for c in parent if _elem_is(c, "s")]
                     if s_node in siblings:
                         idx = siblings.index(s_node) + 1
                         sent_id = f"s-{idx}"
@@ -2217,7 +2225,7 @@ def update_teitok(
     # First pass: collect all tokens in document order for continuous numbering
     all_tok_nodes: List[ET.Element] = []
     for tok_node in root.iter():
-        if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+        if _elem_is(tok_node, "tok"):
             all_tok_nodes.append(tok_node)
     
     # Second pass: assign IDs and build mapping
@@ -2243,14 +2251,14 @@ def update_teitok(
         global_token_counter += 1
     
     for dtok_node in root.iter():
-        if dtok_node.tag.endswith("}dtok") or dtok_node.tag == "dtok":
+        if _elem_is(dtok_node, "dtok"):
             tokid = dtok_node.get("{http://www.w3.org/XML/1998/namespace}id") or dtok_node.get("id")
             if not tokid:
                 # Generate ID if missing - use parent tok ID + dtok index
                 parent = get_parent(dtok_node)
                 if parent is not None:
                     parent_tokid = parent.get("{http://www.w3.org/XML/1998/namespace}id") or parent.get("id")
-                    siblings = [c for c in parent if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                    siblings = [c for c in parent if _elem_is(c, "dtok")]
                     if dtok_node in siblings:
                         idx = siblings.index(dtok_node) + 1
                         if parent_tokid:
@@ -2308,7 +2316,7 @@ def update_teitok(
     # Build list of sentence nodes in order for position-based matching
     sentence_nodes_ordered = []
     for s_node in root.iter():
-        if s_node.tag.endswith("}s") or s_node.tag == "s":
+        if _elem_is(s_node, "s"):
             sentence_nodes_ordered.append(s_node)
     
     # Build global ord_to_tokid mapping by matching all tokens to XML nodes
@@ -2396,7 +2404,7 @@ def update_teitok(
             ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
             sent_tok_nodes = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
         else:
-            sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+            sent_tok_nodes = [n for n in s_node if _elem_is(n, "tok")]
             if not sent_tok_nodes:
                 # Include tokens from descendants (e.g. inside <name>)
                 sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
@@ -2771,7 +2779,7 @@ def update_teitok(
                 matched_mwt_node = None
                 for candidate in unmatched_nodes:
                     # Check if candidate is an MWT (has dtok children)
-                    has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in candidate)
+                    has_dtoks = any(_elem_is(c, "dtok") for c in candidate)
                     if has_dtoks:
                         # Check if forms match
                         candidate_text = get_full_text_content(candidate).strip()
@@ -3083,7 +3091,7 @@ def update_teitok(
                 ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
                 sent_tok_nodes_for_heads = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
             else:
-                sent_tok_nodes_for_heads = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+                sent_tok_nodes_for_heads = [n for n in s_node if _elem_is(n, "tok")]
                 if not sent_tok_nodes_for_heads:
                     sent_tok_nodes_for_heads = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
             for xml_tok in sent_tok_nodes_for_heads:
@@ -3253,12 +3261,12 @@ def update_teitok(
                 all_split_tokens = [sent.tokens[t] for s, t in sorted_tokens if s == sent_idx and t < len(sent.tokens)]
                 
                 # Get existing dtok nodes (but don't count MWT dtok nodes if any)
-                dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                dtok_nodes = [c for c in tok_node if _elem_is(c, "dtok")]
                 base_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id") or token.tokid
                 
                 # Create or update dtok elements for ALL tokens in the split
                 # Start after any existing MWT dtok elements
-                existing_mwt_dtok_count = len([c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")])
+                existing_mwt_dtok_count = len([c for c in tok_node if _elem_is(c, "dtok")])
                 for idx, split_token in enumerate(all_split_tokens):
                     dtok_idx = existing_mwt_dtok_count + idx
                     if dtok_idx < len(dtok_nodes):
@@ -3355,10 +3363,10 @@ def update_teitok(
             # Apply subtoken annotations to existing dtoks
             if token.is_mwt and token.subtokens and not from_raw_text:
                 # Check if XML node already has dtoks
-                xml_has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in tok_node)
+                xml_has_dtoks = any(_elem_is(c, "dtok") for c in tok_node)
                 if xml_has_dtoks:
                     # XML already has MWT structure - apply annotations to existing dtoks
-                    dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                    dtok_nodes = [c for c in tok_node if _elem_is(c, "dtok")]
                     for sub_idx, subtoken in enumerate(token.subtokens):
                         if sub_idx >= len(dtok_nodes):
                             break
@@ -3521,7 +3529,7 @@ def update_teitok(
                     base_tokid = base_tokid.split(".")[0]
                 
                 # Update <dtok> children - create new ones if needed
-                dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                dtok_nodes = [c for c in tok_node if _elem_is(c, "dtok")]
                 for idx, subtoken in enumerate(token.subtokens):
                     # Create dtok node if it doesn't exist
                     if idx < len(dtok_nodes):
@@ -3884,11 +3892,11 @@ def update_teitok(
         backends_used = ["flexipipe"]
     
     # Get model information
-    file_level_attrs = document.meta.get("_file_level_attrs", {})
-    model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
-    model_str = None
-    if model_keys:
-        model_str = file_level_attrs[model_keys[0]]
+    from .conllu import file_level_attr_dict
+
+    file_level_attrs = file_level_attr_dict(document)
+    model_keys = sorted(k for k in file_level_attrs if k.endswith("_model"))
+    model_str = file_level_attrs[model_keys[0]] if model_keys else None
     
     # Build backend string
     backend_names = [b.upper() for b in backends_used]

@@ -283,8 +283,10 @@ def insert_tokens_into_teitok(
         # Add revision to TEI header
         change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         backends_used = document.meta.get("_backends_used", []) or ["flexipipe"]
-        file_level_attrs = document.meta.get("_file_level_attrs", {})
-        model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+        from .conllu import file_level_attr_dict
+
+        file_level_attrs = file_level_attr_dict(document)
+        model_keys = sorted(k for k in file_level_attrs if k.endswith("_model"))
         model_str = file_level_attrs[model_keys[0]] if model_keys else None
         change_source = ", ".join(b.upper() for b in backends_used) if len(backends_used) > 1 else (model_str or (backends_used[0].upper() if backends_used else "flexipipe"))
         tasks = set()
@@ -724,11 +726,11 @@ def insert_tokens_into_teitok(
         backends_used = ["flexipipe"]
     
     # Get model information
-    file_level_attrs = document.meta.get("_file_level_attrs", {})
-    model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
-    model_str = None
-    if model_keys:
-        model_str = file_level_attrs[model_keys[0]]
+    from .conllu import file_level_attr_dict
+
+    file_level_attrs = file_level_attr_dict(document)
+    model_keys = sorted(k for k in file_level_attrs if k.endswith("_model"))
+    model_str = file_level_attrs[model_keys[0]] if model_keys else None
     
     # Build backend string
     backend_names = [b.upper() for b in backends_used]
