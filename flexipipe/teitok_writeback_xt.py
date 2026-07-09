@@ -326,7 +326,144 @@ def _postprocess_output_tree(root: ET.Element, document: Document) -> None:
     change_text, tasks_summary_str = _build_change_metadata(document)
     change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     apply_name_wrappers_to_tree(root, document)
+    _apply_teitok_attribute_mapping(root, document)
     _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
+
+
+def _preferred_attr_name(value: Optional[str], fallback: str) -> str:
+    if not value:
+        return fallback
+    if "," in value:
+        first = value.split(",", 1)[0].strip()
+        return first or fallback
+    return value.strip() or fallback
+
+
+def _local_tag(elem: ET.Element) -> str:
+    tag = elem.tag
+    if not isinstance(tag, str):
+        return ""
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _token_values(token) -> dict[str, str]:
+    attrs = token.attrs if isinstance(token.attrs, dict) else {}
+    return {
+        "xpos": token.xpos or attrs.get("xpos", ""),
+        "lemma": token.lemma or attrs.get("lemma", ""),
+        "reg": token.reg or attrs.get("reg", ""),
+        "expan": token.expan or attrs.get("expan", ""),
+        "trslit": token.trslit or attrs.get("trslit", ""),
+    }
+
+
+def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> None:
+    """Map writeback attrs to TEITOK names (e.g. xpos->pos) and copy extra attrs."""
+    attr_map = document.meta.get("_teitok_attr_map")
+    if not isinstance(attr_map, dict):
+        attr_map = {}
+
+    target = {
+        "xpos": _preferred_attr_name(attr_map.get("xpos"), "xpos"),
+        "lemma": _preferred_attr_name(attr_map.get("lemma"), "lemma"),
+        "reg": _preferred_attr_name(attr_map.get("reg"), "reg"),
+        "expan": _preferred_attr_name(attr_map.get("expan"), "expan"),
+        "trslit": _preferred_attr_name(attr_map.get("trslit"), "trslit"),
+    }
+
+    tok_elems = [e for e in root.iter() if _local_tag(e) == "tok"]
+    flat_tokens = _flatten_surface_tokens(document)
+    n = min(len(tok_elems), len(flat_tokens))
+    for i in range(n):
+        elem = tok_elems[i]
+        vals = _token_values(flat_tokens[i])
+        for key, out_name in target.items():
+            value = vals.get(key, "")
+            if value and value != "_":
+                elem.set(out_name, value)
+            elif out_name in elem.attrib and key in {"reg", "expan", "trslit"}:
+                elem.attrib.pop(out_name, None)
+    # If mapped XPOS name differs from "xpos", remove the internal alias everywhere.
+    if target["xpos"] != "xpos":
+        for elem in tok_elems:
+            elem.attrib.pop("xpos", None)
+
+    has_sentence_tags = any(_local_tag(e) == "s" for e in root.iter())
+    if not has_sentence_tags:
+        for elem in tok_elems:
+            elem.attrib.pop("ord", None)
+
+
+def _flatten_surface_tokens(document: Document) -> list:
+    """Return parent tokens in document order (omit MWT subtokens)."""
+    from .doc import Token
+
+    sub_ids: set[int] = set()
+    for sent in document.sentences:
+        for tok in sent.tokens:
+            if tok.is_mwt and tok.subtokens:
+                for st in tok.subtokens[1:]:
+                    if st.id:
+                        sub_ids.add(st.id)
+    flat: list[Token] = []
+    for sent in document.sentences:
+        for tok in sent.tokens:
+            if tok.id and tok.id in sub_ids:
+                continue
+            flat.append(tok)
+    return flat
+
+
+def sync_document_spacing_to_nlp_plaintext(document: Document, nlp_plaintext: str) -> None:
+    """Set ``space_after`` on tokens so CoNLL-U aligns with xmltokenizer ``nlp_plaintext``."""
+    import xmltokenizer as xt
+
+    from .conllu import document_to_conllu
+
+    flat = _flatten_surface_tokens(document)
+    if not flat:
+        return
+
+    aligned = xt.align_to_plaintext(
+        xt.parse_conllu(
+            document_to_conllu(document, model_info=None, create_implicit_mwt=False)
+        ),
+        nlp_plaintext,
+    )
+    surface_aligned = [at for at in aligned if at.nlp_start < at.nlp_end]
+    if len(flat) != len(surface_aligned):
+        return
+
+    for i, (tok, at) in enumerate(zip(flat, surface_aligned)):
+        if i + 1 < len(surface_aligned):
+            gap = nlp_plaintext[at.nlp_end : surface_aligned[i + 1].nlp_start]
+            tok.space_after = bool(gap) and gap.isspace()
+        else:
+            tok.space_after = None
+
+
+def document_from_xmltokenizer_nlp_plaintext(
+    nlp_plaintext: str,
+    *,
+    doc_id: str = "",
+) -> Document:
+    """
+    Build a flexipipe ``Document`` whose tokenization matches xmltokenizer fold.
+
+    Uses the xmltokenizer naive tokenizer (same punctuation/paragraph rules as
+    ``attach_conllu`` alignment) so flexipipe NLP output can fold back into XML.
+    """
+    from xmltokenizer.backends.naive import NaiveBackend
+
+    from .conllu import conllu_to_document
+
+    conllu = NaiveBackend().tokenize(nlp_plaintext)
+    document = conllu_to_document(conllu, doc_id=doc_id or "")
+    sync_document_spacing_to_nlp_plaintext(document, nlp_plaintext)
+    document.meta["_tokenized"] = True
+    return document
 
 
 def _conllu_for_scope_nlp(

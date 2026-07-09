@@ -227,6 +227,32 @@ def _propagate_token_ids(target: Document, source: Document) -> None:
                                 propagated_count += 1
 
 
+_TEITOK_WRITEBACK_META_KEYS = (
+    "_xt_session",
+    "_teitok_extracted_nlp",
+    "_teitok_nlp_udpipe",
+    "_punctuation_split",
+    "original_input_path",
+    "original_input_xpath",
+    "source_path",
+    "_teitok_layout_normalized",
+    "_teitok_layout_separator",
+    "_teitok_layout_block_tags",
+    "_teitok_attr_map",
+    "_tokenized",
+    "_segmented",
+)
+
+
+def _propagate_teitok_writeback_meta(target: Document, source: Document) -> None:
+    """Copy TEITOK/xmltokenizer writeback metadata from input doc to tagged doc."""
+    for key in _TEITOK_WRITEBACK_META_KEYS:
+        if key in source.meta:
+            target.meta[key] = source.meta[key]
+    if source.meta.get("original_input_path"):
+        target.meta["_processed_from_raw_text"] = True
+
+
 def _detect_performed_tasks(document: Document) -> set[str]:
     tasks = {"segment", "tokenize"}
     has_lemma = False
@@ -2282,6 +2308,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Glob pattern for files when --input is a directory (default: *.xml).",
     )
     process_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Corpus/dataset profile YAML/JSON with process defaults (backend/model/tasks/writeback/attrs).",
+    )
+    process_parser.add_argument(
+        "--application",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Application profile YAML/JSON (TEITOK writeback policy: output format, attrs mapping, ...).",
+    )
+    process_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Optional portable model bundle manifest (JSON/YAML). Not needed for TEITOK "
+        "settings.xml manifest keys (backend/model/xpres/recond).",
+    )
+    process_parser.add_argument(
         "--backend",
         type=_backend_choice,
         default=None,
@@ -3386,6 +3433,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Attribute name(s) to use for lemma in TEITOK files (comma-separated). Tried in order, falls back to 'lemma' then 'form'.",
     )
     train_parser.add_argument(
+        "--trslit",
+        help="Attribute name(s) to use for transliteration in TEITOK files (comma-separated, e.g., 'roman'). Exported as Translit= in CoNLL-U.",
+    )
+    _add_corpus_config_args(train_parser)
+    train_parser.add_argument(
         "--udpipe1-tokenizer",
         dest="udpipe1_tokenizer",
         help="Override UDPipe CLI tokenizer training options (e.g., 'epochs=50:early_stopping=1').",
@@ -3491,8 +3543,9 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--backend",
         choices=get_backend_choices_for_training(),  # Convert uses same backends as training
-        default="spacy",
-        help="Target backend for treebank conversion (default: spacy)",
+        default=None,
+        help="Target backend for training (sets required annotation filter). "
+             "Default: export mode — only xpos/lemma from config (for partially annotated TEITOK like Ladino).",
     )
     convert_parser.add_argument(
         "--train-ratio",
@@ -3534,6 +3587,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--lemma",
         help="Comma-separated TEITOK attribute names for lemma fallback (for treebank conversion)",
     )
+    convert_parser.add_argument(
+        "--trslit",
+        help="Comma-separated TEITOK attribute names for transliteration (for treebank conversion, e.g., 'roman')",
+    )
+    _add_corpus_config_args(convert_parser)
     
     # Arguments for lexicon conversion
     convert_parser.add_argument(
@@ -3877,10 +3935,12 @@ def _parse_attrs_map(attrs_map: Optional[List[str]]) -> Dict[str, str]:
             mappings["expan"] = values
         elif attr in ("lemma", "lem"):
             mappings["lemma"] = values
+        elif attr in ("trslit", "translit", "roman"):
+            mappings["trslit"] = values
         elif attr in ("tokid", "id", "tokenid"):
             mappings["tokid"] = values
         else:
-            raise SystemExit(f"Unknown attribute '{attr}' in attrs-map. Supported: xpos, reg, expan, lemma, tokid")
+            raise SystemExit(f"Unknown attribute '{attr}' in attrs-map. Supported: xpos, reg, expan, lemma, trslit, tokid")
     return mappings
 
 
@@ -4348,6 +4408,24 @@ def run_tag(args: argparse.Namespace) -> int:
         print(f"[flexipipe] DEBUG: Input Unicode normalization: {unicode_normalize}", file=sys.stderr)
         print(f"[flexipipe] DEBUG: Output Unicode normalization: {output_unicode_normalize}", file=sys.stderr)
     
+    profile = _corpus_profile_from_args(args) if getattr(args, "config", None) else None
+
+    application_path = getattr(args, "application", None)
+    if application_path:
+        from .profile_config import load_application_profile, apply_application_profile_defaults
+
+        application_profile = load_application_profile(Path(application_path))
+        apply_application_profile_defaults(args, application_profile)
+
+    manifest_path = getattr(args, "manifest", None)
+    if manifest_path:
+        from .profile_config import load_model_manifest, apply_model_manifest_defaults
+
+        model_manifest = load_model_manifest(Path(manifest_path))
+        apply_model_manifest_defaults(args, model_manifest)
+
+    _apply_process_profile_defaults(args, profile)
+
     backend_type = args.backend
     if backend_type:
         setattr(args, "_backend_explicit", True)
@@ -4364,6 +4442,7 @@ def run_tag(args: argparse.Namespace) -> int:
     
     auto_selected = False
     teitok_settings_obj: Optional[TeitokSettings] = None
+    merged_attrs_map: dict[str, str] = _parse_attrs_map(getattr(args, "attrs_map", None))
 
     # Parse tasks as requested by the user (for header/reporting),
     # before adding mandatory defaults. If --tasks was not provided,
@@ -4388,7 +4467,7 @@ def run_tag(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"[flexipipe] {exc}", file=sys.stderr)
             return 1
-    mandatory_missing = TASK_MANDATORY - requested_tasks
+    mandatory_missing = (TASK_MANDATORY - {"segment"} if getattr(args, "_skip_segment_task", False) else TASK_MANDATORY) - requested_tasks
     if mandatory_missing:
         if args.verbose or args.debug:
             missing_list = ", ".join(sorted(mandatory_missing))
@@ -4947,13 +5026,19 @@ def run_tag(args: argparse.Namespace) -> int:
                         segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
                         tokenize_locally = segment_locally and backend_type != "treetagger"
                     
-                        doc = Document.from_plain_text(
-                            udpipe_nlp,
-                            doc_id="",
-                            segment=segment_locally,
-                            tokenize=tokenize_locally,
-                        )
+                        if _xt_session is not None:
+                            from .teitok_writeback_xt import document_from_xmltokenizer_nlp_plaintext
+
+                            doc = document_from_xmltokenizer_nlp_plaintext(udpipe_nlp)
+                        else:
+                            doc = Document.from_plain_text(
+                                udpipe_nlp,
+                                doc_id="",
+                                segment=segment_locally,
+                                tokenize=tokenize_locally,
+                            )
                         doc.meta["_teitok_extracted_nlp"] = surface_nlp
+                        doc.meta["_teitok_attr_map"] = dict(merged_attrs_map)
                         if _punct_pre:
                             doc.meta["_teitok_nlp_udpipe"] = udpipe_nlp
                             doc.meta["_punctuation_split"] = "pre"
@@ -5005,13 +5090,7 @@ def run_tag(args: argparse.Namespace) -> int:
                         reg_attr = merged_attrs_map.get("reg")
                         expan_attr = merged_attrs_map.get("expan")
                         lemma_attr = merged_attrs_map.get("lemma")
-                        doc = load_teitok(
-                            tmp_path,
-                            xpos_attr=xpos_attr,
-                            reg_attr=reg_attr,
-                            expan_attr=expan_attr,
-                            lemma_attr=lemma_attr,
-                        )
+                        doc = _load_teitok_for_process(args, tmp_path, merged_attrs_map)
                         # Normalize document encoding
                         if unicode_normalize != "none":
                             doc.normalize_unicode(unicode_normalize)
@@ -5111,13 +5190,19 @@ def run_tag(args: argparse.Namespace) -> int:
                     segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
                     tokenize_locally = segment_locally and backend_type != "treetagger"
                 
-                    doc = Document.from_plain_text(
-                        udpipe_nlp,
-                        doc_id="",
-                        segment=segment_locally,
-                        tokenize=tokenize_locally,
-                    )
+                    if _xt_session is not None:
+                        from .teitok_writeback_xt import document_from_xmltokenizer_nlp_plaintext
+
+                        doc = document_from_xmltokenizer_nlp_plaintext(udpipe_nlp)
+                    else:
+                        doc = Document.from_plain_text(
+                            udpipe_nlp,
+                            doc_id="",
+                            segment=segment_locally,
+                            tokenize=tokenize_locally,
+                        )
                     doc.meta["_teitok_extracted_nlp"] = surface_nlp
+                    doc.meta["_teitok_attr_map"] = dict(merged_attrs_map)
                     if _punct_pre:
                         doc.meta["_teitok_nlp_udpipe"] = udpipe_nlp
                         doc.meta["_punctuation_split"] = "pre"
@@ -5167,13 +5252,7 @@ def run_tag(args: argparse.Namespace) -> int:
                     reg_attr = merged_attrs_map.get("reg")
                     expan_attr = merged_attrs_map.get("expan")
                     lemma_attr = merged_attrs_map.get("lemma")
-                    doc = load_teitok(
-                        args.input,
-                        xpos_attr=xpos_attr,
-                        reg_attr=reg_attr,
-                        expan_attr=expan_attr,
-                        lemma_attr=lemma_attr,
-                    )
+                    doc = _load_teitok_for_process(args, args.input, merged_attrs_map)
                     # Normalize document encoding
                     if unicode_normalize != "none":
                         doc.normalize_unicode(unicode_normalize)
@@ -5713,8 +5792,10 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Get model name for registry lookups
                 model_name = getattr(args, "model", None)
             
-                # Apply segmentation (sentence splitting)
+                # Apply segmentation (sentence splitting) when segment task is requested
                 segmenter_spec = getattr(args, "segmenter", None)
+                if "segment" not in requested_tasks:
+                    segmenter_spec = ""
                 segmenter_lang = getattr(args, "segmenter_language", None) or language
                 doc, segmentation_applied = maybe_apply_segmentation(
                     doc,
@@ -5817,6 +5898,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
                 _propagate_sentence_metadata(result.document, doc)
                 _propagate_token_ids(result.document, doc)
+                _propagate_teitok_writeback_meta(result.document, doc)
 
                 if doc.meta.get("_teitok_block_nlp_ranges"):
                     from .teitok_block_align import (
@@ -5980,6 +6062,9 @@ def run_tag(args: argparse.Namespace) -> int:
                 from .backend_registry import create_backend
             
                 flexitag_options = build_flexitag_options_from_args(args)
+                profile_options = getattr(args, "_profile_backend_options", None)
+                if isinstance(profile_options, dict):
+                    flexitag_options.update(profile_options)
             
                 try:
                     flexitag_backend = create_backend(
@@ -6013,6 +6098,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 result = neural_result  # FlexitagBackend returns NeuralResult
                 _propagate_sentence_metadata(result.document, doc)
                 _propagate_token_ids(result.document, doc)
+                _propagate_teitok_writeback_meta(result.document, doc)
             
                 # Model string for flexitag only
                 if args.model:
@@ -6206,27 +6292,38 @@ def run_tag(args: argparse.Namespace) -> int:
             use_writeback = False
             original_input_path = None
             is_extracted_text = False
-            if args.writeback and input_format == "teitok":
-                # Writeback only works when input is TEITOK XML (not stdin)
-                if not read_from_stdin and args.input:
-                    original_input_path = Path(args.input)
-                    if original_input_path.exists():
-                        # Use writeback if output is same as input, or no output specified
-                        if not output_path or str(original_input_path.resolve()) == str(Path(output_path).resolve()):
-                            use_writeback = True
-                            # Check if this came from extracted text (non-tokenized TEITOK with --tokenize)
-                            # OR if --use-raw-text was used on an untokenized XML file
-                            from .teitok import teitok_has_tokens
-                            # First check: if original input file has no tokens, we need to insert tokens
+            if input_format == "teitok" and not read_from_stdin and args.input:
+                original_input_path = Path(args.input)
+                if original_input_path.exists():
+                    from .teitok import teitok_has_tokens
+
+                    file_untokenized = not teitok_has_tokens(str(original_input_path))
+                    same_in_out = (
+                        output_path
+                        and str(original_input_path.resolve())
+                        == str(Path(output_path).resolve())
+                    )
+                    if args.writeback and (not output_path or same_in_out):
+                        use_writeback = True
+                    elif (
+                        file_untokenized
+                        and output_format == "teitok"
+                        and (output_path or args.test)
+                    ):
+                        # Untokenized XML: fold tags into --output (or --test preview)
+                        # without requiring in-place --writeback.
+                        use_writeback = True
+
+                    if use_writeback:
+                        if file_untokenized:
+                            is_extracted_text = True
+                        elif output_doc.meta.get("original_input_path") and not teitok_has_tokens(
+                            output_doc.meta["original_input_path"]
+                        ):
+                            is_extracted_text = True
+                        elif output_doc.meta.get("_processed_from_raw_text", False):
                             if not teitok_has_tokens(str(original_input_path)):
                                 is_extracted_text = True
-                            # Second check: if meta says it came from extracted text
-                            elif output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
-                                is_extracted_text = True
-                            # Third check: if processed from raw text and original file has no tokens
-                            elif output_doc.meta.get("_processed_from_raw_text", False):
-                                if not teitok_has_tokens(str(original_input_path)):
-                                    is_extracted_text = True
         
             # Apply create_implicit_mwt if requested, but only when:
             # 1. Not in writeback mode (regular output), OR
@@ -6351,6 +6448,12 @@ def run_tag(args: argparse.Namespace) -> int:
                 # or when inserting new tokens in writeback mode)
                 try:
                     if is_extracted_text or use_xmltokenizer_writeback:
+                        if output_doc.meta.get("_xt_session") is not None:
+                            from .teitok_writeback_xt import sync_document_spacing_to_nlp_plaintext
+
+                            nlp_ref = output_doc.meta.get("_teitok_extracted_nlp") or ""
+                            if nlp_ref:
+                                sync_document_spacing_to_nlp_plaintext(output_doc, nlp_ref)
                         textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
                         include_notes = getattr(args, "textnotes", False)
                         engine = getattr(args, "insert_tokens_engine", "standoff")
@@ -6718,6 +6821,221 @@ def _required_annotations_for_backend(
     return required
 
 
+def _required_annotations_for_treebank_export(
+    *,
+    xpos_attr: Optional[str] = None,
+    lemma_attr: Optional[str] = None,
+    backend_type: Optional[str] = None,
+) -> List[str]:
+    """
+    Annotations required when converting TEITOK to CoNLL-U splits.
+
+    Default (no --backend): only attrs configured in the corpus profile (xpos, lemma).
+    With --backend: use that backend's training requirements (stricter).
+    """
+    if backend_type and backend_type.lower() != "flexitag":
+        return _required_annotations_for_backend(backend_type, xpos_attr)
+    required: List[str] = []
+    if xpos_attr:
+        required.append("xpos")
+    if lemma_attr:
+        required.append("lemma")
+    return required or ["xpos"]
+
+
+def _add_corpus_config_args(parser: argparse.ArgumentParser) -> None:
+    """Register corpus profile and segmentation CLI arguments."""
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Corpus profile YAML/JSON (attrs, segmentation, train ratios). CLI flags override the file.",
+    )
+    parser.add_argument(
+        "--segment-mode",
+        choices=["native", "document", "block", "heuristic", "model"],
+        default=None,
+        help="Segmentation mode for both flexitag and CoNLL-U export (overrides config)",
+    )
+    parser.add_argument(
+        "--segment-flexitag",
+        choices=["native", "document", "block", "heuristic", "model"],
+        default=None,
+        help="Segmentation mode when training flexitag (default: document)",
+    )
+    parser.add_argument(
+        "--segment-conllu",
+        choices=["native", "document", "block", "heuristic", "model"],
+        default=None,
+        help="Segmentation mode for CoNLL-U export / neural backends (default: heuristic)",
+    )
+    parser.add_argument(
+        "--max-sentence-tokens",
+        type=int,
+        default=None,
+        help="Force sentence split after this many tokens (heuristic mode)",
+    )
+    parser.add_argument(
+        "--export-document-splits",
+        action="store_true",
+        help="Also write train/dev/test.document.conllu with one sentence per XML file",
+    )
+    parser.add_argument(
+        "--refresh-splits",
+        action="store_true",
+        help="Re-convert TEITOK XML into ud_folder instead of using existing CoNLL-U splits",
+    )
+
+
+def _corpus_profile_from_args(args: argparse.Namespace):
+    """Load corpus profile from --config and merge CLI overrides."""
+    from .corpus_config import resolve_corpus_profile
+
+    config_path = getattr(args, "config", None)
+    train_data = getattr(args, "train_data", None) or getattr(args, "input", None)
+    corpus_dir = Path(train_data).expanduser() if train_data else None
+    if corpus_dir and not corpus_dir.is_dir():
+        corpus_dir = corpus_dir.parent if corpus_dir.parent.is_dir() else None
+
+    attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
+    ratios = None
+    if hasattr(args, "train_ratio"):
+        ratios = {
+            "train": getattr(args, "train_ratio", 0.8),
+            "dev": getattr(args, "dev_ratio", 0.1),
+            "test": getattr(args, "test_ratio", 0.1),
+        }
+
+    return resolve_corpus_profile(
+        config_path=Path(config_path).expanduser() if config_path else None,
+        corpus_dir=corpus_dir,
+        cli_overrides={
+            "language": getattr(args, "language", None),
+            "train_data": Path(train_data).expanduser() if train_data else None,
+            "xpos_attr": attrs_map.get("xpos") or getattr(args, "xpos", None),
+            "reg_attr": attrs_map.get("reg") or getattr(args, "reg", None),
+            "expan_attr": attrs_map.get("expan") or getattr(args, "expan", None),
+            "lemma_attr": attrs_map.get("lemma") or getattr(args, "lemma", None),
+            "trslit_attr": attrs_map.get("trslit") or getattr(args, "trslit", None),
+            "segment_mode": getattr(args, "segment_mode", None),
+            "segment_flexitag": getattr(args, "segment_flexitag", None),
+            "segment_conllu": getattr(args, "segment_conllu", None),
+            "max_sentence_tokens": getattr(args, "max_sentence_tokens", None),
+            "tagpos": getattr(args, "tagpos", None),
+            "nlpform": getattr(args, "nlpform", None),
+            "ud_folder": Path(args.ud_folder).expanduser() if getattr(args, "ud_folder", None) else None,
+            "output_dir": Path(args.output_dir).expanduser() if getattr(args, "output_dir", None) else None,
+            "model_name": getattr(args, "name", None),
+            "seed": getattr(args, "seed", None),
+            "train_ratio": ratios["train"] if ratios else None,
+            "dev_ratio": ratios["dev"] if ratios else None,
+            "test_ratio": ratios["test"] if ratios else None,
+        },
+    )
+
+
+def _attrs_from_profile(profile) -> Dict[str, Optional[str]]:
+    attrs = profile.attrs or {}
+    return {
+        "xpos": attrs.get("xpos"),
+        "reg": attrs.get("reg"),
+        "expan": attrs.get("expan"),
+        "lemma": attrs.get("lemma"),
+        "trslit": attrs.get("trslit"),
+    }
+
+
+def _apply_process_profile_defaults(args: argparse.Namespace, profile) -> None:
+    """Apply process defaults from corpus profile when CLI did not set them."""
+    if not profile:
+        return
+
+    raw = getattr(profile, "raw", {}) or {}
+    process_cfg = raw.get("process") or {}
+    if not isinstance(process_cfg, dict):
+        process_cfg = {}
+
+    def _merge_cfg(base: dict, extra: dict) -> dict:
+        merged = dict(base)
+        for k, v in extra.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                nested = dict(merged[k])
+                nested.update(v)
+                merged[k] = nested
+            else:
+                merged[k] = v
+        return merged
+
+    if profile.language and not getattr(args, "language", None):
+        args.language = profile.language
+
+    backends_cfg = process_cfg.get("backends")
+    if not isinstance(backends_cfg, dict):
+        backends_cfg = {}
+
+    selected_backend = (
+        getattr(args, "backend", None)
+        or process_cfg.get("backend")
+        or process_cfg.get("default_backend")
+    )
+    if not getattr(args, "backend", None) and selected_backend:
+        args.backend = str(selected_backend)
+
+    effective_cfg = process_cfg
+    if selected_backend:
+        backend_cfg = backends_cfg.get(str(selected_backend)) or {}
+        if isinstance(backend_cfg, dict):
+            effective_cfg = _merge_cfg(process_cfg, backend_cfg)
+
+    profile_backend_options: dict[str, Any] = {}
+    raw_options = effective_cfg.get("options")
+    if isinstance(raw_options, dict):
+        profile_backend_options.update(raw_options)
+    if "beam_size" in effective_cfg and "beam_size" not in profile_backend_options:
+        profile_backend_options["beam_size"] = effective_cfg.get("beam_size")
+    if profile_backend_options:
+        setattr(args, "_profile_backend_options", profile_backend_options)
+
+    if not getattr(args, "model", None) and effective_cfg.get("model"):
+        args.model = str(effective_cfg.get("model"))
+    if getattr(args, "output_format", None) is None and effective_cfg.get("output_format"):
+        args.output_format = str(effective_cfg.get("output_format"))
+
+    if effective_cfg.get("tokenize") is True and not getattr(args, "tokenize", False):
+        args.tokenize = True
+    if effective_cfg.get("writeback") is not None and getattr(args, "writeback", None) is None:
+        args.writeback = bool(effective_cfg.get("writeback"))
+    if (
+        effective_cfg.get("writeback_engine")
+        and getattr(args, "writeback_engine", "auto") == "auto"
+    ):
+        args.writeback_engine = str(effective_cfg.get("writeback_engine"))
+    if effective_cfg.get("textnotes") is True and not getattr(args, "textnotes", False):
+        args.textnotes = True
+    if effective_cfg.get("rejoin_linebreaks") is not None:
+        args.rejoin_linebreaks = bool(effective_cfg.get("rejoin_linebreaks"))
+
+    if getattr(args, "tasks", None) is None and effective_cfg.get("tasks"):
+        tasks = effective_cfg.get("tasks")
+        if isinstance(tasks, list):
+            args.tasks = ",".join(str(t) for t in tasks)
+        else:
+            args.tasks = str(tasks)
+
+    attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
+    profile_attrs = _attrs_from_profile(profile)
+    attrs_cfg = effective_cfg.get("attrs")
+    if not isinstance(attrs_cfg, dict):
+        attrs_cfg = {}
+    for key in ("xpos", "reg", "expan", "lemma", "trslit"):
+        cfg_value = attrs_cfg.get(key)
+        value = attrs_map.get(key) or cfg_value or profile_attrs.get(key)
+        if value and key not in attrs_map:
+            attrs_map[key] = value
+    if attrs_map:
+        args.attrs_map = [f"{k}:{v}" for k, v in attrs_map.items()]
+
+
 def run_train(args: argparse.Namespace) -> int:
     """Run training command with backend-specific logic."""
     from .session_tracker import create_session, update_session, delete_session
@@ -6757,12 +7075,43 @@ def run_train(args: argparse.Namespace) -> int:
             except OSError:
                 pass
     backend_type = getattr(args, "backend", "flexitag")
-    # Parse attrs-map into individual attributes
+    profile = _corpus_profile_from_args(args)
+    profile_attrs = _attrs_from_profile(profile)
+    # Parse attrs-map into individual attributes (CLI attrs-map overrides profile)
     attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
-    xpos_attr = attrs_map.get("xpos")
-    reg_attr = attrs_map.get("reg")
-    expan_attr = attrs_map.get("expan")
-    lemma_attr = attrs_map.get("lemma")
+    xpos_attr = attrs_map.get("xpos") or profile_attrs.get("xpos")
+    reg_attr = attrs_map.get("reg") or profile_attrs.get("reg")
+    expan_attr = attrs_map.get("expan") or profile_attrs.get("expan")
+    lemma_attr = attrs_map.get("lemma") or profile_attrs.get("lemma")
+    trslit_attr = attrs_map.get("trslit") or profile_attrs.get("trslit")
+    if profile.teitok_input and not getattr(args, "train_data", None) and not getattr(args, "input", None):
+        args.train_data = profile.teitok_input
+    if profile.language and not getattr(args, "language", None):
+        args.language = profile.language
+    if profile.ud_folder and not getattr(args, "ud_folder", None):
+        args.ud_folder = str(profile.ud_folder)
+    if profile.output_dir and not getattr(args, "output_dir", None):
+        args.output_dir = str(profile.output_dir)
+    resolved_name = profile.resolved_model_name()
+    if resolved_name and not getattr(args, "name", None):
+        args.name = resolved_name
+    if profile.tagpos and not getattr(args, "tagpos", None):
+        args.tagpos = profile.tagpos
+    if profile.nlpform and getattr(args, "nlpform", "form") == "form":
+        nlpform_mode = profile.nlpform
+    segmentation_policy = profile.segmentation_for_backend(backend_type)
+    document_segmentation_policy = profile.segmentation_flexitag
+    export_document_splits = bool(
+        getattr(args, "export_document_splits", False)
+        or (
+            profile.segmentation_flexitag.mode == "document"
+            and profile.segmentation_conllu.mode != "document"
+        )
+    )
+    train_ratio = profile.train_ratios.get("train", 0.8)
+    dev_ratio = profile.train_ratios.get("dev", 0.1)
+    test_ratio = profile.train_ratios.get("test", 0.1)
+    split_seed = profile.seed
     
     if backend_type == "flexitag":
         from .model_storage import get_backend_models_dir
@@ -6800,6 +7149,15 @@ def run_train(args: argparse.Namespace) -> int:
             reg_attr=reg_attr,
             expan_attr=expan_attr,
             lemma_attr=lemma_attr,
+            trslit_attr=trslit_attr,
+            segmentation_policy=segmentation_policy,
+            export_document_splits=export_document_splits,
+            document_segmentation_policy=document_segmentation_policy,
+            train_ratio=train_ratio,
+            dev_ratio=dev_ratio,
+            test_ratio=test_ratio,
+            seed=split_seed,
+            refresh_splits=bool(getattr(args, "refresh_splits", False)),
         )
         if not (args.verbose or args.debug):
             print(f"[flexipipe] created model at {model_path}")
@@ -6831,21 +7189,37 @@ def run_train(args: argparse.Namespace) -> int:
     if backend_type in ("spacy", "transformers", "udpipe1", "classla"):
         # Neural backend training
         from .backend_registry import create_backend
-        from .train import _prepare_teitok_corpus, _find_ud_splits
+        from .train import (
+            _announce_existing_splits,
+            _prepare_teitok_corpus,
+            _resolve_training_splits,
+        )
         
         if not args.train_data:
             raise SystemExit("--train-data is required for neural backends")
         train_path = Path(args.train_data)
         dev_path = Path(args.dev_data) if args.dev_data else None
         
-        # Check if this is a TEITOK corpus directory (no pre-split files)
-        splits = _find_ud_splits(train_path)
+        ud_folder = getattr(args, "ud_folder", None)
+        ud_folder_path = Path(ud_folder).expanduser().resolve() if ud_folder else None
+        refresh_splits = bool(getattr(args, "refresh_splits", False))
+
+        try:
+            splits, needs_prepare = _resolve_training_splits(
+                ud_folder=ud_folder_path,
+                source_dir=train_path,
+                backend_type=backend_type,
+                segmentation_policy=segmentation_policy,
+                export_document_splits=export_document_splits,
+                refresh_splits=refresh_splits,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+
         teitok_temp_dir = None
-        if not splits:
-            # This is a TEITOK corpus - prepare it
-            ud_folder = getattr(args, "ud_folder", None)
-            if ud_folder:
-                teitok_temp_path = Path(ud_folder).expanduser().resolve()
+        if needs_prepare:
+            if ud_folder_path:
+                teitok_temp_path = ud_folder_path
                 teitok_temp_path.mkdir(parents=True, exist_ok=True)
                 teitok_temp_dir = str(teitok_temp_path)
             else:
@@ -6861,31 +7235,31 @@ def run_train(args: argparse.Namespace) -> int:
                     output_dir=teitok_temp_path,
                     required_annotations=required_annotations,
                     backend_type=backend_type,
-                    train_ratio=0.8,
-                    dev_ratio=0.1,
-                    test_ratio=0.1,
-                    seed=42,
+                    train_ratio=train_ratio,
+                    dev_ratio=dev_ratio,
+                    test_ratio=test_ratio,
+                    seed=split_seed,
                     verbose=args.verbose or args.debug,
                     xpos_attr=xpos_attr,
                     reg_attr=reg_attr,
                     expan_attr=expan_attr,
                     lemma_attr=lemma_attr,
+                    trslit_attr=trslit_attr,
+                    segmentation_policy=segmentation_policy,
+                    language=getattr(args, "language", None),
+                    export_document_splits=export_document_splits,
+                    document_segmentation_policy=document_segmentation_policy,
                 )
-                # Update paths to point to prepared CoNLL-U files
+                splits = prepared_splits
                 train_path = prepared_splits["train"]
                 if "dev" in prepared_splits:
                     dev_path = prepared_splits["dev"]
-                elif not dev_path:
-                    # Use dev from prepared splits if available
-                    pass
                 
-                # If ud_folder is provided, print where the files are kept
                 if ud_folder:
                     print(f"[flexipipe] CoNLL-U files saved to: {teitok_temp_dir}")
                     if "test" in prepared_splits:
                         print(f"[flexipipe] Test file available at: {prepared_splits['test']}")
                     
-                    # Print token distribution summary
                     split_counts = prepared_splits.get("_token_counts", {})
                     if split_counts:
                         total_tokens = sum(split_counts.values())
@@ -6897,14 +7271,17 @@ def run_train(args: argparse.Namespace) -> int:
                                     pct = (count / total_tokens) * 100
                                     parts.append(f"{split_name} = {count:,} tokens ({pct:.1f}%)")
                             print(f"[flexipipe] Created gold standard distribution: {', '.join(parts)}")
-                    # Remove the token counts from the result dict
                     prepared_splits.pop("_token_counts", None)
             except Exception as e:
                 import shutil
-                # Only clean up if it's a temporary directory (not ud_folder)
                 if teitok_temp_dir and not ud_folder:
                     shutil.rmtree(teitok_temp_dir, ignore_errors=True)
-                raise SystemExit(f"Failed to prepare TEITOK corpus: {e}")
+                raise SystemExit(f"Failed to prepare TEITOK corpus: {e}") from e
+        else:
+            _announce_existing_splits(splits)
+            train_path = splits["train"]
+            if not dev_path and "dev" in splits:
+                dev_path = splits["dev"]
         
         output_dir_arg = Path(args.output_dir).expanduser() if args.output_dir else None
         from .model_storage import get_backend_models_dir
@@ -7095,7 +7472,11 @@ def run_train(args: argparse.Namespace) -> int:
     elif backend_type == "fasttext":
         # fastText training (follows same pattern as spacy/transformers)
         from .backend_registry import create_backend
-        from .train import _prepare_teitok_corpus, _find_ud_splits
+        from .train import (
+            _announce_existing_splits,
+            _prepare_teitok_corpus,
+            _resolve_training_splits,
+        )
         
         if not args.train_data:
             raise SystemExit("--train-data is required for fasttext backend")
@@ -7103,14 +7484,26 @@ def run_train(args: argparse.Namespace) -> int:
         train_path = Path(args.train_data)
         dev_path = Path(args.dev_data) if args.dev_data else None
         
-        # Check if this is a TEITOK corpus directory (no pre-split files)
-        splits = _find_ud_splits(train_path)
+        ud_folder = getattr(args, "ud_folder", None)
+        ud_folder_path = Path(ud_folder).expanduser().resolve() if ud_folder else None
+        refresh_splits = bool(getattr(args, "refresh_splits", False))
+
+        try:
+            splits, needs_prepare = _resolve_training_splits(
+                ud_folder=ud_folder_path,
+                source_dir=train_path,
+                backend_type=backend_type,
+                segmentation_policy=segmentation_policy,
+                export_document_splits=export_document_splits,
+                refresh_splits=refresh_splits,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+
         teitok_temp_dir = None
-        if not splits:
-            # This is a TEITOK corpus - prepare it
-            ud_folder = getattr(args, "ud_folder", None)
-            if ud_folder:
-                teitok_temp_path = Path(ud_folder).expanduser().resolve()
+        if needs_prepare:
+            if ud_folder_path:
+                teitok_temp_path = ud_folder_path
                 teitok_temp_path.mkdir(parents=True, exist_ok=True)
                 teitok_temp_dir = str(teitok_temp_path)
             else:
@@ -7126,31 +7519,31 @@ def run_train(args: argparse.Namespace) -> int:
                     output_dir=teitok_temp_path,
                     required_annotations=required_annotations,
                     backend_type=backend_type,
-                    train_ratio=0.8,
-                    dev_ratio=0.1,
-                    test_ratio=0.1,
-                    seed=42,
+                    train_ratio=train_ratio,
+                    dev_ratio=dev_ratio,
+                    test_ratio=test_ratio,
+                    seed=split_seed,
                     verbose=args.verbose or args.debug,
                     xpos_attr=xpos_attr,
                     reg_attr=reg_attr,
                     expan_attr=expan_attr,
                     lemma_attr=lemma_attr,
+                    trslit_attr=trslit_attr,
+                    segmentation_policy=segmentation_policy,
+                    language=getattr(args, "language", None),
+                    export_document_splits=export_document_splits,
+                    document_segmentation_policy=document_segmentation_policy,
                 )
-                # Update paths to point to prepared CoNLL-U files
+                splits = prepared_splits
                 train_path = prepared_splits["train"]
                 if "dev" in prepared_splits:
                     dev_path = prepared_splits["dev"]
-                elif not dev_path:
-                    # Use dev from prepared splits if available
-                    pass
                 
-                # If ud_folder is provided, print where the files are kept
                 if ud_folder:
                     print(f"[flexipipe] CoNLL-U files saved to: {teitok_temp_dir}")
                     if "test" in prepared_splits:
                         print(f"[flexipipe] Test file available at: {prepared_splits['test']}")
                     
-                    # Print token distribution summary
                     split_counts = prepared_splits.get("_token_counts", {})
                     if split_counts:
                         total_tokens = sum(split_counts.values())
@@ -7162,16 +7555,14 @@ def run_train(args: argparse.Namespace) -> int:
                                     pct = (count / total_tokens) * 100
                                     parts.append(f"{split_name} = {count:,} tokens ({pct:.1f}%)")
                             print(f"[flexipipe] Created gold standard distribution: {', '.join(parts)}")
-                    # Remove the token counts from the result dict
                     prepared_splits.pop("_token_counts", None)
             except Exception as e:
                 import shutil
-                # Only clean up if it's a temporary directory (not ud_folder)
                 if teitok_temp_dir and not ud_folder:
                     shutil.rmtree(teitok_temp_dir, ignore_errors=True)
-                raise SystemExit(f"Failed to prepare TEITOK corpus: {e}")
+                raise SystemExit(f"Failed to prepare TEITOK corpus: {e}") from e
         else:
-            # Found pre-split CoNLL-U files
+            _announce_existing_splits(splits)
             train_path = splits["train"]
             if not dev_path and "dev" in splits:
                 dev_path = splits["dev"]
@@ -7477,14 +7868,22 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
 def _run_convert_treebank(args: argparse.Namespace) -> int:
     """Convert TEITOK corpus into UD-style CoNLL-U train/dev/test splits."""
     from .train import _prepare_teitok_corpus
-    
+
+    profile = _corpus_profile_from_args(args)
+    profile_attrs = _attrs_from_profile(profile)
+
+    if not args.input and profile.teitok_input:
+        args.input = profile.teitok_input
+    if not args.output and profile.ud_folder:
+        args.output = profile.ud_folder
+
     if not args.input:
         print("Error: --input is required for treebank conversion", file=sys.stderr)
         return 1
     if not args.output:
         print("Error: --output is required for treebank conversion", file=sys.stderr)
         return 1
-    
+
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         print(f"[flexipipe] Input path not found: {input_path}", file=sys.stderr)
@@ -7493,11 +7892,20 @@ def _run_convert_treebank(args: argparse.Namespace) -> int:
     output_dir = Path(args.output).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    backend_type = args.backend or "spacy"
-    # Parse attrs-map for convert command
+    # Export uses flexitag-style annotation filtering by default (xpos/lemma from profile).
+    # Segmentation always follows segmentation.conllu from the profile/config.
+    export_backend = getattr(args, "backend", None) or "flexitag"
     attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
-    xpos_attr = attrs_map.get("xpos")
-    required_annotations = _required_annotations_for_backend(backend_type, xpos_attr)
+    xpos_attr = attrs_map.get("xpos") or profile_attrs.get("xpos") or getattr(args, "xpos", None)
+    reg_attr = attrs_map.get("reg") or profile_attrs.get("reg") or getattr(args, "reg", None)
+    expan_attr = attrs_map.get("expan") or profile_attrs.get("expan") or getattr(args, "expan", None)
+    lemma_attr = attrs_map.get("lemma") or profile_attrs.get("lemma") or getattr(args, "lemma", None)
+    trslit_attr = attrs_map.get("trslit") or profile_attrs.get("trslit") or getattr(args, "trslit", None)
+    required_annotations = _required_annotations_for_treebank_export(
+        xpos_attr=xpos_attr,
+        lemma_attr=lemma_attr,
+        backend_type=getattr(args, "backend", None),
+    )
 
     ratios = [args.train_ratio, args.dev_ratio, args.test_ratio]
     total = sum(ratios)
@@ -7506,21 +7914,35 @@ def _run_convert_treebank(args: argparse.Namespace) -> int:
         return 1
     norm = [r / total for r in ratios]
 
+    segmentation_policy = profile.segmentation_conllu
+    export_document_splits = bool(
+        getattr(args, "export_document_splits", False)
+        or (
+            profile.segmentation_flexitag.mode == "document"
+            and profile.segmentation_conllu.mode != "document"
+        )
+    )
+
     try:
         prepared = _prepare_teitok_corpus(
-            teitok_dir=input_path,  # Can be file or directory
+            teitok_dir=input_path,
             output_dir=output_dir,
             required_annotations=required_annotations,
-            backend_type=backend_type,
+            backend_type=export_backend,
             train_ratio=norm[0],
             dev_ratio=norm[1],
             test_ratio=norm[2],
             seed=args.seed,
             verbose=args.verbose,
             xpos_attr=xpos_attr,
-            reg_attr=attrs_map.get("reg"),
-            expan_attr=attrs_map.get("expan"),
-            lemma_attr=attrs_map.get("lemma"),
+            reg_attr=reg_attr,
+            expan_attr=expan_attr,
+            lemma_attr=lemma_attr,
+            trslit_attr=trslit_attr,
+            segmentation_policy=segmentation_policy,
+            language=profile.language or getattr(args, "language", None),
+            export_document_splits=export_document_splits,
+            document_segmentation_policy=profile.segmentation_flexitag,
         )
     except Exception as exc:
         print(f"[flexipipe] Failed to convert TEITOK corpus: {exc}", file=sys.stderr)
@@ -7661,20 +8083,36 @@ def run_map_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_teitok_for_process(
+    args: argparse.Namespace,
+    path: str,
+    merged_attrs_map: dict[str, str],
+):
+    """Load TEITOK XML for process, honoring application-profile segmentation policy."""
+    from .teitok import load_teitok
+
+    policy = getattr(args, "_runtime_segmentation_policy", None)
+    return load_teitok(
+        path,
+        xpos_attr=merged_attrs_map.get("xpos"),
+        reg_attr=merged_attrs_map.get("reg"),
+        expan_attr=merged_attrs_map.get("expan"),
+        lemma_attr=merged_attrs_map.get("lemma"),
+        segmentation_policy=policy,
+    )
+
+
 def _load_document(path: Path, fmt: str, *, args: Optional[argparse.Namespace] = None) -> Document:
     if fmt == "teitok":
-        # Parse attrs-map into individual attributes
         attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None) if args else None)
-        xpos_attr = attrs_map.get("xpos")
-        reg_attr = attrs_map.get("reg")
-        expan_attr = attrs_map.get("expan")
-        lemma_attr = attrs_map.get("lemma")
+        if args is not None:
+            return _load_teitok_for_process(args, str(path), attrs_map)
         return load_teitok(
             str(path),
-            xpos_attr=xpos_attr,
-            reg_attr=reg_attr,
-            expan_attr=expan_attr,
-            lemma_attr=lemma_attr,
+            xpos_attr=attrs_map.get("xpos"),
+            reg_attr=attrs_map.get("reg"),
+            expan_attr=attrs_map.get("expan"),
+            lemma_attr=attrs_map.get("lemma"),
         )
     if fmt == "conllu":
         text = path.read_text(encoding="utf-8", errors="replace")

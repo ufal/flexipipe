@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .teitok_settings import TeitokSettings
+    from .segmentation_policy import SegmentationPolicy
 
 from .doc import Document, Sentence, SubToken, Token, Entity
 from .doc_utils import collect_span_entities_by_sentence
@@ -408,6 +409,9 @@ def load_teitok(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
+    segmentation_policy: Optional["SegmentationPolicy"] = None,
+    language: Optional[str] = None,
 ) -> Document:
     """
     Load a TEITOK XML file.
@@ -418,6 +422,7 @@ def load_teitok(
         reg_attr: Comma-separated attribute names to try for reg (e.g., "nform,fform")
         expan_attr: Comma-separated attribute names to try for expan (e.g., "fform")
         lemma_attr: Comma-separated attribute names to try for lemma
+        trslit_attr: Comma-separated attribute names to try for trslit/Translit (e.g., "roman")
     
     Returns:
         Document object
@@ -477,13 +482,16 @@ def load_teitok(
     
     # If attribute mappings are provided OR we fixed duplicates, use Python-based loading
     # (Python loader can handle the fixed XML, C++ loader might not)
-    if xpos_attr or reg_attr or expan_attr or lemma_attr or had_duplicates:
+    if xpos_attr or reg_attr or expan_attr or lemma_attr or trslit_attr or had_duplicates:
         doc = _load_teitok_with_mappings(
             load_path,
             xpos_attr=xpos_attr,
             reg_attr=reg_attr,
             expan_attr=expan_attr,
             lemma_attr=lemma_attr,
+            trslit_attr=trslit_attr,
+            segmentation_policy=segmentation_policy,
+            language=language,
         )
     else:
         # Otherwise, use the fast C++ loader
@@ -528,7 +536,7 @@ def _get_attr_value_with_fallback(
     for attr_name in attr_names:
         value = elem.get(attr_name)
         if value and value != "--":  # Filter out "--" (reserved value in TEITOK)
-            return value
+            return value.strip()
     
     if fallback_to_text:
         text = (elem.text or "").strip()
@@ -825,6 +833,155 @@ def _remove_duplicate_tok_nodes(root: ET.Element) -> None:
             parent.remove(node)
 
 
+def _build_tok_line_keys(root: ET.Element) -> Dict[ET.Element, str]:
+    """Map each <tok> to the id of the nearest preceding <lb> in document order."""
+    line_keys: Dict[ET.Element, str] = {}
+    current_lb = ""
+    for elem in root.iter():
+        if _elem_is(elem, "lb"):
+            current_lb = (
+                elem.get("id")
+                or elem.get(f"{XML_NS}id")
+                or elem.get("xml:id")
+                or f"lb-{id(elem)}"
+            )
+        if _elem_is(elem, "tok"):
+            line_keys[elem] = current_lb
+    return line_keys
+
+
+def _block_key_for_tok(
+    tok_elem: ET.Element,
+    parent_map: Dict[ET.Element, ET.Element],
+    root: ET.Element,
+) -> str:
+    block_tags = frozenset({"p", "div", "body", "text"})
+    parent = parent_map.get(tok_elem)
+    while parent is not None and parent != root:
+        local = _element_local_tag(parent.tag)
+        if local in block_tags:
+            return (
+                parent.get("id")
+                or parent.get(f"{XML_NS}id")
+                or parent.get("xml:id")
+                or f"block-{id(parent)}"
+            )
+        parent = parent_map.get(parent)
+    return "root"
+
+
+def _token_from_tok_elem(
+    tok_elem: ET.Element,
+    *,
+    lemma_attrs: List[str],
+    xpos_attrs: List[str],
+    reg_attrs: List[str],
+    expan_attrs: List[str],
+    trslit_attrs: List[str],
+    token_id: int = 1,
+) -> Optional[Token]:
+    form_attr = tok_elem.get("form", "")
+    if form_attr == "--":
+        return None
+    form_attr_val = (tok_elem.get("form") or "").strip()
+    form_text = (tok_elem.text or "").strip()
+    if form_text and form_attr_val and form_text != form_attr_val:
+        form = form_text
+    else:
+        form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or form_text
+    if not form:
+        return None
+    tokid = tok_elem.get("id") or tok_elem.get(f"{XML_NS}id", "")
+    lemma = _get_attr_value_with_fallback(tok_elem, lemma_attrs, fallback_to_text=("form" in lemma_attrs))
+    if not lemma and "form" in lemma_attrs:
+        lemma = form
+    xpos = _get_attr_value_with_fallback(tok_elem, xpos_attrs)
+    upos = _get_attr_value_with_fallback(tok_elem, ["upos"])
+    feats = _get_attr_value_with_fallback(tok_elem, ["feats"])
+    reg = _get_attr_value_with_fallback(tok_elem, reg_attrs, fallback_to_text=("form" in reg_attrs)) or (
+        form if "form" in reg_attrs else ""
+    )
+    expan = _get_attr_value_with_fallback(tok_elem, expan_attrs, fallback_to_text=("form" in expan_attrs)) or (
+        form if "form" in expan_attrs else ""
+    )
+    mod = _get_attr_value_with_fallback(tok_elem, ["mod"])
+    trslit = _get_attr_value_with_fallback(tok_elem, trslit_attrs)
+    ltrslit = _get_attr_value_with_fallback(tok_elem, ["ltrslit"])
+    head_str = tok_elem.get("head", "")
+    head = int(head_str) if head_str and head_str.isdigit() else 0
+    deprel = tok_elem.get("deprel", "")
+    deps = tok_elem.get("deps", "")
+    misc = tok_elem.get("misc", "")
+    tok_attrs: Dict[str, str] = {}
+    if head_str and not head_str.isdigit():
+        tok_attrs["head_tokid"] = head_str
+    known = {
+        "form", "lemma", "xpos", "upos", "feats", "reg", "expan", "mod",
+        "trslit", "ltrslit", "id", "head", "deprel", "deps", "misc", f"{XML_NS}id",
+    }
+    known.update(xpos_attrs)
+    known.update(reg_attrs)
+    known.update(expan_attrs)
+    known.update(trslit_attrs)
+    known.update(lemma_attrs)
+    for key, value in tok_elem.attrib.items():
+        if key not in known:
+            tok_attrs[key] = value
+    tail = tok_elem.tail or ""
+    space_after = bool(tail and any(c.isspace() for c in tail))
+    subtokens: List[SubToken] = []
+    for dtok_elem in tok_elem.findall("dtok") or tok_elem.findall("{*}dtok"):
+        if dtok_elem.get("form", "") == "--":
+            continue
+        dtok_form_attr = (dtok_elem.get("form") or "").strip()
+        dtok_form_text = (dtok_elem.text or "").strip()
+        if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
+            dtok_form = dtok_form_text
+        else:
+            dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or dtok_form_text
+        subtokens.append(
+            SubToken(
+                id=len(subtokens) + 1,
+                form=dtok_form,
+                lemma="",
+                xpos="",
+                upos="",
+                feats="",
+                reg="",
+                expan="",
+                space_after=False,
+                attrs={},
+            )
+        )
+    token = Token(
+        id=token_id,
+        form=form,
+        lemma=lemma or "",
+        xpos=xpos or "",
+        upos=upos or "",
+        feats=feats or "",
+        reg=reg or "",
+        expan=expan or "",
+        mod=mod or "",
+        trslit=trslit or "",
+        ltrslit=ltrslit or "",
+        tokid=tokid or None,
+        head=head,
+        deprel=deprel or "",
+        deps=deps or "",
+        misc=misc or "",
+        is_mwt=len(subtokens) > 0,
+        subtokens=subtokens,
+        space_after=space_after,
+        attrs=tok_attrs,
+    )
+    if subtokens:
+        token.mwt_start = token_id
+        token.mwt_end = token_id + len(subtokens) - 1
+        token.parts = [st.form for st in subtokens]
+    return token
+
+
 def _load_teitok_with_mappings(
     path: str,
     *,
@@ -832,6 +989,9 @@ def _load_teitok_with_mappings(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
+    segmentation_policy: Optional["SegmentationPolicy"] = None,
+    language: Optional[str] = None,
 ) -> Document:
     """
     Load TEITOK XML with custom attribute mappings.
@@ -869,6 +1029,7 @@ def _load_teitok_with_mappings(
     reg_attrs = [a.strip() for a in reg_attr.split(",")] if reg_attr else []
     expan_attrs = [a.strip() for a in expan_attr.split(",")] if expan_attr else []
     lemma_attrs = [a.strip() for a in lemma_attr.split(",")] if lemma_attr else []
+    trslit_attrs = [a.strip() for a in trslit_attr.split(",")] if trslit_attr else []
     
     # Add defaults
     if xpos_attrs:
@@ -890,6 +1051,11 @@ def _load_teitok_with_mappings(
         lemma_attrs.extend(["lemma"])
     else:
         lemma_attrs = ["lemma"]
+
+    if trslit_attrs:
+        trslit_attrs.extend(["trslit"])
+    else:
+        trslit_attrs = ["trslit"]
     
     tei_attrs: Dict[str, str] = {}
     text_elem = root.find(".//text")
@@ -1094,7 +1260,7 @@ def _load_teitok_with_mappings(
                 expan = form  # Fallback to form only if form is in the list
             
             mod = _get_attr_value_with_fallback(tok_elem, ["mod"])
-            trslit = _get_attr_value_with_fallback(tok_elem, ["trslit"])
+            trslit = _get_attr_value_with_fallback(tok_elem, trslit_attrs)
             ltrslit = _get_attr_value_with_fallback(tok_elem, ["ltrslit"])
             # Prefer id over xml:id (unless source has xml:id)
             tokid = tok_elem.get("id")
@@ -1110,6 +1276,7 @@ def _load_teitok_with_mappings(
             known_attrs.update(xpos_attrs)
             known_attrs.update(reg_attrs)
             known_attrs.update(expan_attrs)
+            known_attrs.update(trslit_attrs)
             known_attrs.update(lemma_attrs)
             
             # Get head, deprel, deps, misc, ord if present
@@ -1134,6 +1301,7 @@ def _load_teitok_with_mappings(
             known_attrs.update(xpos_attrs)
             known_attrs.update(reg_attrs)
             known_attrs.update(expan_attrs)
+            known_attrs.update(trslit_attrs)
             known_attrs.update(lemma_attrs)
             for key, value in tok_elem.attrib.items():
                 if key not in known_attrs:
@@ -1324,142 +1492,49 @@ def _load_teitok_with_mappings(
         document.sentences.append(sentence)
         sentence_counter += 1
     
-    # If no <s> elements but we have <tok> elements, create sentence(s) from those tokens.
-    # Many TEITOK files have tokenized text without sentence boundaries; we group by block (p/div) or use one sentence.
+    # If no <s> elements but we have <tok> elements, create sentence(s) via SegmentationPolicy.
     if not document.sentences:
+        from .segmentation_policy import (
+            SegmentationPolicy,
+            TokenSegmentContext,
+            _renumber_tokens,
+            build_sentences_from_tokens,
+        )
+
         all_tok_elems = [n for n in root.iter() if _elem_is(n, "tok")]
         if all_tok_elems:
-            def _block_parent(tok_elem: ET.Element) -> ET.Element:
-                """Innermost ancestor that is p, div, body, or text; else root."""
-                p = parent_map.get(tok_elem)
-                block_tags = ("p", "div", "body", "text")
-                while p is not None and p != root:
-                    local = p.tag.split("}")[-1] if "}" in str(p.tag) else p.tag
-                    if local in block_tags:
-                        return p
-                    p = parent_map.get(p)
-                return root
-
-            sent_counter = 1
-            prev_block: Optional[ET.Element] = None
-            current_sentence: Optional[Sentence] = None
-            current_sentence_tok_elems: List[ET.Element] = []
-            global_tok_id = 1
+            line_keys = _build_tok_line_keys(root)
+            collected_tokens: List[Token] = []
+            collected_contexts: List[TokenSegmentContext] = []
+            token_id = 1
             for tok_elem in all_tok_elems:
-                form_attr = tok_elem.get("form", "")
-                if form_attr == "--":
-                    continue
-                block = _block_parent(tok_elem)
-                if block != prev_block:
-                    if current_sentence is not None:
-                        if current_sentence.tokens:
-                            current_sentence.tokens[-1].space_after = None
-                            if not current_sentence.text and current_sentence_tok_elems:
-                                # Exact text from XML so spacing matches the file
-                                xml_parts = [prev_block.text or ""]
-                                for te in current_sentence_tok_elems:
-                                    xml_parts.append(te.text or "")
-                                    xml_parts.append(te.tail or "")
-                                current_sentence.text = "".join(xml_parts).strip()
-                            elif not current_sentence.text:
-                                current_sentence.text = "".join(
-                                    t.form + (" " if t.space_after else "") for t in current_sentence.tokens
-                                ).strip()
-                        document.sentences.append(current_sentence)
-                    sent_id = f"s-{sent_counter}"
-                    sent_counter += 1
-                    current_sentence = Sentence(id=sent_id, sent_id=sent_id, source_id=sent_id, text="", tokens=[], attrs={})
-                    current_sentence_tok_elems = []
-                    prev_block = block
-
-                form_attr = (tok_elem.get("form") or "").strip()
-                form_text = (tok_elem.text or "").strip()
-                if form_text and form_attr and form_text != form_attr:
-                    form = form_text
-                else:
-                    form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or form_text
-                if not form:
-                    continue
-                tokid = tok_elem.get("id") or tok_elem.get(f"{XML_NS}id", "")
-                lemma = _get_attr_value_with_fallback(tok_elem, lemma_attrs, fallback_to_text=("form" in lemma_attrs))
-                if not lemma and "form" in lemma_attrs:
-                    lemma = form
-                xpos = _get_attr_value_with_fallback(tok_elem, xpos_attrs)
-                upos = _get_attr_value_with_fallback(tok_elem, ["upos"])
-                feats = _get_attr_value_with_fallback(tok_elem, ["feats"])
-                reg = _get_attr_value_with_fallback(tok_elem, reg_attrs, fallback_to_text=("form" in reg_attrs)) or (form if "form" in reg_attrs else "")
-                expan = _get_attr_value_with_fallback(tok_elem, expan_attrs, fallback_to_text=("form" in expan_attrs)) or (form if "form" in expan_attrs else "")
-                mod = _get_attr_value_with_fallback(tok_elem, ["mod"])
-                trslit = _get_attr_value_with_fallback(tok_elem, ["trslit"])
-                ltrslit = _get_attr_value_with_fallback(tok_elem, ["ltrslit"])
-                head_str = tok_elem.get("head", "")
-                head = int(head_str) if head_str and head_str.isdigit() else 0
-                deprel = tok_elem.get("deprel", "")
-                deps = tok_elem.get("deps", "")
-                misc = tok_elem.get("misc", "")
-                tok_attrs: Dict[str, str] = {}
-                if head_str and not head_str.isdigit():
-                    tok_attrs["head_tokid"] = head_str
-                for key, value in tok_elem.attrib.items():
-                    if key not in {"form", "lemma", "xpos", "upos", "feats", "reg", "expan", "mod", "trslit", "ltrslit", "id", "head", "deprel", "deps", "misc", f"{XML_NS}id"}:
-                        tok_attrs[key] = value
-                # Preserve space between tokens: tail " " must yield space_after=True (bool(" ".strip()) is False!)
-                tail = tok_elem.tail or ""
-                space_after = bool(tail and any(c.isspace() for c in tail))
-                subtokens = []
-                for dtok_elem in tok_elem.findall("dtok") or tok_elem.findall("{*}dtok"):
-                    if dtok_elem.get("form", "") == "--":
-                        continue
-                    dtok_form_attr = (dtok_elem.get("form") or "").strip()
-                    dtok_form_text = (dtok_elem.text or "").strip()
-                    if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
-                        dtok_form = dtok_form_text
-                    else:
-                        dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or dtok_form_text
-                    subtokens.append(SubToken(id=len(subtokens) + 1, form=dtok_form, lemma="", xpos="", upos="", feats="", reg="", expan="", space_after=False, attrs={}))
-                token = Token(
-                    id=global_tok_id,
-                    form=form,
-                    lemma=lemma or "",
-                    xpos=xpos or "",
-                    upos=upos or "",
-                    feats=feats or "",
-                    reg=reg or "",
-                    expan=expan or "",
-                    mod=mod or "",
-                    trslit=trslit or "",
-                    ltrslit=ltrslit or "",
-                    tokid=tokid or None,
-                    head=head,
-                    deprel=deprel or "",
-                    deps=deps or "",
-                    misc=misc or "",
-                    is_mwt=len(subtokens) > 0,
-                    subtokens=subtokens,
-                    space_after=space_after,
-                    attrs=tok_attrs,
+                token = _token_from_tok_elem(
+                    tok_elem,
+                    lemma_attrs=lemma_attrs,
+                    xpos_attrs=xpos_attrs,
+                    reg_attrs=reg_attrs,
+                    expan_attrs=expan_attrs,
+                    trslit_attrs=trslit_attrs,
+                    token_id=token_id,
                 )
-                if subtokens:
-                    token.mwt_start = global_tok_id
-                    token.mwt_end = global_tok_id + len(subtokens) - 1
-                    token.parts = [st.form for st in subtokens]
-                global_tok_id += len(subtokens) if subtokens else 1
-                if current_sentence is not None:
-                    current_sentence.tokens.append(token)
-                    current_sentence_tok_elems.append(tok_elem)
-            if current_sentence is not None and current_sentence.tokens:
-                current_sentence.tokens[-1].space_after = None
-                if not current_sentence.text and current_sentence_tok_elems and prev_block is not None:
-                    xml_parts = [prev_block.text or ""]
-                    for te in current_sentence_tok_elems:
-                        xml_parts.append(te.text or "")
-                        xml_parts.append(te.tail or "")
-                    current_sentence.text = "".join(xml_parts).strip()
-                elif not current_sentence.text:
-                    current_sentence.text = "".join(
-                        t.form + (" " if t.space_after else "") for t in current_sentence.tokens
-                    ).strip()
-                document.sentences.append(current_sentence)
+                if token is None:
+                    continue
+                token_id += len(token.subtokens) if token.subtokens else 1
+                collected_tokens.append(token)
+                collected_contexts.append(
+                    TokenSegmentContext(
+                        block_key=_block_key_for_tok(tok_elem, parent_map, root),
+                        line_key=line_keys.get(tok_elem, ""),
+                    )
+                )
+            policy = segmentation_policy or SegmentationPolicy(mode="block")
+            document.sentences = build_sentences_from_tokens(
+                collected_tokens,
+                collected_contexts,
+                policy,
+                language=language,
+            )
+            _renumber_tokens(document.sentences)
     
     # Post-process: convert head from tokid to ord if needed
     # Build tokid -> ord mapping for all tokens

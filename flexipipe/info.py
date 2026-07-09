@@ -1173,6 +1173,7 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
         "cqp_sattributes_by_level": settings.cqp_sattributes_by_level,
         "explicit_flexipipe_mappings": settings.explicit_flexipipe_mappings,
         "flexipipe_preferences": settings.flexipipe_preferences,
+        "profile_registries": settings.profile_registries,
         "known_tags_only": bool(settings.known_tags_only),
         "use_raw_text": bool(settings.use_raw_text),
         "download_model": bool(settings.download_model),
@@ -1345,6 +1346,34 @@ def list_teitok_settings(args: argparse.Namespace) -> int:
             elif model_pref and not backend_pref:
                 registry_note = " (missing backend)"
             print(f"  {lang_key}: {summary}{registry_note}{mismatch_note}")
+
+    for group, title in (
+        ("datasets", "Dataset profiles"),
+        ("applications", "Application profiles"),
+        ("manifests", "Model manifests"),
+    ):
+        entries = settings.profile_registries.get(group) or {}
+        if not entries:
+            continue
+        print(f"\n{title}:")
+        for key in sorted(entries.keys()):
+            item = entries[key]
+            path = item.get("path") or ""
+            label = item.get("label") or ""
+            extra = []
+            if label:
+                extra.append(label)
+            if group == "manifests":
+                if item.get("backend"):
+                    extra.append(f"backend={item.get('backend')}")
+                if item.get("model"):
+                    extra.append(f"model={item.get('model')}")
+                if item.get("xpres"):
+                    extra.append(f"xpres={item.get('xpres')}")
+                if item.get("recond"):
+                    extra.append(f"recond={item.get('recond')}")
+            suffix = f" ({', '.join(extra)})" if extra else ""
+            print(f"  {key}: {path}{suffix}")
     
     # Default language
     if settings.default_language:

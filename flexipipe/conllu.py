@@ -1449,7 +1449,9 @@ def _unescape_form_column(value: str) -> str:
 
 
 def _escape(value: str) -> str:
-    return value if value else "_"
+    if not value:
+        return "_"
+    return value.strip() or "_"
 
 
 def _extract_misc_value(misc: str, key: str) -> str:

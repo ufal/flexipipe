@@ -52,30 +52,239 @@ class UDPipeCLIBackend(BackendManager):
         "learning_rate_final=0.0005,dropout=0.1,early_stopping=1,tokenize_url=1,"
         "allow_spaces=0,dimension=24"
     )
+    # MorphoDiTa stores surface forms with a single-byte length index in the dictionary.
+    MAX_FORM_UTF8_BYTES = 254
+    MAX_FORM_UNICODE_CHARS = 127
 
     @staticmethod
+    def _fix_missing_lemmas_for_udpipe(lines: List[str]) -> tuple[List[str], int]:
+        """
+        Replace missing lemmas (``_`` or empty) with the surface form.
+
+        UDPipe/MorphoDiTa encode at most 255 word forms per lemma in the
+        morphological dictionary. A large share of ``_`` lemmas collapses many
+        unrelated forms under one lemma and triggers training failures such as
+        "Should encode value N in one byte!".
+        """
+        fixed_lines: List[str] = []
+        fixed_count = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                fixed_lines.append(line)
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 3:
+                fixed_lines.append(line)
+                continue
+
+            token_id = parts[0]
+            if "-" in token_id or "." in token_id:
+                fixed_lines.append(line)
+                continue
+
+            lemma = parts[2]
+            if not lemma or lemma == "_":
+                form = parts[1]
+                if form and form != "_":
+                    parts[2] = form
+                    fixed_count += 1
+                line = "\t".join(parts)
+
+            fixed_lines.append(line)
+
+        return fixed_lines, fixed_count
+
+    @staticmethod
+    def _drop_mwt_span_lines_for_udpipe(lines: List[str]) -> tuple[List[str], int]:
+        """
+        Remove multi-word token span lines (IDs containing ``-``).
+
+        UDPipe training only needs the expanded token rows; keeping span lines
+        leaves hundreds of surface forms under the placeholder lemma ``_``.
+        """
+        fixed_lines: List[str] = []
+        dropped = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                token_id = stripped.split("\t", 1)[0]
+                if "-" in token_id:
+                    dropped += 1
+                    continue
+            fixed_lines.append(line)
+
+        return fixed_lines, dropped
+
+    @staticmethod
+    def _truncate_utf8(text: str, max_bytes: int) -> str:
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text
+        truncated = encoded[:max_bytes]
+        while truncated:
+            try:
+                return truncated.decode("utf-8")
+            except UnicodeDecodeError:
+                truncated = truncated[:-1]
+        return ""
+
+    @staticmethod
+    def _truncate_form_for_udpipe(text: str) -> str:
+        """Truncate a surface form to MorphoDiTa dictionary limits."""
+        if len(text) <= UDPipeCLIBackend.MAX_FORM_UNICODE_CHARS and len(
+            text.encode("utf-8")
+        ) <= UDPipeCLIBackend.MAX_FORM_UTF8_BYTES:
+            return text
+        truncated = text[: UDPipeCLIBackend.MAX_FORM_UNICODE_CHARS]
+        return UDPipeCLIBackend._truncate_utf8(
+            truncated, UDPipeCLIBackend.MAX_FORM_UTF8_BYTES
+        )
+
+    @staticmethod
+    def _truncate_overlong_forms_for_udpipe(lines: List[str]) -> tuple[List[str], int]:
+        """
+        Truncate surface forms that exceed MorphoDiTa dictionary limits.
+
+        MorphoDiTa cannot encode longer forms in the morphological dictionary and
+        UDPipe training aborts with errors such as "Should encode value N in one byte!".
+        """
+        fixed_lines: List[str] = []
+        fixed_count = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                fixed_lines.append(line)
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 3:
+                fixed_lines.append(line)
+                continue
+
+            token_id = parts[0]
+            if "-" in token_id or "." in token_id:
+                fixed_lines.append(line)
+                continue
+
+            form = parts[1]
+            truncated = UDPipeCLIBackend._truncate_form_for_udpipe(form)
+            if truncated != form:
+                parts[1] = truncated
+                lemma = parts[2]
+                if lemma == form or UDPipeCLIBackend._truncate_form_for_udpipe(lemma) != lemma:
+                    parts[2] = truncated
+                fixed_count += 1
+                line = "\t".join(parts)
+
+            fixed_lines.append(line)
+
+        return fixed_lines, fixed_count
+
+    @staticmethod
+    def _strip_teitok_misc_for_udpipe(lines: List[str]) -> tuple[List[str], int]:
+        """Drop TEITOK-specific MISC fields that UDPipe training does not use."""
+        drop_prefixes = ("TokId=", "Normalization=", "Expansion=", "Translit=")
+        fixed_lines: List[str] = []
+        fixed_count = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                fixed_lines.append(line)
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 10:
+                fixed_lines.append(line)
+                continue
+
+            misc = parts[9]
+            if misc and misc != "_":
+                kept = [
+                    piece
+                    for piece in misc.split("|")
+                    if piece and not piece.startswith(drop_prefixes)
+                ]
+                new_misc = "|".join(kept) if kept else "_"
+                if new_misc != misc:
+                    parts[9] = new_misc
+                    fixed_count += 1
+                    line = "\t".join(parts)
+
+            fixed_lines.append(line)
+
+        return fixed_lines, fixed_count
+
+    @staticmethod
+    def _write_fixed_conllu(lines: List[str]) -> Path:
+        fixed_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".conllu", delete=False, encoding="utf-8"
+        )
+        fixed_file.write("\n".join(lines))
+        fixed_file.close()
+        return Path(fixed_file.name)
+
     @staticmethod
     def _validate_and_fix_conllu_for_training(conllu_path: Path, verbose: bool = False, debug: bool = False) -> Path:
         """
         Validate and filter CoNLL-U file for UDPipe training.
-        
-        Removes sentences with missing deprel values (unless the corpus has no dependencies at all).
-        This prevents noise in the model from invalid dependency structures.
-        
-        Returns the path to the (possibly filtered) CoNLL-U file.
-        If filtering was needed, returns a temporary file path; otherwise returns the original.
+
+        - Replaces missing lemmas (``_``) with the token form so MorphoDiTa can
+          build the morphological dictionary (255-form-per-lemma limit).
+        - Truncates surface forms longer than 127 Unicode characters or 254 UTF-8 bytes.
+        - Drops multi-word token span lines (expanded tokens are kept).
+        - Strips TEITOK-specific MISC attributes unused by UDPipe.
+        - Removes sentences with missing deprel values when the corpus has
+          dependency annotations.
+
+        Returns the path to the (possibly fixed) CoNLL-U file.
+        If changes were needed, returns a temporary file path; otherwise the original.
         """
         from ..file_utils import read_text_file
-        
-        lines = read_text_file(conllu_path).split('\n')
-        
+
+        lines = read_text_file(conllu_path).split("\n")
+        lines, fixed_lemma_count = UDPipeCLIBackend._fix_missing_lemmas_for_udpipe(lines)
+        lines, dropped_mwt_count = UDPipeCLIBackend._drop_mwt_span_lines_for_udpipe(lines)
+        lines, truncated_form_count = UDPipeCLIBackend._truncate_overlong_forms_for_udpipe(lines)
+        lines, stripped_misc_count = UDPipeCLIBackend._strip_teitok_misc_for_udpipe(lines)
+        preprocessing_changed = bool(
+            fixed_lemma_count or dropped_mwt_count or truncated_form_count or stripped_misc_count
+        )
+
+        if fixed_lemma_count and (verbose or debug):
+            print(
+                f"[flexipipe] Replaced {fixed_lemma_count} missing lemma(s) with surface form "
+                "for UDPipe training."
+            )
+        if dropped_mwt_count and (verbose or debug):
+            print(
+                f"[flexipipe] Dropped {dropped_mwt_count} multi-word token span line(s) "
+                "for UDPipe training."
+            )
+        if truncated_form_count and (verbose or debug):
+            print(
+                f"[flexipipe] Truncated {truncated_form_count} overlong token form(s) to "
+                f"{UDPipeCLIBackend.MAX_FORM_UNICODE_CHARS} Unicode characters / "
+                f"{UDPipeCLIBackend.MAX_FORM_UTF8_BYTES} UTF-8 bytes for UDPipe training."
+            )
+        if stripped_misc_count and debug:
+            print(
+                f"[flexipipe] Stripped TEITOK MISC attributes from {stripped_misc_count} token(s) "
+                "for UDPipe training."
+            )
+
         # First pass: check if corpus has any dependencies at all
         corpus_has_dependencies = False
         for line in lines:
             stripped = line.strip()
-            if not stripped or stripped.startswith('#'):
+            if not stripped or stripped.startswith("#"):
                 continue
-            parts = line.split('\t')
+            parts = line.split("\t")
             if len(parts) < 8:
                 continue
             token_id = parts[0]
@@ -89,20 +298,22 @@ class UDPipeCLIBackend(BackendManager):
             if head and head.strip() and head.strip() != "_" and head.strip() != "0":
                 corpus_has_dependencies = True
                 break
-        
-        # If corpus has no dependencies, keep all sentences
+
+        # If corpus has no dependencies, return preprocessed file when needed
         if not corpus_has_dependencies:
             if debug:
-                print(f"[flexipipe] Corpus has no dependency annotations; keeping all sentences.")
+                print("[flexipipe] Corpus has no dependency annotations; keeping all sentences.")
+            if preprocessing_changed:
+                return UDPipeCLIBackend._write_fixed_conllu(lines)
             return conllu_path
-        
+
         # Second pass: filter out sentences with missing deprel values
         filtered_lines = []
         current_sentence_lines = []
         discarded_sentences = 0
         sentence_has_invalid_deprel = False
         sentence_id = None
-        
+
         for line in lines:
             stripped = line.strip()
             if not stripped:
@@ -120,33 +331,33 @@ class UDPipeCLIBackend(BackendManager):
                 sentence_has_invalid_deprel = False
                 sentence_id = None
                 continue
-            
-            if stripped.startswith('#'):
+
+            if stripped.startswith("#"):
                 # Comment line - extract sent_id if present
-                if stripped.startswith('# sent_id = '):
-                    sentence_id = stripped.replace('# sent_id = ', '').strip()
+                if stripped.startswith("# sent_id = "):
+                    sentence_id = stripped.replace("# sent_id = ", "").strip()
                 current_sentence_lines.append(line)
                 continue
-            
-            parts = line.split('\t')
+
+            parts = line.split("\t")
             if len(parts) < 8:
                 current_sentence_lines.append(line)
                 continue
-            
+
             token_id = parts[0]
             if "-" in token_id or "." in token_id:
                 # MWT or empty node - keep as is (MWTs should not have deprel)
                 current_sentence_lines.append(line)
                 continue
-            
+
             # Only check deprel for regular tokens (not MWTs or empty nodes)
             deprel = parts[7] if len(parts) > 7 else ""
             # Check if deprel is missing or empty
             if not deprel or deprel.strip() == "" or deprel.strip() == "_":
                 sentence_has_invalid_deprel = True
-            
+
             current_sentence_lines.append(line)
-        
+
         # Handle last sentence if file doesn't end with blank line
         if current_sentence_lines:
             if sentence_has_invalid_deprel:
@@ -156,21 +367,20 @@ class UDPipeCLIBackend(BackendManager):
                     print(f"[flexipipe] Discarding sentence{sent_info} with missing deprel values")
             else:
                 filtered_lines.extend(current_sentence_lines)
-        
+
         if discarded_sentences > 0:
             if verbose or debug:
                 print(f"[flexipipe] Discarded {discarded_sentences} sentence(s) with missing deprel values")
                 if debug and discarded_sentences > 10:
-                    print(f"[flexipipe] ... (showing first 10 above)")
-            
-            # Write filtered content to temporary file
-            import tempfile
-            fixed_file = tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8")
-            fixed_file.write('\n'.join(filtered_lines))
-            fixed_file.close()
-            return Path(fixed_file.name)
-        else:
-            return conllu_path
+                    print("[flexipipe] ... (showing first 10 above)")
+
+            fixed_file = UDPipeCLIBackend._write_fixed_conllu(filtered_lines)
+            return fixed_file
+
+        if preprocessing_changed:
+            return UDPipeCLIBackend._write_fixed_conllu(lines)
+
+        return conllu_path
     
     @staticmethod
     def _detect_annotation_coverage(conllu_path: Path) -> Dict[str, bool]:

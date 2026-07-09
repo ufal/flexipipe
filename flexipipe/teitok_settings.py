@@ -95,6 +95,12 @@ class TeitokSettings:
         # Attribute names to try on <s> for "sentence references these token IDs" (sameAs vs corresp)
         # Order: first non-empty wins. Older TEITOK uses corresp.
         self.sentence_tokref_attributes: List[str] = ["sameAs", "sameas", "corresp"]
+        # Keyed registries from <flexipipe><datasets|applications|manifests><item key="..."/>
+        self.profile_registries: Dict[str, Dict[str, Dict[str, str]]] = {
+            "datasets": {},
+            "applications": {},
+            "manifests": {},
+        }
     
     @classmethod
     def load(cls, settings_path: Path) -> TeitokSettings:
@@ -465,6 +471,20 @@ class TeitokSettings:
                 backend = item_elem.get("backend")
                 model = item_elem.get("model")
                 _store_pref(code, backend, model)
+
+        # <flexipipe><datasets|applications|manifests><item key="..."/> registries
+        for group in ("datasets", "applications", "manifests"):
+            group_elem = flexipipe_elem.find(group)
+            if group_elem is None:
+                continue
+            for item_elem in group_elem.findall("item"):
+                key = item_elem.get("key")
+                if not key:
+                    continue
+                entry = {k: (v.strip() if isinstance(v, str) else v) for k, v in item_elem.attrib.items()}
+                if prefer_existing and key in self.profile_registries[group]:
+                    continue
+                self.profile_registries[group][key] = entry
     
     def _build_attribute_mappings(self) -> None:
         """

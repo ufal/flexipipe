@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 from .conllu import conllu_to_document, document_to_conllu
 from .doc import Document, Sentence, SubToken, Token, apply_nlpform
 from .engine import FlexitagFallback
+from .segmentation_policy import SegmentationPolicy, policy_for_backend
 
 # Default configuration that becomes part of the model JSON.
 DEFAULT_TAGGER_SETTINGS: Dict[str, Any] = {
@@ -551,6 +552,9 @@ def _load_teitok(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
+    segmentation_policy: Optional[SegmentationPolicy] = None,
+    language: Optional[str] = None,
 ) -> Document:
     from .teitok import load_teitok
     return load_teitok(
@@ -559,6 +563,9 @@ def _load_teitok(
         reg_attr=reg_attr,
         expan_attr=expan_attr,
         lemma_attr=lemma_attr,
+        trslit_attr=trslit_attr,
+        segmentation_policy=segmentation_policy,
+        language=language,
     )
 
 
@@ -680,7 +687,10 @@ def _collect_teitok_sentences(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
     collect_all: bool = False,
+    segmentation_policy: Optional[SegmentationPolicy] = None,
+    language: Optional[str] = None,
 ) -> List[Sentence]:
     """
     Collect all sentences from TEITOK XML files in a directory.
@@ -723,6 +733,9 @@ def _collect_teitok_sentences(
                 reg_attr=reg_attr,
                 expan_attr=expan_attr,
                 lemma_attr=lemma_attr,
+                trslit_attr=trslit_attr,
+                segmentation_policy=segmentation_policy,
+                language=language,
             )
             file_sentences = 0
             # Get filename without extension for sent_id prefix
@@ -765,6 +778,23 @@ def _collect_teitok_sentences(
     return all_sentences
 
 
+def _flexitag_uses_document_split_files(
+    backend_type: str,
+    policy: SegmentationPolicy,
+    export_document_splits: bool,
+) -> bool:
+    """When flexitag uses document segmentation alongside heuristic conllu, write *.document.conllu only."""
+    return (
+        export_document_splits
+        and policy.mode == "document"
+        and backend_type == "flexitag"
+    )
+
+
+def _split_conllu_stem(split_name: str, document_split_files: bool) -> str:
+    return f"{split_name}.document" if document_split_files else split_name
+
+
 def _split_sentences(
     sentences: List[Sentence],
     train_ratio: float = 0.8,
@@ -772,6 +802,8 @@ def _split_sentences(
     test_ratio: float = 0.1,
     seed: Optional[int] = None,
     output_dir: Optional[Path] = None,
+    *,
+    split_file_suffix: str = "",
 ) -> Dict[str, List[Sentence]]:
     """
     Split sentences into train/dev/test sets.
@@ -786,6 +818,7 @@ def _split_sentences(
         test_ratio: Proportion for test set (default: 0.1)
         seed: Random seed for reproducibility
         output_dir: Optional output directory to check for existing splits
+        split_file_suffix: When ".document", preserve/write train.document.conllu etc.
     
     Returns:
         Dictionary with "train", "dev", "test" keys containing lists of sentences
@@ -797,7 +830,8 @@ def _split_sentences(
     existing_splits: Dict[str, set[str]] = {}
     if output_dir and output_dir.exists():
         for split_name in ("train", "dev", "test"):
-            split_file = output_dir / f"{split_name}.conllu"
+            stem = f"{split_name}{split_file_suffix}"
+            split_file = output_dir / f"{stem}.conllu"
             if split_file.exists():
                 try:
                     # Load existing split and extract sent_ids
@@ -886,6 +920,11 @@ def _prepare_teitok_corpus(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
+    segmentation_policy: Optional[SegmentationPolicy] = None,
+    language: Optional[str] = None,
+    export_document_splits: bool = False,
+    document_segmentation_policy: Optional[SegmentationPolicy] = None,
 ) -> Dict[str, Path]:
     """
     Prepare a TEITOK corpus or CoNLL-U treebank for training by converting to CoNLL-U and splitting.
@@ -1042,29 +1081,35 @@ def _prepare_teitok_corpus(
                 result["_token_counts"] = split_token_counts  # type: ignore
                 return result
     else:
+        effective_policy = segmentation_policy or policy_for_backend(backend_type)
+        if verbose:
+            print(f"[flexipipe] TEITOK segmentation mode: {effective_policy.mode}")
+
+        collect_kwargs = dict(
+            xpos_attr=xpos_attr,
+            reg_attr=reg_attr,
+            expan_attr=expan_attr,
+            lemma_attr=lemma_attr,
+            trslit_attr=trslit_attr,
+            segmentation_policy=effective_policy,
+            language=language,
+        )
+
         # Collect all sentences from TEITOK
-        # For flexitag, we collect both complete and incomplete sentences
-        # For neural backends, we only collect complete sentences
         if backend_type == "flexitag":
-            # Collect all sentences (both complete and incomplete)
             all_sentences = _collect_teitok_sentences(
                 teitok_dir,
                 required_annotations,
                 backend_type,
                 verbose,
-                xpos_attr=xpos_attr,
-                reg_attr=reg_attr,
-                expan_attr=expan_attr,
-                lemma_attr=lemma_attr,
-                collect_all=True,  # Collect all sentences, not just complete ones
+                collect_all=True,
+                **collect_kwargs,
             )
-            
-            # Report total processed
+
             total_sentences = len(all_sentences)
             total_tokens = sum(len(sent.tokens) for sent in all_sentences)
             print(f"[flexipipe] Processed {total_sentences:,} sentences ({total_tokens:,} tokens) from TEITOK corpus")
-            
-            # Separate complete and incomplete sentences
+
             complete_sentences = []
             incomplete_sentences = []
             for sentence in all_sentences:
@@ -1072,15 +1117,13 @@ def _prepare_teitok_corpus(
                     complete_sentences.append(sentence)
                 else:
                     incomplete_sentences.append(sentence)
-            
-            # Report complete vs incomplete
+
             complete_tokens = sum(len(sent.tokens) for sent in complete_sentences)
             incomplete_tokens = sum(len(sent.tokens) for sent in incomplete_sentences)
             print(f"[flexipipe] Complete: {len(complete_sentences):,} sentences ({complete_tokens:,} tokens)")
             if incomplete_sentences:
                 print(f"[flexipipe] Incomplete: {len(incomplete_sentences):,} sentences ({incomplete_tokens:,} tokens)")
-            
-            # Write incomplete sentences to incomplete.conllu if any
+
             if incomplete_sentences:
                 incomplete_doc = Document(id="incomplete")
                 incomplete_doc.sentences = incomplete_sentences
@@ -1089,27 +1132,50 @@ def _prepare_teitok_corpus(
                 incomplete_file.write_text(incomplete_text, encoding="utf-8")
                 result["incomplete"] = incomplete_file
                 print(f"[flexipipe] Wrote incomplete sentences to {incomplete_file}")
-            
+
             sentences = complete_sentences
         else:
-            # For neural backends, only collect complete sentences
+            if effective_policy.mode == "document":
+                print(
+                    "[flexipipe] WARNING: document-level segmentation is not recommended for "
+                    f"neural backend '{backend_type}'. Use --segment-conllu heuristic or model.",
+                    file=sys.stderr,
+                )
             sentences = _collect_teitok_sentences(
                 teitok_dir,
                 required_annotations,
                 backend_type,
                 verbose,
-                xpos_attr=xpos_attr,
-                reg_attr=reg_attr,
-                expan_attr=expan_attr,
-                lemma_attr=lemma_attr,
+                **collect_kwargs,
             )
-            # Report for neural backends
             total_tokens = sum(len(sent.tokens) for sent in sentences)
             print(f"[flexipipe] Processed {len(sentences):,} complete sentences ({total_tokens:,} tokens) from TEITOK corpus")
+            max_sent_len = max((len(s.tokens) for s in sentences), default=0)
+            if max_sent_len > 500 and effective_policy.mode == "document":
+                raise ValueError(
+                    f"Largest sentence has {max_sent_len:,} tokens with document segmentation. "
+                    "Neural backends require shorter units; set segmentation.conllu to heuristic or model."
+                )
     
+    effective_policy = segmentation_policy or policy_for_backend(backend_type)
+    document_split_files = _flexitag_uses_document_split_files(
+        backend_type,
+        effective_policy,
+        export_document_splits,
+    )
+    split_file_suffix = ".document" if document_split_files else ""
+
     # Split sentences (pass output_dir to preserve existing splits if rerunning)
     # Note: If input was CoNLL-U with existing splits, they will be preserved
-    splits = _split_sentences(sentences, train_ratio, dev_ratio, test_ratio, seed, output_dir=output_dir)
+    splits = _split_sentences(
+        sentences,
+        train_ratio,
+        dev_ratio,
+        test_ratio,
+        seed,
+        output_dir=output_dir,
+        split_file_suffix=split_file_suffix,
+    )
     
     # Write CoNLL-U files and collect token counts
     split_token_counts: Dict[str, int] = {}
@@ -1126,14 +1192,56 @@ def _prepare_teitok_corpus(
         split_doc = Document(id=f"{split_name}_split")
         split_doc.sentences = split_sentences
         
-        # Write to CoNLL-U
-        output_file = output_dir / f"{split_name}.conllu"
+        # Write to CoNLL-U (flexitag document mode keeps heuristic train.conllu untouched)
+        stem = _split_conllu_stem(split_name, document_split_files)
+        output_file = output_dir / f"{stem}.conllu"
         conllu_text = document_to_conllu(split_doc, create_implicit_mwt=False)
         output_file.write_text(conllu_text, encoding="utf-8")
         result[split_name] = output_file
+        if document_split_files:
+            result[f"{split_name}.document"] = output_file
         
         if verbose:
             print(f"[flexipipe] Wrote {len(split_sentences)} sentences to {output_file}")
+
+    # Optional document-level CoNLL-U export (flexitag-style one sentence per file)
+    doc_policy = document_segmentation_policy or SegmentationPolicy(mode="document")
+    if (
+        export_document_splits
+        and not is_conllu_input
+        and doc_policy.mode == "document"
+        and not document_split_files
+    ):
+        doc_sentences = _collect_teitok_sentences(
+            teitok_dir,
+            required_annotations,
+            backend_type,
+            verbose,
+            collect_all=(backend_type == "flexitag"),
+            xpos_attr=xpos_attr,
+            reg_attr=reg_attr,
+            expan_attr=expan_attr,
+            lemma_attr=lemma_attr,
+            trslit_attr=trslit_attr,
+            segmentation_policy=doc_policy,
+            language=language,
+        )
+        if backend_type != "flexitag":
+            doc_sentences = [
+                s for s in doc_sentences
+                if _sentence_has_required_annotations(s, required_annotations, backend_type)
+            ]
+        doc_splits = _split_sentences(doc_sentences, train_ratio, dev_ratio, test_ratio, seed, output_dir=None)
+        for split_name, split_sents in doc_splits.items():
+            if not split_sents:
+                continue
+            split_doc = Document(id=f"{split_name}_document_split")
+            split_doc.sentences = split_sents
+            doc_file = output_dir / f"{split_name}.document.conllu"
+            doc_file.write_text(document_to_conllu(split_doc, create_implicit_mwt=False), encoding="utf-8")
+            result[f"{split_name}.document"] = doc_file
+            if verbose:
+                print(f"[flexipipe] Wrote document-level {split_name} to {doc_file}")
     
     # Store token counts in result for summary display
     result["_token_counts"] = split_token_counts  # type: ignore
@@ -1146,9 +1254,106 @@ def _prepare_teitok_corpus(
     return result
 
 
-def _find_ud_splits(ud_root: Path) -> Dict[str, Path]:
+def _is_teitok_corpus_dir(path: Path) -> bool:
+    """Return True if path looks like a directory of TEITOK XML files."""
+    if not path.is_dir():
+        return False
+    for ext in ("*.xml", "*.tei", "*.teitok"):
+        try:
+            if any(path.glob(ext)) or any(path.rglob(ext)):
+                return True
+        except (PermissionError, OSError):
+            pass
+    return False
+
+
+def _try_find_conllu_splits(folder: Path, split_suffix: str = "") -> Dict[str, Path]:
+    if not folder.is_dir():
+        return {}
+    try:
+        return _find_ud_splits(folder, split_suffix=split_suffix)
+    except FileNotFoundError:
+        return {}
+
+
+def _announce_existing_splits(splits: Dict[str, Path]) -> None:
+    train = splits.get("train")
+    if train:
+        print(f"[flexipipe] Using existing CoNLL-U splits in {train.parent}")
+
+
+def _resolve_training_splits(
+    *,
+    ud_folder: Optional[Path],
+    source_dir: Path,
+    backend_type: str,
+    segmentation_policy: Optional[SegmentationPolicy],
+    export_document_splits: bool,
+    refresh_splits: bool = False,
+) -> tuple[Dict[str, Path], bool]:
+    """
+    Locate train/dev/test CoNLL-U files for training.
+
+    Returns (splits, needs_teitok_prepare). When needs_teitok_prepare is True, caller
+    should convert TEITOK XML from source_dir into ud_folder.
+    """
+    policy = segmentation_policy or policy_for_backend(backend_type)
+    use_document = _flexitag_uses_document_split_files(
+        backend_type, policy, export_document_splits
+    )
+    suffix = ".document" if use_document else ""
+    source_resolved = source_dir.expanduser().resolve()
+    ud_folder_resolved = ud_folder.expanduser().resolve() if ud_folder else None
+
+    if refresh_splits:
+        if not _is_teitok_corpus_dir(source_resolved):
+            raise ValueError(
+                "--refresh-splits requires train-data to point at a TEITOK XML directory"
+            )
+        return {}, True
+
+    folders: List[Path] = []
+    if ud_folder_resolved:
+        folders.append(ud_folder_resolved)
+    if source_resolved not in folders:
+        folders.append(source_resolved)
+
+    for folder in folders:
+        splits = _try_find_conllu_splits(folder, suffix)
+        if splits.get("train"):
+            return splits, False
+
+    if use_document and ud_folder_resolved:
+        if _try_find_conllu_splits(ud_folder_resolved, "").get("train"):
+            raise ValueError(
+                f"Flexitag needs {ud_folder_resolved}/train.document.conllu but only "
+                "train.conllu exists. Run 'flexipipe convert --type treebank' or "
+                "use --refresh-splits to rebuild from TEITOK."
+            )
+
+    if _is_teitok_corpus_dir(source_resolved):
+        return {}, True
+
+    raise FileNotFoundError(
+        f"Could not locate CoNLL-U training splits. Set train.ud_folder in your profile "
+        f"or pass --ud-folder, run 'flexipipe convert --type treebank', or point "
+        f"--train-data at a folder containing train.conllu. Searched: "
+        f"{', '.join(str(f) for f in folders)}"
+    )
+
+
+def _find_ud_splits(ud_root: Path, *, split_suffix: str = "") -> Dict[str, Path]:
     """Find train/dev/test splits, supporting both CoNLL-U and TEITOK formats."""
-    splits = {}
+    splits: Dict[str, Path] = {}
+    if split_suffix:
+        for split in ("train", "dev", "test"):
+            path = ud_root / f"{split}{split_suffix}.conllu"
+            if path.exists():
+                splits[split] = path
+        if "train" not in splits:
+            return {}
+        return splits
+
     # Try CoNLL-U files first (standard UD format)
     for split in ("train", "dev", "test"):
         # Try standard UD naming: *-ud-{split}.conllu
@@ -1469,6 +1674,15 @@ def train_ud_treebank(
     reg_attr: Optional[str] = None,
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
+    trslit_attr: Optional[str] = None,
+    segmentation_policy: Optional[SegmentationPolicy] = None,
+    export_document_splits: bool = False,
+    document_segmentation_policy: Optional[SegmentationPolicy] = None,
+    train_ratio: float = 0.8,
+    dev_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 42,
+    refresh_splits: bool = False,
 ) -> Path:
     tag_attribute_input = tag_attribute.lower() if tag_attribute else None
     if tag_attribute_input not in {None, "auto", "xpos", "upos", "utot"}:
@@ -1483,15 +1697,24 @@ def train_ud_treebank(
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    splits = _find_ud_splits(ud_root)
-    
-    # Handle TEITOK corpus directory (no pre-split files)
+    ud_folder_path = Path(ud_folder).expanduser().resolve() if ud_folder else None
+
+    splits, needs_prepare = _resolve_training_splits(
+        ud_folder=ud_folder_path,
+        source_dir=ud_root,
+        backend_type="flexitag",
+        segmentation_policy=segmentation_policy,
+        export_document_splits=export_document_splits,
+        refresh_splits=refresh_splits,
+    )
+
+    # Handle TEITOK corpus directory (no pre-split files, or --refresh-splits)
     teitok_temp_dir = None
-    if not splits or "train" not in splits:
+    if needs_prepare:
         # This is a TEITOK corpus - prepare it
         # Use ud_folder if provided, otherwise create a temporary directory
         if ud_folder:
-            tmp_path = Path(ud_folder).expanduser().resolve()
+            tmp_path = ud_folder_path  # type: ignore[assignment]
             tmp_path.mkdir(parents=True, exist_ok=True)
             teitok_temp_dir = str(tmp_path)
         else:
@@ -1515,15 +1738,20 @@ def train_ud_treebank(
                 output_dir=tmp_path,
                 required_annotations=required_annotations,
                 backend_type="flexitag",
-                train_ratio=0.8,
-                dev_ratio=0.1,
-                test_ratio=0.1,
-                seed=42,  # Fixed seed for reproducibility
+                train_ratio=train_ratio,
+                dev_ratio=dev_ratio,
+                test_ratio=test_ratio,
+                seed=seed,
                 verbose=verbose,
                 xpos_attr=xpos_attr,
                 reg_attr=reg_attr,
                 expan_attr=expan_attr,
                 lemma_attr=lemma_attr,
+                trslit_attr=trslit_attr,
+                segmentation_policy=segmentation_policy,
+                language=language_code,
+                export_document_splits=export_document_splits,
+                document_segmentation_policy=document_segmentation_policy,
             )
             splits = prepared_splits
             
@@ -1570,6 +1798,8 @@ def train_ud_treebank(
             if teitok_temp_dir and not ud_folder:
                 shutil.rmtree(teitok_temp_dir, ignore_errors=True)
             raise
+    else:
+        _announce_existing_splits(splits)
     
     # Final check: ensure we have a train split before proceeding
     if "train" not in splits:
