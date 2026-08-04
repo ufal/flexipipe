@@ -286,7 +286,7 @@ void CoNLLUWriter::write(const std::vector<Sentence>& sentences, std::ostream& o
             }
         } else {
             // No original text, use defaults
-            for (const auto& token : sentence.tokens) {
+            for (size_t i = 0; i < sentence.tokens.size(); ++i) {
                 space_after_flags.push_back(true);
             }
         }

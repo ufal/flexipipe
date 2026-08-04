@@ -200,6 +200,9 @@ class FlexiBuildExt(build_ext):
             "cmake",
             "..",
             "-DFLEXITAG_BUILD_PYTHON=ON",
+            # Static libflexitag so flexitag_py does not need a separate
+            # libflexitag.so at import time (critical for pip wheels).
+            "-DBUILD_SHARED_LIBS=OFF",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
@@ -284,17 +287,37 @@ class FlexiBuildExt(build_ext):
             built_module = so_files[0]
             _log(f"[flexipipe] Successfully built flexitag_py: {built_module}")
 
+            # If a shared libflexitag was still produced, ship it next to the module
+            # and rely on $ORIGIN RPATH (see flexitag/CMakeLists.txt).
+            shared_libs = (
+                list(build_dir.rglob("libflexitag.so*"))
+                + list(build_dir.rglob("libflexitag*.dylib"))
+                + list(build_dir.rglob("flexitag*.dll"))
+            )
+
             if hasattr(self, "build_lib") and self.build_lib:
                 target_dir = Path(self.build_lib) / "flexipipe"
                 target_dir.mkdir(parents=True, exist_ok=True)
                 target_path = target_dir / built_module.name
                 shutil.copy2(built_module, target_path)
                 _log(f"[flexipipe] Copied flexitag_py to {target_path}")
+                for lib in shared_libs:
+                    if lib.is_symlink():
+                        # Preserve soname symlinks when possible
+                        dest = target_dir / lib.name
+                        if dest.exists() or dest.is_symlink():
+                            dest.unlink()
+                        dest.symlink_to(os.readlink(lib))
+                    elif lib.is_file():
+                        shutil.copy2(lib, target_dir / lib.name)
+                        _log(f"[flexipipe] Copied {lib.name} next to flexitag_py")
 
                 flexitag_build_dir = Path(self.build_lib) / "flexitag" / "build"
                 flexitag_build_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(built_module, flexitag_build_dir / built_module.name)
-        except RuntimeError:
+                for lib in shared_libs:
+                    if lib.is_file() and not lib.is_symlink():
+                        shutil.copy2(lib, flexitag_build_dir / lib.name)        except RuntimeError:
             raise
         except Exception as e:
             _fail_or_skip(f"Error building flexitag_py: {e}")
@@ -514,10 +537,16 @@ setup(
         "flexipipe": [
             "flexitag_py*.so",
             "flexitag_py*.pyd",
+            "libflexitag.so*",
+            "libflexitag*.dylib",
             "data/flexipipe_wrapper.sh",
             "data/flexipipe_launcher.c",
         ],
-        "": ["flexitag/build/flexitag_py*.so", "flexitag/build/flexitag_py*.pyd"],  # Include from flexitag/build
+        "": [
+            "flexitag/build/flexitag_py*.so",
+            "flexitag/build/flexitag_py*.pyd",
+            "flexitag/build/libflexitag.so*",
+        ],
     },
     include_package_data=True,
     python_requires=">=3.8",

@@ -164,6 +164,12 @@ if(FLEXITAG_BUILD_PYTHON)
         pybind11_add_module(flexitag_py bindings/python/module.cpp)
         target_include_directories(flexitag_py PRIVATE ${PROJECT_SOURCE_DIR}/include)
         target_link_libraries(flexitag_py PRIVATE flexitag)
+        # Look for libflexitag.so next to the module when shared builds are used.
+        set_target_properties(flexitag_py PROPERTIES
+            BUILD_RPATH_USE_ORIGIN TRUE
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH TRUE
+        )
         # Python module needs ICU headers (inherited from flexitag, but ensure they're available)
         if(ICU_INCLUDE_DIR)
             target_include_directories(flexitag_py PRIVATE ${ICU_INCLUDE_DIR})
@@ -179,6 +185,11 @@ if(FLEXITAG_BUILD_PYTHON)
         pybind11_add_module(flexitag_py bindings/python/module.cpp)
         target_include_directories(flexitag_py PRIVATE ${PROJECT_SOURCE_DIR}/include)
         target_link_libraries(flexitag_py PRIVATE flexitag)
+        set_target_properties(flexitag_py PROPERTIES
+            BUILD_RPATH_USE_ORIGIN TRUE
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH TRUE
+        )
         # Python module needs ICU headers (inherited from flexitag, but ensure they're available)
         if(ICU_INCLUDE_DIR)
             target_include_directories(flexitag_py PRIVATE ${ICU_INCLUDE_DIR})
