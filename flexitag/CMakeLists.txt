@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+option(FLEXITAG_BUILD_PYTHON "Build Python bindings" ON)
 
 include(FetchContent)
 
@@ -24,19 +25,26 @@ target_include_directories(flexitag
         ${PROJECT_SOURCE_DIR}/include
 )
 
-# Try system pugixml first
+# Try system pugixml first (unless building the Python module for pip wheels,
+# where we prefer a static FetchContent pugixml so libpugixml.so is not required
+# at import time on target machines).
 find_package(pugixml QUIET)
+
+if(FLEXITAG_BUILD_PYTHON)
+    message(STATUS "FLEXITAG_BUILD_PYTHON=ON: using static bundled pugixml for wheel portability")
+    set(pugixml_FOUND FALSE)
+endif()
 
 if(pugixml_FOUND)
     target_link_libraries(flexitag PRIVATE pugixml::pugixml)
 else()
     find_path(PUGIXML_INCLUDE_DIR pugixml.hpp)
     find_library(PUGIXML_LIBRARY NAMES pugixml)
-    if(PUGIXML_INCLUDE_DIR AND PUGIXML_LIBRARY)
+    if(PUGIXML_INCLUDE_DIR AND PUGIXML_LIBRARY AND NOT FLEXITAG_BUILD_PYTHON)
         target_include_directories(flexitag PRIVATE ${PUGIXML_INCLUDE_DIR})
         target_link_libraries(flexitag PRIVATE ${PUGIXML_LIBRARY})
     else()
-        message(STATUS "System pugixml not found, fetching local copy")
+        message(STATUS "System pugixml not used, fetching static local copy")
         FetchContent_Declare(
             pugixml_fetch
             URL https://github.com/zeux/pugixml/archive/refs/tags/v1.14.tar.gz
@@ -150,7 +158,6 @@ endif()
 add_executable(flexitag_cli cli/flexitag_cli.cpp)
 target_link_libraries(flexitag_cli PRIVATE flexitag)
 
-option(FLEXITAG_BUILD_PYTHON "Build Python bindings" ON)
 if(FLEXITAG_BUILD_PYTHON)
     # Prefer the interpreter/headers passed from setup.py (venv Python),
     # so we do not pick up a stale system pybind11 aimed at another Python
