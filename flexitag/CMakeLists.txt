@@ -4,6 +4,8 @@ project(flexitag LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Required when linking static/shared flexitag into the Python extension (.so).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 

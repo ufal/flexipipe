@@ -200,9 +200,11 @@ class FlexiBuildExt(build_ext):
             "cmake",
             "..",
             "-DFLEXITAG_BUILD_PYTHON=ON",
-            # Static libflexitag so flexitag_py does not need a separate
-            # libflexitag.so at import time (critical for pip wheels).
-            "-DBUILD_SHARED_LIBS=OFF",
+            # Shared libflexitag + copy it next to flexitag_py (with $ORIGIN RPATH).
+            # Static linking previously dropped the module from some wheels when
+            # -fPIC was missing; shipping both files is more reliable for pip.
+            "-DBUILD_SHARED_LIBS=ON",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
@@ -318,6 +320,23 @@ class FlexiBuildExt(build_ext):
                 for lib in shared_libs:
                     if lib.is_file() and not lib.is_symlink():
                         shutil.copy2(lib, flexitag_build_dir / lib.name)
+
+                # Ensure the wheel will contain the extension (setuptools 80+
+                # can omit unexpected non-.py files unless present in build_lib).
+                if not target_path.is_file():
+                    _fail_or_skip(
+                        f"flexitag_py was built but not copied into build_lib: {target_path}"
+                    )
+                    return
+                shipped = list(target_dir.glob("flexitag_py*")) + list(
+                    target_dir.glob("libflexitag*")
+                )
+                _log(f"[flexipipe] Wheel payload in {target_dir}: {[p.name for p in shipped]}")
+                if not any(p.name.startswith("libflexitag") for p in shipped):
+                    _log(
+                        "[flexipipe] Warning: libflexitag.* not found next to flexitag_py; "
+                        "import may fail unless flexitag was linked statically"
+                    )
         except RuntimeError:
             raise
         except Exception as e:
