@@ -150,6 +150,15 @@ target_link_libraries(flexitag_cli PRIVATE flexitag)
 
 option(FLEXITAG_BUILD_PYTHON "Build Python bindings" ON)
 if(FLEXITAG_BUILD_PYTHON)
+    # Prefer the interpreter/headers passed from setup.py (venv Python),
+    # so we do not pick up a stale system pybind11 aimed at another Python
+    # (e.g. /usr/include/python3.6m while building for 3.10).
+    if(DEFINED Python3_EXECUTABLE OR DEFINED PYTHON_EXECUTABLE)
+        if(NOT Python3_EXECUTABLE AND PYTHON_EXECUTABLE)
+            set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}")
+        endif()
+        find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+    endif()
     find_package(pybind11 CONFIG QUIET)
     if(pybind11_FOUND)
         pybind11_add_module(flexitag_py bindings/python/module.cpp)

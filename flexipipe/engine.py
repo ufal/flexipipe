@@ -249,56 +249,45 @@ try:
         tag_document as _tag_document,
     )
 except ImportError:  # pragma: no cover - handled during runtime
-    # Try adding the build directory to sys.path
+    import importlib
     import sys
     from pathlib import Path
-    import os
-    
-    # Look for flexitag_py in the flexitag/build directory relative to this file
-    # Always resolve __file__ to an absolute path first
-    engine_file = Path(__file__)
-    if not engine_file.is_absolute():
-        engine_file = Path.cwd() / engine_file
-    engine_file = engine_file.resolve()
-    
-    flexipipe_dir = engine_file.parent.parent
-    flexitag_build = flexipipe_dir / "flexitag" / "build"
-    
-    if flexitag_build.exists():
-        build_path_str = str(flexitag_build.resolve())
-        if build_path_str not in sys.path:
-            sys.path.insert(0, build_path_str)
+
+    engine_file = Path(__file__).resolve()
+    flexipipe_package_dir = engine_file.parent
+    flexitag_build = flexipipe_package_dir.parent / "flexitag" / "build"
+
+    FlexitagEngine = None  # type: ignore
+    _load_teitok = None  # type: ignore
+    _save_teitok = None  # type: ignore
+    _dump_teitok = None  # type: ignore
+    _tag_document = None  # type: ignore
+    _import_error: BaseException = ImportError(
+        "flexitag_py extension is not available. Build the flexitag project with "
+        "pybind11 support or ensure it is on PYTHONPATH."
+    )
+
+    for search_dir in (flexipipe_package_dir, flexitag_build):
+        if not search_dir.exists():
+            continue
+        path_str = str(search_dir.resolve())
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+        if "flexitag_py" in sys.modules:
+            del sys.modules["flexitag_py"]
         try:
-            from flexitag_py import (
-                FlexitagEngine,
-                load_teitok as _load_teitok,
-                save_teitok as _save_teitok,
-                dump_teitok as _dump_teitok,
-                tag_document as _tag_document,
-            )
-        except ImportError as exc:
-            FlexitagEngine = None  # type: ignore
-            # Capture exc in closure to avoid NameError
+            mod = importlib.import_module("flexitag_py")
+            FlexitagEngine = getattr(mod, "FlexitagEngine", None)
+            _load_teitok = mod.load_teitok
+            _save_teitok = mod.save_teitok
+            _dump_teitok = mod.dump_teitok
+            _tag_document = mod.tag_document
+            _import_error = None  # type: ignore
+            break
+        except Exception as exc:
             _import_error = exc
 
-            def _missing_extension(*_: object, **__: object) -> None:
-                raise RuntimeError(
-                    "flexitag_py extension is not available. Build the flexitag project with "
-                    "pybind11 support or ensure it is on PYTHONPATH."
-                ) from _import_error
-
-            _tag_document = _missing_extension  # type: ignore
-            _load_teitok = _missing_extension  # type: ignore
-            _save_teitok = _missing_extension  # type: ignore
-            _dump_teitok = _missing_extension  # type: ignore
-    else:
-        FlexitagEngine = None  # type: ignore
-        # Capture exc in closure to avoid NameError
-        _import_error = ImportError(
-            "flexitag_py extension is not available. Build the flexitag project with "
-            "pybind11 support or ensure it is on PYTHONPATH."
-        )
-
+    if _tag_document is None:
         def _missing_extension(*_: object, **__: object) -> None:
             raise RuntimeError(
                 "flexitag_py extension is not available. Build the flexitag project with "
