@@ -317,7 +317,8 @@ class FlexiBuildExt(build_ext):
                 shutil.copy2(built_module, flexitag_build_dir / built_module.name)
                 for lib in shared_libs:
                     if lib.is_file() and not lib.is_symlink():
-                        shutil.copy2(lib, flexitag_build_dir / lib.name)        except RuntimeError:
+                        shutil.copy2(lib, flexitag_build_dir / lib.name)
+        except RuntimeError:
             raise
         except Exception as e:
             _fail_or_skip(f"Error building flexitag_py: {e}")
