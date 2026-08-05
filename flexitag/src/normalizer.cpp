@@ -182,6 +182,8 @@ void Normalizer::derive_inflection_suffixes() {
 
 void Normalizer::extract_substitution_patterns() {
     substitution_patterns_.clear();
+    sorted_substitution_patterns_.clear();
+    sorted_patterns_ready_ = false;
     
     if (!lexicon_) {
         return;
@@ -218,6 +220,22 @@ void Normalizer::extract_substitution_patterns() {
             }
         }
     }
+}
+
+void Normalizer::ensure_sorted_patterns() const {
+    if (sorted_patterns_ready_) {
+        return;
+    }
+    sorted_substitution_patterns_.clear();
+    sorted_substitution_patterns_.reserve(substitution_patterns_.size());
+    for (const auto& [pattern, count] : substitution_patterns_) {
+        if (count >= min_pattern_count_) {
+            sorted_substitution_patterns_.push_back({pattern, count});
+        }
+    }
+    std::sort(sorted_substitution_patterns_.begin(), sorted_substitution_patterns_.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    sorted_patterns_ready_ = true;
 }
 
 std::string Normalizer::normalize(const std::string& word, bool conservative) const {
@@ -566,16 +584,9 @@ std::string Normalizer::apply_pattern_substitution(const std::string& word) cons
         }
     }
     
-    // Try applying frequent substitution patterns
-    // Sort patterns by frequency (most frequent first)
-    std::vector<std::pair<std::string, int>> sorted_patterns;
-    for (const auto& [pattern, count] : substitution_patterns_) {
-        if (count >= min_pattern_count_) {
-            sorted_patterns.push_back({pattern, count});
-        }
-    }
-    std::sort(sorted_patterns.begin(), sorted_patterns.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    // Try applying frequent substitution patterns (sorted once, reused per word)
+    ensure_sorted_patterns();
+    const auto& sorted_patterns = sorted_substitution_patterns_;
     
     // Apply all applicable patterns to build the normalized form
     // We need to apply multiple patterns (e.g., ç->c and ó->o for coraçón->corazon)
@@ -583,7 +594,8 @@ std::string Normalizer::apply_pattern_substitution(const std::string& word) cons
     bool any_applied = false;
     
     if (debug_) {
-        std::cerr << "[normalizer] apply_pattern_substitution: word='" << word_lower << "'\n";
+        std::cerr << "[normalizer] apply_pattern_substitution: word='" << word_lower
+                  << "' (" << sorted_patterns.size() << " patterns)\n";
     }
     
     for (const auto& [pattern_str, count] : sorted_patterns) {
@@ -591,14 +603,7 @@ std::string Normalizer::apply_pattern_substitution(const std::string& word) cons
         // CRITICAL: Cannot use substr() because it's byte-based and can split multi-byte UTF-8 characters
         auto [from_char, to_char] = split_pattern(pattern_str);
         if (from_char.empty() || to_char.empty()) {
-            if (debug_) {
-                std::cerr << "[normalizer]   skipping invalid pattern: '" << pattern_str << "'\n";
-            }
             continue;
-        }
-        
-        if (debug_) {
-            std::cerr << "[normalizer]   checking pattern: '" << pattern_str << "' (from='" << from_char << "' to='" << to_char << "' count=" << count << ")\n";
         }
         
         // Apply this pattern: replace from_char (variant) with to_char (standard)
@@ -673,12 +678,8 @@ std::string Normalizer::apply_pattern_substitution(const std::string& word) cons
                     if (debug_) {
                         std::cerr << "[normalizer]     applied: '" << before_replace << "' -> '" << normalized_candidate << "' (valid=" << is_valid << ")\n";
                     }
-                } else if (debug_) {
-                    std::cerr << "[normalizer]     skipped (doesn't lead to valid form): '" << from_char << "' -> '" << to_char << "' (test='" << test_candidate << "')\n";
                 }
             }
-        } else if (debug_ && char_exists_in_string(normalized_candidate, from_char)) {
-            std::cerr << "[normalizer]     skipped (wrong direction): '" << from_char << "' -> '" << to_char << "'\n";
         }
     }
     

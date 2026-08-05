@@ -35,7 +35,16 @@ bool TaggerSettings::get_bool(const std::string& key, bool fallback) const {
         return fallback;
     }
     const std::string& val = it->second;
-    return val == "1" || val == "true" || val == "TRUE" || val == "yes";
+    // Accept common truthy spellings from CLI/JSON and Python str(True) → "True"
+    if (val == "1" || val == "true" || val == "TRUE" || val == "True" ||
+        val == "yes" || val == "YES" || val == "Yes" || val == "on" || val == "ON") {
+        return true;
+    }
+    if (val == "0" || val == "false" || val == "FALSE" || val == "False" ||
+        val == "no" || val == "NO" || val == "No" || val == "off" || val == "OFF" || val.empty()) {
+        return false;
+    }
+    return fallback;
 }
 
 namespace {

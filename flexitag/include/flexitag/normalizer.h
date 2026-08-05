@@ -52,6 +52,9 @@ private:
     bool debug_ = false;
     std::vector<std::string> inflection_suffixes_;
     std::unordered_map<std::string, int> substitution_patterns_;  // "from_to" -> count (e.g., "y_i" -> 5)
+    // Cached sorted-by-frequency view of substitution_patterns_ (built once).
+    mutable std::vector<std::pair<std::string, int>> sorted_substitution_patterns_;
+    mutable bool sorted_patterns_ready_ = false;
     int min_pattern_count_ = 10;  // Minimum count for a pattern to be considered frequent (increased from 3)
     
     // Derive inflection suffixes from vocab form->reg mappings
@@ -59,6 +62,9 @@ private:
     
     // Extract substitution patterns from vocab form->reg mappings
     void extract_substitution_patterns();
+
+    // Ensure sorted_substitution_patterns_ is populated (lazy, once).
+    void ensure_sorted_patterns() const;
     
     // Check if word exists as a reg value in lexicon (already normalized)
     bool word_exists_as_reg(const std::string& word) const;

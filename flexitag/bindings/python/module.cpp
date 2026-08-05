@@ -39,6 +39,11 @@ std::string to_string_any(const py::handle& value) {
     if (value.is_none()) {
         return "";
     }
+    // Booleans must become "1"/"0" so TaggerSettings::get_bool() sees them.
+    // Python str(True) is "True", which older get_bool() rejected.
+    if (py::isinstance<py::bool_>(value)) {
+        return py::cast<bool>(value) ? "1" : "0";
+    }
     return py::cast<std::string>(py::str(value));
 }
 

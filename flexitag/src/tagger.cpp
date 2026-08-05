@@ -665,10 +665,19 @@ Document FlexitagTagger::tag(const Document& doc, TaggerStats* stats) {
                             // it keeps the FIRST one encountered (matching neotagxml line 1009-1010)
                             if (it == dp[i].end() || state.score > it->second.score) {
                                 dp[i][tag_key] = state;
-                                if (settings_.debug && i < 10) {  // Increased debug range
-                                    std::cerr << "[flexitag] Dead end - starting fresh path for " << tag_key 
-                                              << " (word prob only, connected to " << fallback_prev_tag << "): " 
-                                              << state.score << "\n";
+                                if (settings_.debug) {
+                                    // Cap spam: one summary line per position, not per tag.
+                                    static thread_local std::size_t last_dead_end_pos =
+                                        static_cast<std::size_t>(-1);
+                                    static thread_local int dead_end_positions_logged = 0;
+                                    if (i != last_dead_end_pos && dead_end_positions_logged < 5) {
+                                        last_dead_end_pos = i;
+                                        ++dead_end_positions_logged;
+                                        std::cerr << "[flexitag] Dead end at pos " << i
+                                                  << " (no transitions from " << fallback_prev_tag
+                                                  << "); starting fresh paths for "
+                                                  << lattice[i].size() << " candidate tag(s)\n";
+                                    }
                                 }
                             }
                             // If score is equal, we keep the existing one (first encountered) - matching neotagxml
@@ -1858,6 +1867,9 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
     // This is the "unknown" source - uses type counts (number of unique vocab entries per tag)
     if (candidates.empty()) {
         const auto& type_counts = lexicon_->tag_type_counts();
+        // Cap OOV tag fan-out: large xpos tagsets (hundreds+) make Viterbi O(n·T²) and
+        // look hung after punctuation dead-ends. Override with max_unknown_tags=0 for all.
+        int max_unknown = settings_.get_int("max_unknown_tags", 64);
         
         if (type_counts.empty()) {
             // Fallback: use tag_stats if type_counts is empty (shouldn't happen, but safety check)
@@ -1865,11 +1877,21 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
                 std::cerr << "[flexitag] WARNING: tag_type_counts() returned empty map for '" << token.form 
                           << "', using tag_stats()\n";
             }
+            std::vector<std::pair<std::string, float>> ranked;
+            ranked.reserve(lexicon_->tag_stats().size());
             for (const auto& [tag, stats] : lexicon_->tag_stats()) {
+                ranked.emplace_back(tag, stats.count);
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (max_unknown > 0 && static_cast<int>(ranked.size()) > max_unknown) {
+                ranked.resize(static_cast<std::size_t>(max_unknown));
+            }
+            for (const auto& [tag, count] : ranked) {
                 WordCandidate cand;
                 cand.form = token.form;
                 cand.tag = tag;
-                cand.prob = std::max(stats.count, 1.f);
+                cand.prob = std::max(count, 1.f);
                 cand.source = "unknown";
                 cand.wcase = form_case(token.form);
                 cand.token = const_cast<Token*>(&token);
@@ -1878,12 +1900,29 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
             }
         } else {
             float total_types = 0.f;
-            for (const auto& [tag, count] : type_counts) {
-                total_types += static_cast<float>(count);
+            std::vector<std::pair<std::string, int>> ranked;
+            ranked.reserve(type_counts.size());
+            for (const auto& [tag, type_count] : type_counts) {
+                ranked.emplace_back(tag, type_count);
+                total_types += static_cast<float>(type_count);
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (max_unknown > 0 && static_cast<int>(ranked.size()) > max_unknown) {
+                if (settings_.debug) {
+                    std::cerr << "[flexitag] OOV '" << token.form << "': limiting unknown tags from "
+                              << ranked.size() << " to top " << max_unknown << "\n";
+                }
+                ranked.resize(static_cast<std::size_t>(max_unknown));
+                total_types = 0.f;
+                for (const auto& [tag, type_count] : ranked) {
+                    (void)tag;
+                    total_types += static_cast<float>(type_count);
+                }
             }
             
             // Use type counts as probabilities (normalized)
-            for (const auto& [tag, type_count] : type_counts) {
+            for (const auto& [tag, type_count] : ranked) {
                 WordCandidate cand;
                 cand.form = token.form;
                 cand.tag = tag;

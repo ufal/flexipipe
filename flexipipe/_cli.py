@@ -416,6 +416,18 @@ def _parse_tasks_argument(value: Optional[str]) -> set[str]:
     return tasks
 
 
+# Flexitag has no NER/parser pipeline; defaulting to full TASK_DEFAULTS makes TEITOK
+# writeback/--test runs look hung. Omit normalize by default — enhanced lexicon
+# normalization is expensive; opt in with --tasks ...,normalize or --normalization-style.
+_FLEXITAG_DEFAULT_TASKS = {"tokenize", "segment", "tag", "lemmatize"}
+
+
+def _default_tasks_for_backend(backend: Optional[str]) -> set[str]:
+    if (backend or "").lower() == "flexitag":
+        return set(_FLEXITAG_DEFAULT_TASKS)
+    return set(TASK_DEFAULTS)
+
+
 def _normalize_format_name(value: Optional[str]) -> Optional[str]:
     if value == "tei":
         return "teitok"
@@ -2646,8 +2658,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--normalization-style",
         choices=["conservative", "aggressive", "enhanced", "balanced"],
         default="conservative",
-        help="Normalization style: conservative (explicit mappings only), aggressive (pattern-based substitutions), "
-             "enhanced (morphological variations), balanced (combination, default: conservative)",
+        help="Normalization style: conservative (skip pattern Normalizer; default), aggressive (pattern-based), "
+             "enhanced (morphological + explicit), balanced (patterns + morphological). "
+             "Also skipped entirely when 'normalize' is not in --tasks.",
     )
     process_parser.add_argument(
         "--extra-vocab",
@@ -4450,7 +4463,10 @@ def run_tag(args: argparse.Namespace) -> int:
     # back to heuristic detection.
     raw_tasks_arg = getattr(args, "tasks", None)
     try:
-        requested_tasks = _parse_tasks_argument(raw_tasks_arg)
+        if raw_tasks_arg is None:
+            requested_tasks = _default_tasks_for_backend(getattr(args, "backend", None))
+        else:
+            requested_tasks = _parse_tasks_argument(raw_tasks_arg)
     except ValueError as exc:
         print(f"[flexipipe] {exc}", file=sys.stderr)
         return 1
@@ -5049,8 +5065,9 @@ def run_tag(args: argparse.Namespace) -> int:
                         if backend_type == "treetagger" and not tokenize_locally:
                             for sent in doc.sentences:
                                 sent.tokens = []
-                        # Normalize document encoding
-                        if unicode_normalize != "none":
+                        # Do not NFC token forms when xmltokenizer writeback owns alignment —
+                        # forms must stay byte-identical to session.nlp_plaintext.
+                        if unicode_normalize != "none" and _xt_session is None:
                             doc.normalize_unicode(unicode_normalize)
                         doc.meta["original_input_path"] = original_input_path
                         doc.meta.setdefault("source_path", original_input_path)
@@ -5430,7 +5447,7 @@ def run_tag(args: argparse.Namespace) -> int:
             # Always ensure default tasks are requested for writeback to guarantee tagging happens
             # This ensures the document gets properly annotated even if user didn't specify --tasks
             if not needs_backend:
-                requested_tasks = set(TASK_DEFAULTS)
+                requested_tasks = _default_tasks_for_backend(backend_type)
                 tasks_requiring_backend = requested_tasks - TASK_MANDATORY
                 needs_backend = True
                 if args.verbose or args.debug:
@@ -6062,9 +6079,14 @@ def run_tag(args: argparse.Namespace) -> int:
                 from .backend_registry import create_backend
             
                 flexitag_options = build_flexitag_options_from_args(args)
+                # Enhanced lexicon normalization is only useful when normalize is requested.
+                if "normalize" not in requested_tasks:
+                    flexitag_options["skip_enhanced_normalization"] = "1"
                 profile_options = getattr(args, "_profile_backend_options", None)
                 if isinstance(profile_options, dict):
                     flexitag_options.update(profile_options)
+                    if "normalize" not in requested_tasks:
+                        flexitag_options["skip_enhanced_normalization"] = "1"
             
                 try:
                     flexitag_backend = create_backend(
@@ -6182,13 +6204,24 @@ def run_tag(args: argparse.Namespace) -> int:
                 model_info=model_str,
             )
         elif output_format == "teitok":
-            # Normalize output document before serialization
-            if output_unicode_normalize != "none":
+            # Normalize output document before serialization.
+            # Skip when xmltokenizer writeback must align CoNLL-U forms to nlp_plaintext.
+            if (
+                output_unicode_normalize != "none"
+                and result.document.meta.get("_xt_session") is None
+            ):
                 if args.debug:
                     print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
                 result.document.normalize_unicode(output_unicode_normalize)
             elif args.debug:
-                print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
+                if result.document.meta.get("_xt_session") is not None:
+                    print(
+                        "[flexipipe] DEBUG: Skipping output Unicode normalize "
+                        "(xmltokenizer writeback alignment)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
             # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
             # But defer this until we know if we're in writeback mode and updating existing tokens
             output_doc = result.document
@@ -6552,7 +6585,13 @@ def run_tag(args: argparse.Namespace) -> int:
                         return 1
                 else:
                     if args.test and temp_writeback_path:
-                        with open(temp_writeback_path, "r", encoding="utf-8") as tf:
+                        # Writeback may target --output while --test used a temp copy of
+                        # the original as the "source" path. Always print the file that
+                        # was actually written (otherwise stdout looks untokenized).
+                        result_path = (
+                            Path(output_path) if output_path else temp_writeback_path
+                        )
+                        with open(result_path, "r", encoding="utf-8") as tf:
                             sys.stdout.write(tf.read())
                         temp_writeback_path.unlink(missing_ok=True)
                         return 0

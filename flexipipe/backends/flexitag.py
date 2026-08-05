@@ -256,22 +256,27 @@ def build_flexitag_options_from_args(args: Any) -> Dict[str, Any]:
     # --pid removed as redundant (only relevant for legacy settings)
     if getattr(args, "debug", False):
         options["debug"] = True
-    
-    # Parse normalization style
+
+    # Use "1"/"0" strings (not Python bools) so older flexitag_py builds whose
+    # get_bool() only accepted "true"/"1" (not str(True)=="True") still honour them.
     normalization_style = getattr(args, "normalization_style", "conservative")
     if normalization_style == "conservative":
-        options["normalization_conservative"] = True
-        options["skip_enhanced_normalization"] = True
+        # Explicit lexicon form→reg only: do not build/run pattern Normalizer.
+        options["normalization_conservative"] = "1"
+        options["skip_enhanced_normalization"] = "1"
     elif normalization_style == "aggressive":
-        options["normalization_conservative"] = False
-        options["skip_enhanced_normalization"] = False
+        options["normalization_conservative"] = "0"
+        options["skip_enhanced_normalization"] = "0"
     elif normalization_style == "enhanced":
-        options["normalization_conservative"] = True
-        options["skip_enhanced_normalization"] = False
+        options["normalization_conservative"] = "1"
+        options["skip_enhanced_normalization"] = "0"
     elif normalization_style == "balanced":
-        options["normalization_conservative"] = False
-        options["skip_enhanced_normalization"] = False
-    
+        options["normalization_conservative"] = "0"
+        options["skip_enhanced_normalization"] = "0"
+    else:
+        options["normalization_conservative"] = "1"
+        options["skip_enhanced_normalization"] = "1"
+
     extra_vocab = getattr(args, "extra_vocab", None)
     if extra_vocab:
         options["extra-vocab"] = extra_vocab

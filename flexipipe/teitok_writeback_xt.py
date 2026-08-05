@@ -623,11 +623,6 @@ def writeback_teitok_with_xmltokenizer(
             raise XmltokenizerWritebackError(f"CoNLL-U parse failed: {exc}") from exc
 
     out_de = xt.fold(metadata)
-    # Always restore xmlns on disk when we deactivated on input (TEITOK corpora).
-    if session.ns_transform is not None:
-        out_bytes = xt.reactivate(out_de, session.ns_transform)
-    else:
-        out_bytes = out_de
 
     if run_xt_validate:
         try:
@@ -635,6 +630,7 @@ def writeback_teitok_with_xmltokenizer(
         except xt.ValidationError as exc:
             raise XmltokenizerWritebackError(f"xmltokenizer validate failed: {exc}") from exc
 
+    # Parse/postprocess in deactivated form (matches extract snapshot for structure checks).
     new_root = _parse_folded_xml(out_de, document, align_debug=align_debug)
 
     verify_structure_preserved(
@@ -646,19 +642,37 @@ def writeback_teitok_with_xmltokenizer(
     )
     _postprocess_output_tree(new_root, document)
 
-    new_tree = ET.ElementTree(new_root)
     if HAS_LXML:
-        new_tree.write(
-            str(output_path_obj),
+        folded_after = ET.tostring(
+            new_root,
             encoding="utf-8",
             xml_declaration=True,
             pretty_print=False,
         )
     else:
-        new_tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
+        folded_after = ET.tostring(new_root, encoding="utf-8", xml_declaration=True)
 
-    if align_debug:
+    # Restore xmlns on disk when we deactivated on input (TEITOK corpora).
+    # Previously we reactivated then discarded the result and wrote xmlnsoff= XML.
+    if session.ns_transform is not None:
+        out_bytes = xt.reactivate(folded_after, session.ns_transform)
+    else:
+        out_bytes = folded_after
+
+    output_path_obj.write_bytes(out_bytes)
+
+    import re as _re
+
+    tok_count = len(_re.findall(br"<tok[\s/>]", out_bytes))
+    if tok_count == 0:
         print(
-            f"[flexipipe] xmltokenizer writeback OK → {output_path_obj}",
+            f"[flexipipe] WARNING: xmltokenizer writeback wrote {output_path_obj} "
+            "with no <tok> elements — check tokenization/alignment",
+            file=sys.stderr,
+        )
+    elif align_debug:
+        print(
+            f"[flexipipe] xmltokenizer writeback OK → {output_path_obj} "
+            f"({tok_count} <tok>)",
             file=sys.stderr,
         )
