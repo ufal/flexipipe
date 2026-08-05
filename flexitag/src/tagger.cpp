@@ -405,6 +405,23 @@ void FlexitagTagger::configure(const TaggerSettings& settings) {
 
 void FlexitagTagger::set_lexicon(std::shared_ptr<Lexicon> lexicon) {
     lexicon_ = std::move(lexicon);
+
+    // Resolve endlen once here — never inside morpho_parse. Model settings often
+    // store endlen=0 meaning "default"; Lexicon::set_endlen(0) maps that to 6.
+    // If we compared settings(0) != lexicon(6) on every OOV token we would
+    // reindex the full ending table (~10k forms) hundreds of times per file.
+    if (lexicon_) {
+        int endlen = settings_.get_int("endlen", 0);
+        if (endlen != 0 && endlen != lexicon_->endlen()) {
+            lexicon_->set_endlen(endlen);
+            lexicon_->reindex_endings();
+            if (settings_.debug || settings_.verbose) {
+                std::cerr << "[flexitag] reindexed endings with endlen=" << lexicon_->endlen() << "\n";
+            }
+        }
+        // Keep settings in sync so per-token code never sees a stale 0 vs 6 mismatch.
+        settings_.options["endlen"] = std::to_string(lexicon_->endlen());
+    }
     
     // Initialize normalizer if lexicon is available and enhanced normalization is not skipped
     bool skip_enhanced_norm = settings_.get_bool("skip_enhanced_normalization", false);
@@ -1622,16 +1639,10 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
     // For now, we'll check if candidates.empty() (matching wordParse.size() == 0)
     if (candidates.empty()) {
         int endretry = settings_.get_int("endretry", 2);  // Default: try 2 extra ending lengths
-        // Get endlen from settings (allows runtime overrides), fallback to lexicon value
-        int endlen = settings_.get_int("endlen", lexicon_->endlen());  // Can be negative for prefixes
-        // CRITICAL: If endlen from settings differs from lexicon's endlen, update the lexicon
-        // This ensures endings are indexed correctly when endlen is overridden
-        if (endlen != lexicon_->endlen()) {
-            lexicon_->set_endlen(endlen);
-            // Re-index endings with the new endlen value
-            // This is necessary because endings are indexed during vocabulary loading
-            // and changing endlen requires re-indexing
-            lexicon_->reindex_endings();
+        // endlen is synced once in set_lexicon(); 0 in settings means "use lexicon default".
+        int endlen = settings_.get_int("endlen", 0);
+        if (endlen == 0) {
+            endlen = lexicon_->endlen();
         }
         const bool use_prefix = (endlen < 0);
         const int abs_endlen = std::abs(endlen);
