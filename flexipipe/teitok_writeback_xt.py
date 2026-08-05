@@ -168,7 +168,7 @@ def resolve_writeback_engine(requested: str) -> str:
 def open_xmltokenizer_session(
     path: str,
     *,
-    profile_name: str = "tei",
+    profile_name: str = "teitok",
     layout_normalize: bool = False,
     layout_block_tags: Optional[tuple[str, ...]] = None,
     layout_separator: str = "\n",
@@ -236,7 +236,7 @@ def nlp_plaintext_for_flexipipe(
     path: str,
     *,
     writeback_engine: str = "auto",
-    profile_name: str = "tei",
+    profile_name: str = "teitok",
     textnode_xpath: str = ".//text",
     include_notes: bool = False,
     rejoin_linebreaks: bool = True,
@@ -359,8 +359,80 @@ def _token_values(token) -> dict[str, str]:
     }
 
 
+def _document_has_mwt(document: Document) -> bool:
+    return any(
+        bool(tok.is_mwt and tok.subtokens)
+        for sent in document.sentences
+        for tok in sent.tokens
+    )
+
+
+def _with_implicit_mwt(document: Document) -> Document:
+    """Return a document with SpaceAfter=No sequences folded into MWT parents.
+
+    Idempotent if MWTs are already present. Used so CoNLL-U export and
+    ``<tok>``/``<dtok>`` attr mapping share the same surface-token inventory.
+    """
+    from .conllu import _create_implicit_mwt
+
+    if _document_has_mwt(document):
+        return document
+
+    new_doc = Document(id=document.id, meta=dict(document.meta), attrs=dict(document.attrs))
+    for layer, spans in document.spans.items():
+        for span in spans:
+            new_doc.add_span(layer, span)
+    for sent in document.sentences:
+        new_doc.sentences.append(_create_implicit_mwt(sent))
+    # Preserve writeback session / layout meta
+    for key, value in document.meta.items():
+        new_doc.meta.setdefault(key, value)
+    return new_doc
+
+
+def _subtoken_values(sub) -> dict[str, str]:
+    attrs = sub.attrs if isinstance(getattr(sub, "attrs", None), dict) else {}
+    return {
+        "xpos": getattr(sub, "xpos", "") or attrs.get("xpos", ""),
+        "lemma": getattr(sub, "lemma", "") or attrs.get("lemma", ""),
+        "reg": getattr(sub, "reg", "") or attrs.get("reg", ""),
+        "expan": getattr(sub, "expan", "") or attrs.get("expan", ""),
+        "trslit": getattr(sub, "trslit", "") or attrs.get("trslit", ""),
+    }
+
+
+def _set_mapped_attrs(elem: ET.Element, vals: dict[str, str], target: dict[str, str]) -> None:
+    for key, out_name in target.items():
+        value = vals.get(key, "")
+        if value and value != "_":
+            elem.set(out_name, value)
+        elif out_name in elem.attrib and key in {"reg", "expan", "trslit"}:
+            elem.attrib.pop(out_name, None)
+
+
+def _tok_surface_text(elem: ET.Element) -> str:
+    """Surface form of a <tok>, concatenating direct text and <dtok> text."""
+    parts: list[str] = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in list(elem):
+        if _local_tag(child) == "dtok":
+            parts.append("".join(child.itertext()) if hasattr(child, "itertext") else (child.text or ""))
+        if child.tail:
+            # tails between dtoks are usually empty; ignore for form compare
+            pass
+    if not parts:
+        parts.append("".join(elem.itertext()) if hasattr(elem, "itertext") else "")
+    return "".join(parts).strip()
+
+
 def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> None:
-    """Map writeback attrs to TEITOK names (e.g. xpos->pos) and copy extra attrs."""
+    """Map writeback attrs to TEITOK names (e.g. xpos->pos) and copy extra attrs.
+
+    Expects ``document`` surface tokens to match folded ``<tok>`` count (apply
+    implicit MWTs on the Document *before* fold/export). MWT parents map onto
+    ``<tok>``; analytical values go on ``<dtok>`` children from subtokens.
+    """
     attr_map = document.meta.get("_teitok_attr_map")
     if not isinstance(attr_map, dict):
         attr_map = {}
@@ -375,20 +447,56 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
 
     tok_elems = [e for e in root.iter() if _local_tag(e) == "tok"]
     flat_tokens = _flatten_surface_tokens(document)
-    n = min(len(tok_elems), len(flat_tokens))
-    for i in range(n):
-        elem = tok_elems[i]
-        vals = _token_values(flat_tokens[i])
-        for key, out_name in target.items():
-            value = vals.get(key, "")
-            if value and value != "_":
-                elem.set(out_name, value)
-            elif out_name in elem.attrib and key in {"reg", "expan", "trslit"}:
-                elem.attrib.pop(out_name, None)
-    # If mapped XPOS name differs from "xpos", remove the internal alias everywhere.
-    if target["xpos"] != "xpos":
-        for elem in tok_elems:
-            elem.attrib.pop("xpos", None)
+
+    if len(tok_elems) != len(flat_tokens):
+        print(
+            "[flexipipe] WARNING: writeback attr mapping: "
+            f"{len(tok_elems)} <tok> vs {len(flat_tokens)} document tokens — "
+            "renaming folded attrs only (skipping positional overlay to avoid drift)",
+            file=sys.stderr,
+        )
+        if target["xpos"] != "xpos":
+            for elem in list(root.iter()):
+                if _local_tag(elem) in {"tok", "dtok"} and "xpos" in elem.attrib:
+                    if target["xpos"] not in elem.attrib:
+                        elem.set(target["xpos"], elem.get("xpos") or "")
+                    elem.attrib.pop("xpos", None)
+    else:
+        for i, elem in enumerate(tok_elems):
+            tok = flat_tokens[i]
+            form_text = _tok_surface_text(elem)
+            doc_form = (tok.form or "").strip()
+            if form_text and doc_form and form_text != doc_form:
+                print(
+                    f"[flexipipe] WARNING: writeback attr mapping form mismatch at tok {i}: "
+                    f"xml={form_text!r} doc={doc_form!r} — stopping positional overlay",
+                    file=sys.stderr,
+                )
+                if target["xpos"] != "xpos":
+                    for e in list(root.iter()):
+                        if _local_tag(e) in {"tok", "dtok"} and "xpos" in e.attrib:
+                            if target["xpos"] not in e.attrib:
+                                e.set(target["xpos"], e.get("xpos") or "")
+                            e.attrib.pop("xpos", None)
+                break
+
+            dtok_elems = [c for c in list(elem) if _local_tag(c) == "dtok"]
+            if tok.is_mwt and tok.subtokens and dtok_elems:
+                # Analytical layers live on <dtok>; keep parent for form/reg only.
+                for key in ("reg", "expan", "trslit"):
+                    value = _token_values(tok).get(key, "")
+                    out_name = target[key]
+                    if value and value != "_":
+                        elem.set(out_name, value)
+                for dtok_elem, sub in zip(dtok_elems, tok.subtokens):
+                    _set_mapped_attrs(dtok_elem, _subtoken_values(sub), target)
+            else:
+                _set_mapped_attrs(elem, _token_values(tok), target)
+
+        if target["xpos"] != "xpos":
+            for elem in list(root.iter()):
+                if _local_tag(elem) in {"tok", "dtok"}:
+                    elem.attrib.pop("xpos", None)
 
     has_sentence_tags = any(_local_tag(e) == "s" for e in root.iter())
     if not has_sentence_tags:
@@ -397,20 +505,20 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
 
 
 def _flatten_surface_tokens(document: Document) -> list:
-    """Return parent tokens in document order (omit MWT subtokens)."""
+    """Return parent/surface tokens in document order (omit MWT member Token rows)."""
     from .doc import Token
 
     sub_ids: set[int] = set()
     for sent in document.sentences:
         for tok in sent.tokens:
             if tok.is_mwt and tok.subtokens:
-                for st in tok.subtokens[1:]:
+                for st in tok.subtokens:
                     if st.id:
                         sub_ids.add(st.id)
     flat: list[Token] = []
     for sent in document.sentences:
         for tok in sent.tokens:
-            if tok.id and tok.id in sub_ids:
+            if tok.id and tok.id in sub_ids and not tok.is_mwt:
                 continue
             flat.append(tok)
     return flat
@@ -542,34 +650,44 @@ def writeback_teitok_with_xmltokenizer(
     output_path: Optional[str] = None,
     *,
     session: Optional[XmltokenizerSession] = None,
-    profile_name: str = "tei",
+    profile_name: str = "teitok",
     align_debug: bool = False,
     run_xt_validate: bool = True,
     create_implicit_mwt: bool = True,
 ) -> None:
-    """Fold flexipipe's CoNLL-U standoff back into XML via xmltokenizer."""
+    """Fold flexipipe's CoNLL-U standoff back into XML via xmltokenizer.
+
+    When ``create_implicit_mwt`` is true, SpaceAfter=No runs are folded into MWT
+    parents on a working copy of ``document`` *once*, then exported without
+    re-applying the transform. That keeps CoNLL-U surface tokens, folded
+    ``<tok>``/``<dtok>``, and attr mapping on the same inventory.
+    """
     import xmltokenizer as xt
 
     original_path_obj = Path(original_path)
     output_path_obj = Path(output_path) if output_path else original_path_obj
 
+    # Apply implicit MWTs on the Document first (idempotent), then always export
+    # with create_implicit_mwt=False so we never double-transform / desync counts.
+    work_doc = _with_implicit_mwt(document) if create_implicit_mwt else document
+
     if session is None:
         session = open_xmltokenizer_session(
             original_path,
             profile_name=profile_name,
-            layout_normalize=document.meta.get("_teitok_layout_normalized", False),
-            layout_block_tags=document.meta.get("_teitok_layout_block_tags"),
-            layout_separator=document.meta.get("_teitok_layout_separator", "\n"),
+            layout_normalize=work_doc.meta.get("_teitok_layout_normalized", False),
+            layout_block_tags=work_doc.meta.get("_teitok_layout_block_tags"),
+            layout_separator=work_doc.meta.get("_teitok_layout_separator", "\n"),
         )
     elif session.source_path != str(original_path_obj.resolve()):
         session = open_xmltokenizer_session(
             original_path,
             profile_name=profile_name,
-            layout_normalize=document.meta.get(
+            layout_normalize=work_doc.meta.get(
                 "_teitok_layout_normalized", session.layout_normalized
             ),
-            layout_block_tags=document.meta.get("_teitok_layout_block_tags"),
-            layout_separator=document.meta.get("_teitok_layout_separator", "\n"),
+            layout_block_tags=work_doc.meta.get("_teitok_layout_block_tags"),
+            layout_separator=work_doc.meta.get("_teitok_layout_separator", "\n"),
         )
 
     import xmltokenizer as xt
@@ -584,7 +702,7 @@ def writeback_teitok_with_xmltokenizer(
         original_root_snapshot = copy.deepcopy(ET.fromstring(raw_de_snap))
 
     full_nlp = session.nlp_plaintext
-    if document.meta.get("_teitok_extracted_nlp") != full_nlp:
+    if work_doc.meta.get("_teitok_extracted_nlp") != full_nlp:
         print(
             "[flexipipe] xmltokenizer writeback: document NLP plaintext differs from "
             "session (NLP may have run on a different extractor)",
@@ -601,11 +719,11 @@ def writeback_teitok_with_xmltokenizer(
             continue
         span = session.scope_nlp_spans[i] if i < len(session.scope_nlp_spans) else (0, len(full_nlp))
         scope_conllu = _conllu_for_scope_nlp(
-            document,
+            work_doc,
             span[0],
             span[1],
             full_nlp,
-            create_implicit_mwt=create_implicit_mwt,
+            create_implicit_mwt=False,
         )
         try:
             xt.attach_conllu(
@@ -631,7 +749,7 @@ def writeback_teitok_with_xmltokenizer(
             raise XmltokenizerWritebackError(f"xmltokenizer validate failed: {exc}") from exc
 
     # Parse/postprocess in deactivated form (matches extract snapshot for structure checks).
-    new_root = _parse_folded_xml(out_de, document, align_debug=align_debug)
+    new_root = _parse_folded_xml(out_de, work_doc, align_debug=align_debug)
 
     verify_structure_preserved(
         original_root_snapshot,
@@ -640,7 +758,7 @@ def writeback_teitok_with_xmltokenizer(
         ignore_attrs={"id", "rpt", "cont"},
         debug=align_debug,
     )
-    _postprocess_output_tree(new_root, document)
+    _postprocess_output_tree(new_root, work_doc)
 
     if HAS_LXML:
         folded_after = ET.tostring(
