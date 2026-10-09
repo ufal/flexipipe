@@ -772,6 +772,130 @@ def insert_tokens_into_teitok(
         tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
 
 
+def _local_name(name: str) -> str:
+    return name.rsplit("}", 1)[-1] if name.startswith("{") else name.rsplit(":", 1)[-1]
+
+
+def _structure_events(
+    root: ET.Element, ignore_tags: Set[str], ignore_attrs: Set[str]
+) -> List[tuple]:
+    """Parsed (not regex) event stream of ``root`` for structure comparison:
+    ("start", tag, attrs) / ("end", tag) / ("text", str) / ("other", repr).
+
+    - elements in ``ignore_tags`` vanish, their content stays;
+    - attributes in ``ignore_attrs`` (by local name, so ``xml:id`` counts as
+      ``id``) and the fragment attributes ``rpt``/``cont`` are dropped;
+    - a continuation fragment (``@rpt``) is merged into its predecessor, also
+      across whitespace between them;
+    - adjacent texts are merged.
+    """
+    ignore_tags_l = {t.lower() for t in ignore_tags}
+    ignore_attrs_l = {a.lower() for a in ignore_attrs} | {"rpt", "cont"}
+    events: List[tuple] = []
+
+    def text(t: Optional[str]) -> None:
+        if not t:
+            return
+        if events and events[-1][0] == "text":
+            events[-1] = ("text", events[-1][1] + t)
+        else:
+            events.append(("text", t))
+
+    def walk(el) -> None:
+        if not isinstance(el.tag, str):  # comment / PI
+            events.append(("other", ET.tostring(el, encoding="unicode", with_tail=False)))
+            text(el.tail)
+            return
+        skip = _local_name(el.tag).lower() in ignore_tags_l
+        if not skip:
+            attrs = tuple(sorted(
+                (k, v) for k, v in el.attrib.items()
+                if _local_name(k).lower() not in ignore_attrs_l
+            ))
+            merged = False
+            if any(_local_name(k) == "rpt" for k in el.attrib):
+                if events and events[-1] == ("end", el.tag):
+                    events.pop()
+                    merged = True
+                elif (len(events) >= 2 and events[-1][0] == "text"
+                      and not events[-1][1].strip() and events[-2] == ("end", el.tag)):
+                    ws = events.pop()
+                    events.pop()
+                    events.append(ws)
+                    merged = True
+            if not merged:
+                events.append(("start", el.tag, attrs))
+        text(el.text)
+        for child in el:
+            walk(child)
+        if not skip:
+            events.append(("end", el.tag))
+        text(el.tail)
+
+    walk(root)
+    return events
+
+
+def _hoist_edge_whitespace_events(events: List[tuple]) -> List[tuple]:
+    """Canonical whitespace placement: whitespace at the inner edge of an
+    element moves just outside it, through every level (xmltokenizer does
+    this; it has no effect on inline markup)."""
+    while True:
+        out: List[tuple] = []
+
+        def emit(t: str) -> None:
+            if not t:
+                return
+            if out and out[-1][0] == "text":
+                out[-1] = ("text", out[-1][1] + t)
+            else:
+                out.append(("text", t))
+
+        i, n = 0, len(events)
+        while i < n:
+            ev = events[i]
+            if ev[0] == "text":
+                emit(ev[1])
+                i += 1
+            elif ev[0] == "start" and i + 1 < n and events[i + 1][0] == "text":
+                t = events[i + 1][1]
+                lead = t[: len(t) - len(t.lstrip())]
+                emit(lead)
+                out.append(ev)
+                emit(t[len(lead):])
+                i += 2
+            elif ev[0] == "end" and out and out[-1][0] == "text":
+                t = out[-1][1]
+                trail = t[len(t.rstrip()):]
+                if trail:
+                    rest = t[: len(t) - len(trail)]
+                    if rest:
+                        out[-1] = ("text", rest)
+                    else:
+                        out.pop()
+                out.append(ev)
+                emit(trail)
+                i += 1
+            else:
+                out.append(ev)
+                i += 1
+        if out == events:
+            return out
+        events = out
+
+
+def _render_events(events: List[tuple]) -> str:
+    parts = []
+    for ev in events:
+        if ev[0] == "start":
+            parts.append(f"<{_local_name(ev[1])}" + "".join(f' {_local_name(k)}="{v}"' for k, v in ev[2]) + ">")
+        elif ev[0] == "end":
+            parts.append(f"</{_local_name(ev[1])}>")
+        else:
+            parts.append(ev[1])
+    return "".join(parts)
+
+
 def verify_structure_preserved(
     original_root: ET.Element,
     modified_root: ET.Element,
@@ -781,95 +905,33 @@ def verify_structure_preserved(
     debug: bool = False,
 ) -> None:
     """
-    Compare original vs modified XML by converting both to strings and stripping:
-    - Any <s>/<tok> tags (or other ignore_tags)
-    - Attributes listed in ignore_attrs (e.g. id, xml:id, rpt)
-    - Bridge sequences like </ab><ab rpt="1"> that arise from reopening tags
+    Check that ``modified_root`` has the structure of ``original_root`` once the
+    inserted elements (``ignore_tags``, e.g. s/tok/dtok) and ``ignore_attrs`` are
+    removed: same elements, same attributes, same order relative to the text.
+    Split fragments (``@rpt``) are merged back and edge whitespace is compared in
+    canonical placement. Works on the parsed trees, not on serialized strings.
     """
-
-    def serialize(elem: ET.Element) -> str:
-        return ET.tostring(elem, encoding="unicode")
-
-    def remove_tags(text: str, tags_to_remove: Set[str]) -> str:
-        if not tags_to_remove:
-            return text
-        tags_pattern = "|".join(re.escape(tag) for tag in tags_to_remove)
-        # Remove opening tags (including attributes) and self-closing forms
-        text = re.sub(rf"<(?:{tags_pattern})(\s[^<>]*?)?/?>", "", text, flags=re.IGNORECASE)
-        # Remove closing tags
-        text = re.sub(rf"</(?:{tags_pattern})>", "", text, flags=re.IGNORECASE)
-        return text
-
-    def remove_attributes(text: str, attrs_to_remove: Set[str]) -> str:
-        for attr in attrs_to_remove:
-            attr_pattern = r'\s+(?:\w+:)?' + re.escape(attr) + r'="[^"]*"'
-            text = re.sub(attr_pattern, "", text, flags=re.IGNORECASE)
-        return text
-
-    def remove_repetition_bridges(text: str) -> str:
-        pattern_whitespace = re.compile(
-            r"<([A-Za-z0-9:_-]+)[^<>]*?\brpt=\"1\"[^<>]*?>(\s*)</\1>",
-            flags=re.IGNORECASE,
-        )
-        pattern_bridge = re.compile(
-            r"</([A-Za-z0-9:_-]+)>\s*<\1[^<>]*?\brpt=\"1\"[^<>]*?>",
-            flags=re.IGNORECASE,
-        )
-        prev = None
-        while prev != text:
-            prev = text
-            text = pattern_whitespace.sub(r"\2", text)
-            text = pattern_bridge.sub("", text)
-        return text
-
-    original_text = serialize(original_root)
-    modified_text = serialize(modified_root)
-
-    # Apply same normalization steps to both strings
-    original_text = remove_tags(original_text, ignore_tags)
-    modified_text = remove_tags(modified_text, ignore_tags)
-
-    original_text = remove_repetition_bridges(original_text)
-    modified_text = remove_repetition_bridges(modified_text)
-    
-    original_text = remove_attributes(original_text, ignore_attrs)
-    modified_text = remove_attributes(modified_text, ignore_attrs)
-
-    _SELF_CLOSING_COMPARE = {"lb", "pb", "cb", "milestone", "anchor", "gap", "fw"}
-    _sc_pattern = (
-        r"<(" + "|".join(re.escape(t) for t in _SELF_CLOSING_COMPARE) + r")(\s[^<>]*?)?></\1>"
+    a = _hoist_edge_whitespace_events(_structure_events(original_root, ignore_tags, ignore_attrs))
+    b = _hoist_edge_whitespace_events(_structure_events(modified_root, ignore_tags, ignore_attrs))
+    if a == b:
+        return
+    k = 0
+    while k < min(len(a), len(b)) and a[k] == b[k]:
+        k += 1
+    span = 12 if debug else 4
+    ctx = _render_events(a[max(0, k - span):k])
+    snippet_original = _render_events(a[k:k + span])
+    snippet_modified = _render_events(b[k:k + span])
+    raise ValueError(
+        "Modified XML differs from original once token/sentence tags and ignorable attrs are stripped.\n"
+        f"First difference at structure event {k}"
+        + (f" (events: original={len(a)} modified={len(b)})" if debug else "") + ":\n"
+        + f"Context before: {ctx[-200:]!r}\n"
+        + f"Original: {snippet_original[:300]!r}\n"
+        + f"Modified: {snippet_modified[:300]!r}"
     )
 
-    def normalize_empty_self_closing(text: str) -> str:
-        return re.sub(_sc_pattern, r"<\1\2/>", text, flags=re.IGNORECASE)
 
-    original_text = normalize_empty_self_closing(original_text)
-    modified_text = normalize_empty_self_closing(modified_text)
-
-    if original_text != modified_text:
-        diff_pos = 0
-        max_len = min(len(original_text), len(modified_text))
-        while diff_pos < max_len and original_text[diff_pos] == modified_text[diff_pos]:
-            diff_pos += 1
-        snippet_len = 400 if debug else 120
-        snippet_original = original_text[diff_pos:diff_pos + snippet_len]
-        snippet_modified = modified_text[diff_pos:diff_pos + snippet_len]
-        len_msg = (
-            f"\nNormalized lengths: original={len(original_text)} modified={len(modified_text)}"
-            if debug
-            else ""
-        )
-        ctx_before = 80 if debug else 0
-        before_orig = original_text[max(0, diff_pos - ctx_before):diff_pos]
-        before_mod = modified_text[max(0, diff_pos - ctx_before):diff_pos]
-        raise ValueError(
-            "Modified XML differs from original once token/sentence tags and ignorable attrs are stripped.\n"
-            f"First difference at position {diff_pos}:{len_msg}\n"
-            + (f"Context before (orig): {before_orig!r}\n" if debug else "")
-            + (f"Context before (mod):  {before_mod!r}\n" if debug else "")
-            + f"Original: {snippet_original!r}\n"
-            + f"Modified: {snippet_modified!r}"
-        )
 def build_standoff_representation(
     elem: ET.Element,
     block_elements: Set[str],

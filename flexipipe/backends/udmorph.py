@@ -489,7 +489,8 @@ class UDMorphRESTBackend(BackendManager):
             payload["model"] = self.model
 
         if use_raw_text:
-            text_payload = _document_to_plain_text(document)
+            from ..doc_utils import source_plaintext_for_backend
+            text_payload = source_plaintext_for_backend(document) or _document_to_plain_text(document)
             if not text_payload.strip():
                 # Fallback to CoNLL-U if no text available
                 payload["data"] = document_to_conllu(document)

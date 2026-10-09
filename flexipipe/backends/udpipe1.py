@@ -575,8 +575,15 @@ class UDPipeCLIBackend(BackendManager):
             document = normalized_doc
         
         if use_raw_text:
-            # Convert to plain text
-            input_text = _document_to_plain_text(document)
+            # Convert to plain text: the extracted source text when there is one (keeps
+            # its paragraph barriers), else rebuilt from the sentences
+            from ..doc_utils import source_plaintext_for_backend
+            input_text = source_plaintext_for_backend(document)
+            if input_text is None:
+                input_text = _document_to_plain_text(document)
+            elif self._model_unicode_normalization and self._model_unicode_normalization != "none":
+                from ..unicode_utils import normalize_unicode
+                input_text = normalize_unicode(input_text, self._model_unicode_normalization)
             input_format = "plain"
         else:
             # Convert to CoNLL-U

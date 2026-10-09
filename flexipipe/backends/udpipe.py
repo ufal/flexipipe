@@ -609,8 +609,12 @@ class UDPipeRESTBackend(BackendManager):
                         text_parts.append(sentence.text)
                 text = "\n".join(text_parts)
             else:
-                # No normalization: use sentence text as-is
-                text = "\n".join(sentence.text or "" for sentence in document.sentences)
+                # No normalization: the extracted source text when there is one (keeps its
+                # paragraph barriers), else the sentence texts
+                from ..doc_utils import source_plaintext_for_backend
+                text = source_plaintext_for_backend(document) or "\n".join(
+                    sentence.text or "" for sentence in document.sentences
+                )
                 if not text.strip():
                     # Fallback: if no sentence text, try to reconstruct from tokens
                     from ..conllu import _reconstruct_sentence_text

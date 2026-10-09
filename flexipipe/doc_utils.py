@@ -183,3 +183,22 @@ def get_effective_form(token: Token | SubToken, *, use_reg_for_nlp: Optional[boo
     
     return getattr(token, "form", "") or ""
 
+
+
+def source_plaintext_for_backend(document: Document) -> Optional[str]:
+    """
+    The extracted source text a raw-text backend should receive verbatim, if any.
+
+    For TEITOK input the CLI keeps the text it extracted (xmltokenizer ``nlp_plaintext``)
+    in ``document.meta``; its blank lines are block (paragraph) barriers. Rebuilding the
+    text from the pre-segmented sentences joins them with a single newline, so the
+    backend's segmenter can run sentences across paragraphs (PressMint lb-between-p).
+    None when there is no such text, or when normalization changed the token forms.
+    """
+    if document.meta.get("_normalization_applied"):
+        return None
+    for key in ("_teitok_nlp_udpipe", "_teitok_extracted_nlp"):
+        text = document.meta.get(key)
+        if isinstance(text, str) and text.strip():
+            return text
+    return None

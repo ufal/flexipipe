@@ -411,7 +411,11 @@ def _set_mapped_attrs(elem: ET.Element, vals: dict[str, str], target: dict[str, 
 
 
 def _tok_surface_text(elem: ET.Element) -> str:
-    """Surface form of a <tok>, concatenating direct text and <dtok> text."""
+    """Surface form of a <tok>: its @form (written when the inner text differs, e.g. a
+    word hyphenated across <lb break="no"/>), else direct text and <dtok> text."""
+    form_attr = elem.get("form")
+    if form_attr:
+        return form_attr.strip()
     parts: list[str] = []
     if elem.text:
         parts.append(elem.text)
@@ -508,15 +512,15 @@ def _flatten_surface_tokens(document: Document) -> list:
     """Return parent/surface tokens in document order (omit MWT member Token rows)."""
     from .doc import Token
 
-    sub_ids: set[int] = set()
+    flat: list[Token] = []
     for sent in document.sentences:
+        # token ids are per sentence: collect the MWT member ids of this sentence only
+        sub_ids: set[int] = set()
         for tok in sent.tokens:
             if tok.is_mwt and tok.subtokens:
                 for st in tok.subtokens:
                     if st.id:
                         sub_ids.add(st.id)
-    flat: list[Token] = []
-    for sent in document.sentences:
         for tok in sent.tokens:
             if tok.id and tok.id in sub_ids and not tok.is_mwt:
                 continue
@@ -618,7 +622,7 @@ def _conllu_for_scope_nlp(
         by_sent[at.sent_id].append(at)
 
     for sid in order:
-        sent = Sentence(sent_id=sid)
+        sent = Sentence(id=sid, sent_id=sid)
         for at in by_sent[sid]:
             ctok = at.ctok
             head_raw = ctok.head
