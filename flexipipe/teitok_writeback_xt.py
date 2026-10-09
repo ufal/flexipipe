@@ -232,6 +232,58 @@ def open_xmltokenizer_session(
     )
 
 
+def existing_tokenization(path: str) -> dict[str, int]:
+    """Count existing tokenization elements inside ``<text>``: TEITOK ``tok``,
+    ``dtok``, ``s`` and TEI ``w``. Streams the file (lxml events, no regex)."""
+    from lxml import etree
+
+    found = {"tok": 0, "dtok": 0, "s": 0, "w": 0}
+    depth_in_text = 0
+    for event, el in etree.iterparse(path, events=("start", "end"), huge_tree=True,
+                                     recover=False):
+        if not isinstance(el.tag, str):
+            continue
+        name = el.tag.rsplit("}", 1)[-1]
+        if event == "start":
+            if name == "text":
+                depth_in_text += 1
+            elif depth_in_text and name in found:
+                found[name] += 1
+        else:
+            if name == "text":
+                depth_in_text -= 1
+            el.clear(keep_tail=True)
+    return found
+
+
+def refuse_existing_tokenization(path: str, *, engine: str) -> None:
+    """Refuse early (before any NLP runs) when the input cannot be handled:
+
+    - TEI ``<w>`` tokens and no ``<tok>``: never add ``<tok>`` on top of an
+      existing TEI tokenization, whatever the engine.
+    - xmltokenizer write-back on a file that already has ``<tok>``/``<s>``/``<dtok>``:
+      that engine only tokenizes untokenized text.
+    """
+    found = existing_tokenization(path)
+    if found["w"] and not found["tok"]:
+        raise XmltokenizerWritebackError(
+            f"{path}: already tokenized in TEI style ({found['w']} <w> elements). "
+            "flexipipe does not tokenize on top of an existing tokenization and will "
+            "not strip <w> (that would discard it). Convert the <w> tokens to TEITOK "
+            "<tok> first (e.g. with flexiconv), then process the converted file."
+        )
+    present = {k: v for k, v in found.items() if k in ("tok", "s", "dtok") and v}
+    if present and engine == "xmltokenizer":
+        what = ", ".join(f"{v} <{k}>" for k, v in present.items())
+        raise XmltokenizerWritebackError(
+            f"{path}: already tokenized ({what}). The xmltokenizer write-back engine "
+            "only tokenizes untokenized text. To re-annotate the existing tokens use "
+            "--writeback-engine flexipipe; to retokenize, start from the untokenized "
+            "source, or detokenize first: `xmltokenize detokenize FILE --output OUT` "
+            "(keeps a TSV record of the removed tokens and sentences)."
+        )
+
+
 def nlp_plaintext_for_flexipipe(
     path: str,
     *,

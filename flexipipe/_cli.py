@@ -5127,6 +5127,26 @@ def run_tag(args: argparse.Namespace) -> int:
                     nlp_plaintext_for_flexipipe,
                     teitok_layout_options_from_args,
                 )
+                # Refuse inputs we cannot handle now, not after the NLP has run.
+                from .teitok_writeback_xt import (
+                    XmltokenizerWritebackError,
+                    refuse_existing_tokenization,
+                )
+
+                try:
+                    # the engine as requested: under "auto" a tokenized file goes to
+                    # the flexipipe engine, so only an explicit xmltokenizer counts
+                    _engine_arg = (getattr(args, "writeback_engine", "auto") or "auto").strip().lower()
+                    _engine = (
+                        "xmltokenizer"
+                        if getattr(args, "writeback", None) is not False
+                        and _engine_arg in ("xmltokenizer", "xt")
+                        else "other"
+                    )
+                    refuse_existing_tokenization(args.input, engine=_engine)
+                except XmltokenizerWritebackError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
                 has_tokens = teitok_has_tokens(args.input)
             
                 if not has_tokens:
