@@ -119,6 +119,37 @@ class XmltokenizerSession:
     layout_normalized: bool = False
 
 
+# The oldest xmltokenizer this flexipipe works with (keep in step with
+# XMLTOKENIZER_TAG in setup.py). An older one is a stale install: pulling
+# xmltokenizer does not update an installed copy.
+XMLTOKENIZER_MIN_VERSION = (0, 1, 0)
+
+
+def xmltokenizer_version() -> str:
+    try:
+        import xmltokenizer as xt
+    except ImportError:
+        return "not installed"
+    return str(getattr(xt, "__version__", "unknown"))
+
+
+def check_xmltokenizer_version() -> None:
+    """Refuse a stale xmltokenizer before any work is done."""
+    ver = xmltokenizer_version()
+    try:
+        parts = tuple(int(x) for x in ver.split("+")[0].split(".")[:3])
+    except ValueError:
+        parts = ()
+    if parts < XMLTOKENIZER_MIN_VERSION:
+        need = ".".join(str(x) for x in XMLTOKENIZER_MIN_VERSION)
+        raise XmltokenizerNotAvailable(
+            f"xmltokenizer {ver} is older than the {need} this flexipipe needs "
+            "(a stale install: pulling the xmltokenizer repo does not update an installed "
+            'copy). Reinstall: pip install --force-reinstall ".[xmltokenizer]" from flexipipe, '
+            "or with FLEXIPIPE_XMLTOKENIZER=local after pip install -e ../xmltokenizer."
+        )
+
+
 def xmltokenizer_available() -> bool:
     try:
         import xmltokenizer  # noqa: F401
@@ -155,8 +186,9 @@ def resolve_writeback_engine(requested: str) -> str:
         if not xmltokenizer_available():
             raise XmltokenizerNotAvailable(
                 "writeback-engine xmltokenizer requested but xmltokenizer is not installed "
-                '(pip install -e ".[xmltokenizer]" from flexipipe, or pip install -e /path/to/xmltokenizer)'
+                '(pip install ".[xmltokenizer]" from flexipipe, or pip install -e /path/to/xmltokenizer)'
             )
+        check_xmltokenizer_version()
         return "xmltokenizer"
     if mode in ("flexipipe", "standoff", "native"):
         return "flexipipe"

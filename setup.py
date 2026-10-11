@@ -3,6 +3,7 @@
 Setup script for FlexiPipe
 """
 
+import os
 import shutil
 import sys
 import tarfile
@@ -46,12 +47,27 @@ BASE_REQUIREMENTS = [
     "tabulate>=0.9.0",
 ]
 
-# xmltokenizer is a separate repo (sibling checkout for local dev).
-_XT_SIBLING = (Path(__file__).resolve().parent.parent / "xmltokenizer")
-if (_XT_SIBLING / "pyproject.toml").is_file():
-    _XMLTOKENIZER_DEP = f"xmltokenizer @ file://{_XT_SIBLING}"
+# xmltokenizer: a tagged release from its git repository (it is not on PyPI, so it is
+# never resolved by name from there). Keep XMLTOKENIZER_TAG in step with
+# XMLTOKENIZER_MIN_VERSION in flexipipe/teitok_writeback_xt.py.
+#
+# FLEXIPIPE_XMLTOKENIZER overrides the requirement:
+#   local     use the xmltokenizer already installed, e.g. an editable checkout:
+#               pip install -e ../xmltokenizer
+#               FLEXIPIPE_XMLTOKENIZER=local pip install -e ".[xmltokenizer]"
+#             (a git pin would replace the editable install)
+#   anything else is used as the requirement itself (a path, URL or other tag).
+XMLTOKENIZER_REPO = "https://github.com/maartenpt/xmltokenizer.git"
+XMLTOKENIZER_TAG = "v0.1.0"
+_xt_override = os.environ.get("FLEXIPIPE_XMLTOKENIZER", "").strip()
+if _xt_override.lower() == "local":
+    _XMLTOKENIZER_DEP = "xmltokenizer"
+elif _xt_override:
+    _XMLTOKENIZER_DEP = (
+        _xt_override if _xt_override.startswith("xmltokenizer") else f"xmltokenizer @ {_xt_override}"
+    )
 else:
-    _XMLTOKENIZER_DEP = "xmltokenizer>=0.0.1"
+    _XMLTOKENIZER_DEP = f"xmltokenizer @ git+{XMLTOKENIZER_REPO}@{XMLTOKENIZER_TAG}"
 
 EXTRAS = {
     "fasttext": ["fasttext-numpy2>=0.9.2.post2"],

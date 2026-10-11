@@ -22,6 +22,32 @@
    ```
 4. Build the native flexitag modules if needed (see `README_CPP.md`). C++ deps (pugixml, rapidjson) are fetched via CMake.
 
+### xmltokenizer (TEI/TEITOK write-back)
+
+The `xmltokenizer` extra installs a **tagged release** of xmltokenizer from its git
+repository (it is not on PyPI); the tag is set in `setup.py`:
+
+```bash
+pip install "flexipipe[xmltokenizer] @ git+https://github.com/ufal/flexipipe.git"
+```
+
+Pulling a newer xmltokenizer does **not** update an installed copy: reinstall
+flexipipe (`pip install --force-reinstall ...`) to get the version it pins.
+flexipipe checks the installed xmltokenizer version and refuses a stale one with
+a message; write-back errors show both versions.
+
+For development against a local xmltokenizer checkout, install that checkout
+editable and tell flexipipe not to pin it (a git pin would replace the editable
+install):
+
+```bash
+pip install -e ../xmltokenizer
+FLEXIPIPE_XMLTOKENIZER=local pip install -e ".[xmltokenizer]"
+```
+
+Any other value of `FLEXIPIPE_XMLTOKENIZER` is used as the requirement itself (a
+path, URL or other tag).
+
 After installation, run:
 
 ```bash

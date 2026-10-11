@@ -5130,6 +5130,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Refuse inputs we cannot handle now, not after the NLP has run.
                 from .teitok_writeback_xt import (
                     XmltokenizerWritebackError,
+                    check_xmltokenizer_version,
                     refuse_existing_tokenization,
                 )
 
@@ -5143,6 +5144,8 @@ def run_tag(args: argparse.Namespace) -> int:
                         and _engine_arg in ("xmltokenizer", "xt")
                         else "other"
                     )
+                    if _engine == "xmltokenizer":
+                        check_xmltokenizer_version()
                     refuse_existing_tokenization(args.input, engine=_engine)
                 except XmltokenizerWritebackError as exc:
                     print(f"Error: {exc}", file=sys.stderr)
@@ -6589,14 +6592,18 @@ def run_tag(args: argparse.Namespace) -> int:
                                 f"[flexipipe] inspect malformed folded XML: {dump_hint}",
                                 file=sys.stderr,
                             )
+                    from . import __version__ as _fp_version
+                    from .teitok_writeback_xt import xmltokenizer_version
+
+                    _versions = f" [flexipipe {_fp_version}, xmltokenizer {xmltokenizer_version()}]"
                     if use_writeback and not output_path:
                         print(
-                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because --writeback was requested without --output.",
+                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because --writeback was requested without --output.{_versions}",
                             file=sys.stderr,
                         )
                     else:
                         print(
-                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
+                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save{_versions}",
                             file=sys.stderr,
                         )
                     if args.test and temp_writeback_path:
