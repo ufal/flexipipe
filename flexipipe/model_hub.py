@@ -3,8 +3,7 @@
 Models are had from where they are hosted — the LINDAT repository, the sender's own server, Hugging Face,
 or flexipipe-hub when the sender cannot host it — always by the plain URL the registry gives. The hub's
 address is needed only to publish (TEITOK's publish page links to its deposit form): the config's
-``model_hub_url``, else ``FLEXIPIPE_MODEL_HUB_URL``, else ``hub.json`` at the root of the registry repository
-(``{"url": "https://…/flexipipe-hub"}``, next to ``registries/``) — so the hub can move without a new flexipipe.
+``model_hub_url`` (``flexipipe config --set-model-hub-url``), else ``FLEXIPIPE_MODEL_HUB_URL``.
 
 ``install_model`` downloads an entry's package, checks its sha256 (when the entry has one), unpacks it
 safely into the backend's model folder (``<models>/<backend>/<model>/``) and notes where it came from
@@ -24,12 +23,8 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urljoin
 
-HUB_FILE = "hub.json"
 INSTALLED_FROM = "installed-from.json"
-_HUB_CACHE_KEY = "model_hub_url"
-_HUB_CACHE_SECONDS = 60 * 60 * 24
 
 # <backend>/<model>[@v<N>], as `flexipipe install model` takes it
 _SPEC = re.compile(r"^([a-z0-9_-]+)/([A-Za-z0-9][A-Za-z0-9._-]*)(?:@v(\d+))?$")
@@ -43,60 +38,12 @@ def parse_spec(spec: str) -> Optional[Tuple[str, str, Optional[int]]]:
     return m.group(1), m.group(2), int(m.group(3)) if m.group(3) else None
 
 
-def _hub_file_location() -> Optional[str]:
-    """Where the registry repository's hub.json is: next to its registries/ folder."""
-    from .model_registry import get_registry_url
-
-    base = get_registry_url(None)
-    if not base:
-        return None
-    if base.startswith("file://"):
-        root = Path(base[7:])
-        if root.name == "registries":
-            root = root.parent
-        return f"file://{root / HUB_FILE}"
-    base = base.rstrip("/")
-    if base.endswith("/registries"):
-        base = base[: -len("/registries")]
-    return urljoin(base + "/", HUB_FILE)
-
-
-def _read_json_location(location: str) -> Optional[dict]:
-    try:
-        if location.startswith("file://"):
-            return json.loads(Path(location[7:]).read_text(encoding="utf-8"))
-        import requests
-
-        r = requests.get(location, timeout=15)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
-
-
-def hub_url(*, refresh: bool = False) -> Optional[str]:
-    """The hub's address (no trailing slash), or None when nothing says where it is: for publishing."""
-    from .model_storage import read_config, read_model_cache_entry, write_model_cache_entry
+def hub_url() -> Optional[str]:
+    """The hub's address (no trailing slash), or None when it is not set: for publishing."""
+    from .model_storage import read_config
 
     given = read_config().get("model_hub_url") or os.environ.get("FLEXIPIPE_MODEL_HUB_URL")
-    if given:
-        return str(given).rstrip("/")
-    location = _hub_file_location()
-    if not location:
-        return None
-    key = f"{_HUB_CACHE_KEY}:{location}"
-    if not refresh and not location.startswith("file://"):
-        cached = read_model_cache_entry(key, max_age_seconds=_HUB_CACHE_SECONDS)
-        if cached and cached.get("url"):
-            return str(cached["url"]).rstrip("/")
-    data = _read_json_location(location)
-    url = (data or {}).get("url")
-    if not url:
-        return None
-    if not location.startswith("file://"):
-        write_model_cache_entry(key, {"url": url})
-    return str(url).rstrip("/")
+    return str(given).rstrip("/") if given else None
 
 
 # --- the registry entry ------------------------------------------------------------------------

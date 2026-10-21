@@ -3258,7 +3258,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--set-model-hub-url",
         type=str,
         metavar="URL",
-        help="Set the address of flexipipe-hub, for models the registry gives as hub:<backend>/<model> (default: hub.json in the registry repository)",
+        help="Set the address of flexipipe-hub, where TEITOK's publish page sends models to be deposited",
     )
     config_parser.add_argument(
         "--set-model-registry-url",
