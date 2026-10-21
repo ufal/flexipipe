@@ -27,6 +27,12 @@ def run(argv: list[str] | None = None) -> int:
     if sub == "publish":
         from ._cli_publish import main
         return main(argv)
+    if sub == "release":
+        from ._cli_release import main
+        return main(argv)
+    if sub == "udlang":
+        from ._cli_udlang import main
+        return main(argv)
     if sub == "info":
         from ._cli_info import main
         return main(argv)

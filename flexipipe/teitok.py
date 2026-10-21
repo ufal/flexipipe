@@ -1695,6 +1695,8 @@ def dump_teitok(
                     "To build the C++ extension, see: https://github.com/ufal/flexipipe#building-native-modules"
                 ) from e
             raise
+    comment_map = (settings.sentence_comments if settings else None) or sanitized.meta.get("_sentence_comments") or {}
+    xml_str = _add_sentence_attributes(xml_str, sanitized, comment_map)
     if settings:
         xml_str = _remap_teitok_attributes(xml_str, settings)
     if pretty_print:
@@ -1704,6 +1706,60 @@ def dump_teitok(
             skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
         )
     return xml_str
+
+
+_XML_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def _add_sentence_attributes(xml_str: str, document: Document, comment_map: Dict[str, str]) -> str:
+    """The sentences' attributes (from CoNLL-U sentence comments, or the <s> attributes read from TEITOK) on their <s>:
+    a comment the settings map (conllu="text_en" on <s> attribute trans) goes back to that attribute, any other
+    under its own name. Not sent_id / text (TEITOK has the id, and computes the text), nothing internal (_…), only
+    valid attribute names, and never over an attribute the writer already set."""
+    reverse = {name: attr for attr, name in (comment_map or {}).items()}
+    wanted, renamed = [], []
+    for sent in document.sentences:
+        attrs, gone = {}, {}
+        for key, value in (sent.attrs or {}).items():
+            if key.startswith("_") or key in ("id", "sent_id", "text", "xml:id") or value in (None, ""):
+                continue
+            name = reverse.get(key, key)
+            if _XML_NAME.match(name):
+                attrs[name] = str(value)
+                if name != key:
+                    gone[key] = str(value)  # the comment's own name, if a writer put it there: it is `name` now
+        wanted.append(attrs)
+        renamed.append(gone)
+    if not any(wanted):
+        return xml_str
+    try:
+        from lxml import etree
+        root = etree.fromstring(xml_str.encode("utf-8"), etree.XMLParser(remove_blank_text=False))
+        tostring = lambda r: etree.tostring(r, encoding="unicode")
+    except ImportError:
+        etree = ET
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            return xml_str
+        tostring = lambda r: ET.tostring(r, encoding="unicode")
+    except Exception:
+        return xml_str
+    s_elems = [e for e in root.iter() if isinstance(e.tag, str) and e.tag.split("}")[-1] == "s"]
+    if len(s_elems) != len(wanted):
+        return xml_str  # not one <s> per sentence: leave it as the writer made it
+    for s_elem, attrs, gone in zip(s_elems, wanted, renamed):
+        for name, value in attrs.items():
+            if s_elem.get(name) is None:
+                s_elem.set(name, value)
+        for key, value in gone.items():
+            if s_elem.get(key) == value:
+                del s_elem.attrib[key]
+    updated = tostring(root)
+    if xml_str.startswith("<?xml"):
+        prefix, _, remainder = xml_str.partition("?>")
+        return f"{prefix}?>{chr(10) if remainder.startswith(chr(10)) else ''}{updated.lstrip()}"
+    return updated
 
 
 def _remap_teitok_attributes(xml_str: str, settings: "TeitokSettings") -> str:

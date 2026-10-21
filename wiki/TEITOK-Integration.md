@@ -513,7 +513,7 @@ If processing is slow:
 ## See Also
 
 - [Main README](../README.md) - General Flexipipe documentation
-- [Command Reference](command-reference.md) - Complete CLI reference
+- [Command Reference](Reference.md) - Complete CLI reference
 - [Backend Guide](backends.md) - Backend-specific documentation
 
 

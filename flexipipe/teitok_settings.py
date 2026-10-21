@@ -11,7 +11,7 @@ This module handles reading and parsing TEITOK settings.xml files to extract:
 TEITOK settings.xml structure:
 - /defaults: Default settings including language (@lang attribute)
 - /cqp: CQP corpus configuration (pattributes, sattributes)
-- /xmlfiles: XML file defaults (language, etc.)
+- /xmlfile: XML file defaults (language, form hierarchy, sentence attributes …)
 - /teiheader: Text-level metadata defaults
 - /flexipipe: Preferred backend/model configuration per language
 - /neotag/parameters/item: Tagger-specific parameters (handled by C++ code)
@@ -107,6 +107,9 @@ class TeitokSettings:
         self.download_model: bool = False
         self.defined_token_attributes: Set[str] = set()
         self.form_hierarchy: Dict[str, Optional[str]] = {}  # form_name -> parent_form_name (None for base)
+        # <s> attributes written as CoNLL-U sentence comments: <xmlfile><sattributes><item key="s"><item key="trans"
+        # conllu="text_en"/> → {"trans": "text_en"} (# text_en = …; read back into @trans)
+        self.sentence_comments: Dict[str, str] = {}
         self.default_form: str = "form"  # Default form attribute name
         # Attribute names to try on <s> for "sentence references these token IDs" (sameAs vs corresp)
         # Order: first non-empty wins. Older TEITOK uses corresp.
@@ -152,8 +155,8 @@ class TeitokSettings:
         # Parse /cqp section for pattributes and sattributes
         settings._parse_cqp_section(root)
         
-        # Parse /xmlfiles section for defaults
-        settings._parse_xmlfiles_section(root)
+        # Parse /xmlfile section for defaults (form hierarchy, language, <s> attributes as CoNLL-U comments)
+        settings._parse_xmlfile_section(root)
         
         # Parse /teiheader section for metadata defaults
         settings._parse_teiheader_section(root)
@@ -175,9 +178,9 @@ class TeitokSettings:
                     # (don't override CQP attributes from cqpsettings.xml)
                     if not settings.default_language:
                         settings._parse_defaults_section(resources_root)
-                    # Also check xmlfiles and teiheader for language if still not set
+                    # Also check xmlfile and teiheader for language if still not set
                     if not settings.default_language:
-                        settings._parse_xmlfiles_section(resources_root)
+                        settings._parse_xmlfile_section(resources_root)
                     if not settings.default_language:
                         settings._parse_teiheader_section(resources_root)
                     settings._parse_flexipipe_section(resources_root, prefer_existing=True)
@@ -308,35 +311,51 @@ class TeitokSettings:
             if lang:
                 self.default_language = lang
     
-    def _parse_xmlfiles_section(self, root: ET.Element) -> None:
-        """Parse /xmlfiles section for XML file processing defaults."""
-        xmlfiles_elem = root.find(".//xmlfiles")
-        if xmlfiles_elem is None:
+    def _parse_sentence_comments(self, xmlfile_elem: ET.Element) -> None:
+        """<xmlfile><sattributes><item key="s"><item key="trans" conllu="text_en"/>: the <s> attributes written as CoNLL-U
+        sentence comments, and under which name."""
+        sattributes_elem = xmlfile_elem.find("sattributes")
+        if sattributes_elem is None:
             return
+        for level_elem in sattributes_elem.findall("item"):
+            if (level_elem.get("level") or level_elem.get("key")) != "s":
+                continue
+            for item_elem in level_elem.findall("item"):
+                key, name = item_elem.get("key"), (item_elem.get("conllu") or "").strip()
+                if key and name:
+                    self.sentence_comments[key] = name
+
+    def _parse_xmlfile_section(self, root: ET.Element) -> None:
+        """Parse TEITOK's /xmlfile section (singular, as TEITOK's settings have it; this read <xmlfiles> before, so
+        none of it was ever picked up) for XML file processing defaults."""
+        xmlfile_elem = root.find("xmlfile")
+        if xmlfile_elem is None:
+            return
+        self._parse_sentence_comments(xmlfile_elem)
         
         # Look for default language in various places (only if not already set from /defaults)
         # 1. Direct language attribute
         if not self.default_language:
-            lang = xmlfiles_elem.get("language")
+            lang = xmlfile_elem.get("language")
             if lang:
                 self.default_language = lang
         
         # 2. Language element
         if not self.default_language:
-            lang_elem = xmlfiles_elem.find("language")
+            lang_elem = xmlfile_elem.find("language")
             if lang_elem is not None:
                 self.default_language = lang_elem.text or lang_elem.get("value")
         
         # Store other defaults
-        for key, value in xmlfiles_elem.attrib.items():
+        for key, value in xmlfile_elem.attrib.items():
             if key != "language":
                 self.xmlfile_defaults[key] = value
-                # Check for defaultform attribute
-                if key == "defaultform":
-                    self.default_form = value
+                # defaultform is the form a corpus shows by default (e.g. nform), not the form for computational
+                # purposes, which is @form (climbing the hierarchy): kept in xmlfile_defaults only, default_form
+                # stays "form"
         
         # Parse forms hierarchy from <pattributes><forms>
-        pattributes_elem = xmlfiles_elem.find("pattributes")
+        pattributes_elem = xmlfile_elem.find("pattributes")
         if pattributes_elem is not None:
             forms_elem = pattributes_elem.find("forms")
             if forms_elem is not None:
@@ -361,7 +380,7 @@ class TeitokSettings:
                         self.form_hierarchy[form_name] = None
         
         # Parse child elements as defaults
-        for child in xmlfiles_elem:
+        for child in xmlfile_elem:
             if child.tag not in ("language", "pattributes", "sattributes"):
                 self.xmlfile_defaults[child.tag] = child.text or child.get("value", "")
     
@@ -371,7 +390,7 @@ class TeitokSettings:
         if teiheader_elem is None:
             return
         
-        # Parse language from teiheader (can override xmlfiles)
+        # Parse language from teiheader (can override xmlfile)
         lang_elem = teiheader_elem.find("language")
         if lang_elem is not None:
             lang_value = lang_elem.text or lang_elem.get("value") or lang_elem.get("code")

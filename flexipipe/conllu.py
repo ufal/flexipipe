@@ -1002,7 +1002,7 @@ def document_to_conllu(
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
         extra_entities = span_entities.get(sent_idx)
-        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid, suppress_space_after_in_misc=suppress_space_after_in_misc, use_effective_form=use_effective_form)
+        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid, suppress_space_after_in_misc=suppress_space_after_in_misc, use_effective_form=use_effective_form, sentence_comments=document.meta.get("_sentence_comments"))
         lines.extend(sentence_lines)
         # Add exactly one empty line after each sentence (required by CoNLL-U format)
         lines.append("")
@@ -1027,7 +1027,7 @@ def document_to_conllu(
     return result
 
 
-def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False, suppress_space_after_in_misc: bool = False, use_effective_form: bool = False) -> List[str]:
+def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False, suppress_space_after_in_misc: bool = False, use_effective_form: bool = False, sentence_comments: Optional[Dict[str, str]] = None) -> List[str]:
     lines: List[str] = []
     # Print standard UD sentence attributes
     sent_standard_attrs = sentence.get_standard_attrs()
@@ -1043,6 +1043,8 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
         
         # Print other standard sentence attributes
         for attr_name in sorted(UD_SENTENCE_ATTRIBUTES.keys()):
+            if sentence_comments and sentence_comments.get(attr_name, attr_name) != attr_name:
+                continue  # the settings write it under another name (below)
             if attr_name not in ("sent_id", "text") and attr_name in sent_standard_attrs:
                 lines.append(f"# {attr_name} = {sent_standard_attrs[attr_name]}")
     else:
@@ -1054,6 +1056,15 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
         sentence_text = sentence.text or _reconstruct_sentence_text(sentence.tokens)
         if sentence_text:
             lines.append(f"# text = {sentence_text}")
+
+    # Sentence attributes the TEITOK settings map to a comment (conllu="text_en" on <s> attribute trans): # text_en = …
+    if sentence_comments:
+        written = {line.split("=", 1)[0][2:].strip() for line in lines if line.startswith("# ")}
+        for attr_name, comment_name in sentence_comments.items():
+            value = (sentence.attrs.get(attr_name) or "").strip()
+            if value and comment_name not in written:
+                lines.append(f"# {comment_name} = {' '.join(value.split())}")
+                written.add(comment_name)
 
     # Build entity annotations for NER entities
     if entity_format == "ne":

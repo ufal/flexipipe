@@ -14,6 +14,8 @@ TASK_CHOICES = (
     "benchmark",
     "validate",
     "publish",
+    "udlang",
+    "release",
 )
 
 

@@ -8184,6 +8184,20 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
     
     # Write output
     output_format = args.output_format
+    # Which <s> attributes are which CoNLL-U sentence comments: the TEITOK project's settings.xml (conllu="…" on its
+    # sentence attributes), found from the TEITOK side, the input or the output file
+    if "_sentence_comments" not in doc.meta:
+        from .teitok_settings import find_settings_xml, load_teitok_settings
+        teitok_side = args.input if output_format != "teitok" else args.output
+        try:
+            side = Path(teitok_side) if teitok_side and teitok_side != "-" else None
+            found = find_settings_xml(side if side.exists() else side.parent) if side else None  # (output: not yet written)
+            if found:
+                comments = load_teitok_settings(settings_path=found).sentence_comments
+                if comments:
+                    doc.meta["_sentence_comments"] = comments
+        except Exception:
+            pass
     if output_format == "teitok":
         pretty_print = getattr(args, "pretty_print", False)
         if args.output:
@@ -9410,6 +9424,7 @@ def run_config(args: argparse.Namespace) -> int:
         default_tokenizer = get_default_tokenizer()
         default_segmenter = get_default_segmenter()
         default_normalizer = get_default_normalizer()
+        use_reg_for_nlp = get_use_reg_for_nlp()
 
         # Model registry configuration
         from .model_registry import DEFAULT_REGISTRY_BASE_URL
