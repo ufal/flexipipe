@@ -41,10 +41,11 @@ if TYPE_CHECKING:
 # These are the default mappings if not specified in settings.xml
 DEFAULT_ATTRIBUTE_MAPPINGS = {
     "xpos": ["xpos", "msd", "pos"],
-    "reg": ["reg", "nform"],
+    "reg": ["reg", "nform", "norm"],  # TEITOK corpora call the normalized form any of these
     "expan": ["expan", "fform"],
     "lemma": ["lemma"],
     "tokid": ["id", "xml:id"],
+    "pron": ["pron"],  # canonical pronunciation (the realised one is @phon: never written here)
 }
 
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
@@ -56,6 +57,7 @@ CQP_ATTRIBUTE_MAPPINGS = {
     "lemma": "lemma",
     "reg": "reg",
     "nform": "reg",
+    "norm": "reg",
     "expan": "expan",
     "fform": "expan",
 }
@@ -77,6 +79,20 @@ class TeitokSettings:
     def __init__(self):
         self.attribute_mappings: Dict[str, List[str]] = dict(DEFAULT_ATTRIBUTE_MAPPINGS)
         self.default_language: Optional[str] = None
+        self.corpus_default_model: Optional[Dict[str, str]] = None  # <flexipipe backend model>
+        self.pos_typed_attributes: List[str] = []  # pattributes with type="pos" (TEITOK's tag attribute)
+        self.sentence_layout = None  # <flexipipe><segmentation preset=…> (sentence_layout.SentenceLayout)
+        # a backend per step the main one does not provide: <flexipipe><task name backend model/>
+        # (and EasyCorp's ner_backend / normalize_backend attributes) — task_routing.py
+        self.task_backends: Dict[str, tuple] = {}
+        # training on the corpus: <flexipipe><training tags lemma pron pron-context use/> (corpus_models.py)
+        self.training: Dict[str, str] = {}
+        # where a layer is written, set by the user: <flexipipe><layer name="xpos" attribute="xpos"/>
+        # (the automatic choice, teitok_names.py, leaves these alone)
+        self.layer_attributes: Dict[str, str] = {}
+        # layers the user leaves out: <layers><item key="pron" exclude="yes"/> — never written, and the step
+        # that only produces them is not run
+        self.excluded_layers: Set[str] = set()
         self.cqp_pattributes: List[str] = []
         self.cqp_sattributes: List[str] = []  # Flat list for backward compatibility
         self.cqp_sattributes_by_region: Dict[str, List[str]] = {}  # Region -> list of attributes
@@ -171,8 +187,26 @@ class TeitokSettings:
         
         # Build attribute mappings from CQP attributes
         settings._build_attribute_mappings()
+        settings._apply_layer_attributes()
+        settings._apply_corpus_default_model()
         
         return settings
+
+    def _apply_layer_attributes(self) -> None:
+        """The user's <layer name attribute>: that attribute first for the layer, and a defined one."""
+        for layer, attribute in self.layer_attributes.items():
+            rest = [n for n in self.attribute_mappings.get(layer, []) if n != attribute]
+            self.attribute_mappings[layer] = [attribute] + rest
+            self.defined_token_attributes.add(attribute)
+
+    def _apply_corpus_default_model(self) -> None:
+        """The corpus's default model counts for its default language, unless that language has
+        its own entry (<models><item key=…> / <language code=…>)."""
+        if not self.corpus_default_model or not self.default_language:
+            return
+        if self.get_flexipipe_preference(self.default_language):
+            return
+        self.flexipipe_preferences[self.default_language] = dict(self.corpus_default_model)
     
     def _parse_cqp_section(self, root: ET.Element) -> None:
         """Parse /cqp section for pattributes and sattributes."""
@@ -197,6 +231,8 @@ class TeitokSettings:
                     flexipipe_map = item_elem.get("flexipipe")
                     if flexipipe_map:
                         self.explicit_flexipipe_mappings[attr_name] = flexipipe_map.strip()
+                    if (item_elem.get("type") or "").strip().lower() == "pos":
+                        self.pos_typed_attributes.append(attr_name)
             # Also try <attribute name="..."> format (settings.xml)
             if not self.cqp_pattributes:
                 for attr_elem in pattributes_elem.findall("attribute"):
@@ -456,6 +492,53 @@ class TeitokSettings:
             if pref:
                 self.flexipipe_preferences[pref_key] = pref
         
+        # <flexipipe><tasks><item key="ner" backend="nametag" model="…"/></tasks> (TEITOK's keyed list:
+        # xmlflatten makes it a hash), the older <task name …>, and EasyCorp's attributes
+        for attr_task in ("ner", "normalize", "pron"):
+            backend = (flexipipe_elem.get(f"{attr_task}_backend") or "").strip()
+            if backend and attr_task not in self.task_backends:
+                self.task_backends[attr_task] = (backend.lower(), (flexipipe_elem.get(f"{attr_task}_model") or "").strip() or None)
+        for task_elem in flexipipe_elem.findall("tasks/item") + flexipipe_elem.findall("task"):
+            name = (task_elem.get("key") or task_elem.get("name") or "").strip()
+            backend = (task_elem.get("backend") or "").strip()
+            if name and backend and not (prefer_existing and name in self.task_backends):
+                self.task_backends[name] = (backend.lower(), (task_elem.get("model") or "").strip() or None)
+
+        # <flexipipe><layers><item key="xpos" attribute="xpos"/></layers> (also att=; the older <layer name …>)
+        for layer_elem in flexipipe_elem.findall("layers/item") + flexipipe_elem.findall("layer"):
+            name = (layer_elem.get("key") or layer_elem.get("name") or "").strip()
+            attribute = (layer_elem.get("attribute") or layer_elem.get("att") or "").strip()
+            if name and (layer_elem.get("exclude") or "").strip().lower() in TRUTHY_VALUES:
+                if not (prefer_existing and name in self.layer_attributes):
+                    self.excluded_layers.add(name)
+                continue
+            if name and attribute and not (prefer_existing and name in self.layer_attributes):
+                self.layer_attributes[name] = attribute
+
+        training_elem = flexipipe_elem.find("training")
+        if training_elem is not None and not (prefer_existing and self.training):
+            self.training = {k: v for k, v in training_elem.attrib.items()}
+
+        # <flexipipe><segmentation preset="…"><elements><item key name type boundary crossing/>: how <s>
+        # fits u / seg / p (the older <element …> children too)
+        seg_elem = flexipipe_elem.find("segmentation")
+        if seg_elem is not None and not (prefer_existing and self.sentence_layout is not None):
+            from .sentence_layout import SentenceLayout
+
+            try:
+                self.sentence_layout = SentenceLayout.from_xml(seg_elem)
+            except ValueError as exc:
+                import sys as _sys
+
+                print(f"[flexipipe] settings.xml <flexipipe><segmentation>: {exc} (using the written preset)", file=_sys.stderr)
+
+        # <flexipipe backend=… model=…>: the corpus's model for its default language (the set-up
+        # page's "Model"); a per-language entry for that language wins (_apply_corpus_default_model)
+        top_backend = (flexipipe_elem.get("backend") or "").strip()
+        top_model = (flexipipe_elem.get("model") or "").strip()
+        if (top_backend or top_model) and not (prefer_existing and self.corpus_default_model):
+            self.corpus_default_model = {k: v for k, v in (("backend", top_backend), ("model", top_model)) if v}
+
         # <flexipipe><language ...> entries
         for lang_elem in flexipipe_elem.findall("language"):
             code = lang_elem.get("code") or lang_elem.get("iso") or lang_elem.get("id") or lang_elem.get("name")
@@ -498,8 +581,8 @@ class TeitokSettings:
         2. Standard CQP_ATTRIBUTE_MAPPINGS
         3. Default mappings
         """
-        # Start with defaults
-        mappings = dict(DEFAULT_ATTRIBUTE_MAPPINGS)
+        # Start with defaults (copies: the lists below are changed in place, the defaults must not be)
+        mappings = {k: list(v) for k, v in DEFAULT_ATTRIBUTE_MAPPINGS.items()}
         
         # First, handle explicit flexipipe mappings (highest priority)
         for xml_attr, internal_attr in self.explicit_flexipipe_mappings.items():
@@ -526,8 +609,33 @@ class TeitokSettings:
                         mappings[internal_name].remove(pattr)
                         mappings[internal_name].insert(0, pattr)
         
+        # A positional attribute TEITOK declares as the POS tag (type="pos") with a name flexipipe
+        # does not know (ORTOFON's "tag"): the corpus's language-specific tag, i.e. xpos — unless it
+        # is mapped explicitly (flexipipe="…"), or xpos already has a corpus attribute.
+        known = {name.lower() for name in CQP_ATTRIBUTE_MAPPINGS}
+        xpos_from_corpus = any(a in self.cqp_pattributes for a in mappings.get("xpos", []) if a != "xpos")
+        for pattr in self.pos_typed_attributes:
+            if xpos_from_corpus or pattr in self.explicit_flexipipe_mappings or pattr.lower() in known:
+                continue
+            xpos_names = mappings.setdefault("xpos", [])
+            if pattr in xpos_names:
+                xpos_names.remove(pattr)
+            xpos_names.insert(0, pattr)
+            break
+
         self.attribute_mappings = mappings
     
+    def apply_cli_mappings(self, cli_map: Dict[str, str]) -> None:
+        """Command-line `--attrs-map` (internal attr -> "name[,name…]"): those names first, ahead of
+        settings.xml's; an explicitly named attribute counts as defined (known-tags-only mode)."""
+        for internal_attr, value in (cli_map or {}).items():
+            names = [v.strip() for v in str(value).split(",") if v.strip()]
+            if not names:
+                continue
+            rest = [n for n in self.attribute_mappings.get(internal_attr, []) if n not in names]
+            self.attribute_mappings[internal_attr] = names + rest
+            self.defined_token_attributes.update(names)
+
     def get_attribute_mapping(self, internal_attr: str) -> List[str]:
         """
         Get the list of XML attribute names for an internal attribute.

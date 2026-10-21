@@ -317,10 +317,25 @@ def resolve_flexitag_model_path(
         if candidate.exists():
             return candidate
 
+    # not here, but in the registry (e.g. published through flexipipe-hub): installed when downloading is on
+    hint = ""
+    if "/" not in model_name and not direct_candidate.is_absolute():
+        try:
+            from ..model_hub import find_entry, install_model, package_address
+            from ..model_storage import get_default_download_model, is_running_from_teitok
+
+            entry = find_entry("flexitag", model_name)
+            if entry and package_address(entry):
+                if get_default_download_model() and not is_running_from_teitok():
+                    return install_model("flexitag", model_name)
+                hint = f"\nIt is in the model registry: install it with 'flexipipe install model flexitag/{model_name}'."
+        except Exception as e:
+            hint = f"\nIt is in the model registry, but could not be installed: {e}"
+
     checked_paths = ", ".join(str(path) for path in candidates)
     raise ValueError(
         f"Error: Flexitag model '{model_name}' not found.\n"
-        f"Checked locations: {checked_paths}\n"
+        f"Checked locations: {checked_paths}{hint}\n"
         "Use --model <name> to load from the flexitag data folder or flexipipe models directory."
     )
 
@@ -365,6 +380,16 @@ class FlexitagBackend(BackendManager):
     def supports_training(self) -> bool:
         return True
 
+    def _add_pronunciation(self, document: Document) -> None:
+        """When the model folder has a pronunciation model (model_pron.json, trained with --pron):
+        pron per token, Phonetisaurus for unknown forms when the model has one (pron_backends)."""
+        folder = self._model_path if self._model_path.is_dir() else self._model_path.parent
+        if not (folder / "model_pron.json").exists():
+            return
+        from ..pron_backends import annotate_pronunciation
+
+        annotate_pronunciation(document, folder, "auto", verbose=self._debug)
+
     def tag(
         self,
         document: Document,
@@ -391,6 +416,7 @@ class FlexitagBackend(BackendManager):
         _ = overrides, preserve_pos_tags, components, use_raw_text
         
         flexitag_result: FlexitagResult = self._fallback.tag(document)
+        self._add_pronunciation(flexitag_result.document)
         
         # Convert FlexitagResult to NeuralResult
         return NeuralResult(
@@ -479,7 +505,7 @@ def _create_flexitag_backend(
 
 BACKEND_SPEC = BackendSpec(
     name="flexitag",
-    description="Flexitag - Rule-based fallback tagger (default)",
+    description="Flexitag - built-in trainable tagger and lemmatizer (needs no extra installation)",
     factory=_create_flexitag_backend,
     get_model_entries=get_flexitag_model_entries,
     list_models=list_flexitag_models,

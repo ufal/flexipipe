@@ -100,7 +100,9 @@ def parse_teitok_tagset(tagset_file: Path) -> Dict:
                 ud_feat_name = _map_feature_name_to_ud(pos_display)
                 
                 # Parse value definitions - store by value key (the character in the XPOS tag)
-                for value_item in pos_item.findall('item'):
+                values = pos_item.findall('item')
+                sibling_displays = frozenset(v.get('display', '').strip().lower() for v in values)
+                for value_item in values:
                     value_key = value_item.get('key', '')
                     value_display = value_item.get('display', '').strip()
                     
@@ -108,21 +110,17 @@ def parse_teitok_tagset(tagset_file: Path) -> Dict:
                     if value_key == '0' and not value_display:
                         continue
                     
-                    value_display_lower = value_display.lower()
-                    ud_value = _map_feature_value_to_ud(ud_feat_name, value_display_lower, value_key)
-                    
-                    if ud_value:  # Only store if we have a valid UD value
-                        position_defs[key][pos_index][value_key] = {
-                            'display': value_display,
-                            'ud_value': ud_value,
-                            'ud_feat': ud_feat_name
-                        }
-                    elif value_key:  # Store even if no UD value (for lookup purposes)
-                        position_defs[key][pos_index][value_key] = {
-                            'display': value_display,
-                            'ud_value': None,
-                            'ud_feat': ud_feat_name
-                        }
+                    if not value_key:
+                        continue
+                    position_defs[key][pos_index][value_key] = {
+                        'display': value_display,
+                        'ud_feat': ud_feat_name,
+                        # the UD features this value stands for (None: none)
+                        'ud_feats': _map_feature_value_to_ud(ud_feat_name, value_display, value_key, sibling_displays),
+                        # a word type that changes the UPOS (a subordinating conjunction, a proper noun)
+                        'upos': _TYPE_UPOS.get((EAGLES_TO_UPOS.get(key), value_display.lower()))
+                                if pos_display in ('type', 'tipo') else None,
+                    }
             
             # Also copy position definitions to multi-category items
             if multi_elem is not None:
@@ -169,98 +167,113 @@ def _map_feature_name_to_ud(feature_name: str) -> Optional[str]:
     return mappings.get(feature_lower)
 
 
-def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value_key: str) -> Optional[str]:
-    """Map feature value to UD FEATS value."""
-    if feat_name is None:
+# Feature values by their description in the tagset (lowercased) → the UD features they stand for; None: no UD value
+# (ambiguous, "any", unspecified …: left out rather than invented). A description not listed here is used only if it is
+# itself a UD value of the feature. Mood and tense descriptions may set other features (UD: infinitive, gerund and
+# participle are VerbForms; the conditional is a Mood).
+_VALUES = {
+    'Gender': {
+        'masculine': {'Gender': 'Masc'}, 'masculino': {'Gender': 'Masc'}, 'masc': {'Gender': 'Masc'},
+        'feminine': {'Gender': 'Fem'}, 'femenino': {'Gender': 'Fem'}, 'feminino': {'Gender': 'Fem'}, 'fem': {'Gender': 'Fem'},
+        'neuter': {'Gender': 'Neut'}, 'neutral': {'Gender': 'Neut'}, 'neutro': {'Gender': 'Neut'},
+        'common': {'Gender': 'Com'}, 'común': {'Gender': 'Com'}, 'comum': {'Gender': 'Com'},  # see _common_is_either
+        'masc/fem': {'Gender': 'Fem,Masc'}, 'masculine or feminine': {'Gender': 'Fem,Masc'},
+        'feminine or neuter': {'Gender': 'Fem,Neut'}, 'not feminine': {'Gender': 'Masc,Neut'},
+        'nonneuter': {'Gender': 'Com'},
+        'masculine animate': {'Gender': 'Masc', 'Animacy': 'Anim'},
+        'masculine inanimate': {'Gender': 'Masc', 'Animacy': 'Inan'},
+    },
+    'Number': {
+        'singular': {'Number': 'Sing'}, 'plural': {'Number': 'Plur'}, 'dual': {'Number': 'Dual'},
+        'invariable': None, 'impersonal-invariable': None, 'invariável': None, 'common': None, 'singular or plural': None,
+    },
+    'Person': {
+        'first': {'Person': '1'}, 'primera': {'Person': '1'}, 'primeira': {'Person': '1'},
+        'second': {'Person': '2'}, 'segunda': {'Person': '2'},
+        'third': {'Person': '3'}, 'tercera': {'Person': '3'}, 'terceira': {'Person': '3'},
+    },
+    'Mood': {
+        'indicative': {'Mood': 'Ind'}, 'indicativo': {'Mood': 'Ind'},
+        'subjunctive': {'Mood': 'Sub'}, 'subjuntivo': {'Mood': 'Sub'}, 'conjuntivo': {'Mood': 'Sub'},
+        'imperative': {'Mood': 'Imp'}, 'imperativo': {'Mood': 'Imp'},
+        'conditional': {'Mood': 'Cnd'}, 'condicional': {'Mood': 'Cnd'}, 'optative': {'Mood': 'Opt'},
+        'infinitive': {'VerbForm': 'Inf'}, 'infinitivo': {'VerbForm': 'Inf'},
+        'gerund': {'VerbForm': 'Ger'}, 'gerundio': {'VerbForm': 'Ger'}, 'gerúndio': {'VerbForm': 'Ger'},
+        'participle': {'VerbForm': 'Part'}, 'participial': {'VerbForm': 'Part'}, 'pastparticiple': {'VerbForm': 'Part'},
+        'participio': {'VerbForm': 'Part'}, 'particípio': {'VerbForm': 'Part'},
+    },
+    'Tense': {
+        'present': {'Tense': 'Pres'}, 'presente': {'Tense': 'Pres'},
+        'imperfective': {'Tense': 'Imp'}, 'imperfect': {'Tense': 'Imp'}, 'pretérito imperfecto': {'Tense': 'Imp'},
+        'pretérito imperfeito': {'Tense': 'Imp'},
+        'future': {'Tense': 'Fut'}, 'futuro': {'Tense': 'Fut'},
+        'past': {'Tense': 'Past'}, 'pretérito perfecto': {'Tense': 'Past'}, 'pretérito perfeito': {'Tense': 'Past'},
+        'pluperfect': {'Tense': 'Pqp'}, 'pretérito pluscuamperfecto': {'Tense': 'Pqp'}, 'pretérito mais-que-perfeito': {'Tense': 'Pqp'},
+        'conditional': {'Mood': 'Cnd'}, 'condicional': {'Mood': 'Cnd'},
+        'past or present': None,
+    },
+    'Case': {
+        'nominative': {'Case': 'Nom'}, 'nominativo': {'Case': 'Nom'}, 'genitive': {'Case': 'Gen'},
+        'dative': {'Case': 'Dat'}, 'dativo': {'Case': 'Dat'}, 'accusative': {'Case': 'Acc'}, 'acusativo': {'Case': 'Acc'},
+        'vocative': {'Case': 'Voc'}, 'locative': {'Case': 'Loc'}, 'prepositional': {'Case': 'Loc'},
+        'instrumental': {'Case': 'Ins'}, 'ablative': {'Case': 'Abl'}, 'partitive': {'Case': 'Par'},
+        'illative': {'Case': 'Ill'}, 'inessive': {'Case': 'Ine'}, 'elative': {'Case': 'Ela'}, 'allative': {'Case': 'All'},
+        'adessive': {'Case': 'Ade'}, 'ablative case': {'Case': 'Abl'}, 'essive': {'Case': 'Ess'},
+        'translative': {'Case': 'Tra'}, 'terminative': {'Case': 'Ter'}, 'abessive': {'Case': 'Abe'},
+        'comitative': {'Case': 'Com'}, 'ergative': {'Case': 'Erg'}, 'absolutive': {'Case': 'Abs'},
+        'genitive or dative': {'Case': 'Dat,Gen'}, 'accusative or dative': {'Case': 'Acc,Dat'},
+        # Romance pronouns after a preposition (mí, ti): UD Spanish / Portuguese / Catalan's PrepCase
+        'oblique': {'PrepCase': 'Pre'}, 'oblicuo': {'PrepCase': 'Pre'}, 'oblíquo': {'PrepCase': 'Pre'},
+    },
+    'Degree': {
+        'positive': {'Degree': 'Pos'}, 'comparative': {'Degree': 'Cmp'}, 'comparativo': {'Degree': 'Cmp'},
+        'superlative': {'Degree': 'Sup'}, 'superlativo': {'Degree': 'Sup'}, 'suerlativo': {'Degree': 'Sup'},
+        'absolute': {'Degree': 'Abs'}, 'diminutive': {'Degree': 'Dim'}, 'diminutivo': {'Degree': 'Dim'},
+        'augmentative': {'Degree': 'Aug'}, 'aumentativo': {'Degree': 'Aug'},
+    },
+}
+
+# UD's values per feature (universaldependencies.org/u/feat), for descriptions not in _VALUES
+_UD_VALUES = {
+    'Gender': {'Com', 'Fem', 'Masc', 'Neut'}, 'Number': {'Coll', 'Count', 'Dual', 'Grpa', 'Grpl', 'Inv', 'Pauc', 'Plur', 'Ptan', 'Sing', 'Tri'},
+    'Person': {'0', '1', '2', '3', '4'}, 'Mood': {'Adm', 'Cnd', 'Des', 'Imp', 'Ind', 'Int', 'Irr', 'Jus', 'Nec', 'Opt', 'Pot', 'Prp', 'Qot', 'Sub'},
+    'Tense': {'Fut', 'Imp', 'Past', 'Pqp', 'Pres'}, 'Degree': {'Abs', 'Aug', 'Cmp', 'Dim', 'Equ', 'Pos', 'Sup'},
+    'Case': {'Abs', 'Acc', 'Erg', 'Nom', 'Abe', 'Ben', 'Cau', 'Cmp', 'Cns', 'Com', 'Dat', 'Dis', 'Equ', 'Gen', 'Ins', 'Par', 'Tem',
+             'Tra', 'Voc', 'Abl', 'Add', 'Ade', 'All', 'Del', 'Ela', 'Ess', 'Ill', 'Ine', 'Lat', 'Loc', 'Per', 'Sbe', 'Sbl', 'Spl',
+             'Sub', 'Sup', 'Ter'},
+}
+
+# A word-type description that changes the UPOS of its main category: (category UPOS, description) → UPOS
+_TYPE_UPOS = {('CCONJ', d): 'SCONJ' for d in ('subordinate', 'subordinating', 'subordinada', 'subordinante',
+                                             'subordinativa', 'subordinator')}
+_TYPE_UPOS.update({('NOUN', d): 'PROPN' for d in ('proper', 'propio', 'próprio')})
+
+_FINITE_MOODS = {'Ind', 'Sub', 'Imp', 'Cnd', 'Opt'}
+
+
+def _common_is_either(displays) -> bool:
+    """EAGLES 'common' next to masculine and feminine (Romance: invariable for gender) means either of them — no UD
+    value; next to neuter only (Scandinavian) it is UD's Gender=Com."""
+    return {'masculine', 'feminine'} <= displays or {'masculino', 'femenino'} <= displays
+
+
+def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value_key: str,
+                             sibling_displays=frozenset()) -> Optional[Dict[str, str]]:
+    """The UD features a value stands for ({feature: value}), or None where it has no UD value."""
+    if feat_name is None or value_key == '0':
         return None
-    
-    value_lower = value_display.lower()
-    
-    # Gender mappings
-    if feat_name == 'Gender':
-        if value_key == '0':
-            return None
-        mappings = {
-            'masculine': 'Masc', 'masculino': 'Masc', 'm': 'Masc',
-            'feminine': 'Fem', 'femenino': 'Fem', 'f': 'Fem',
-            'common': 'Com', 'común': 'Com', 'comum': 'Com', 'c': 'Com',
-            'neutral': 'Neut', 'neutro': 'Neut', 'n': 'Neut',
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
-    # Number mappings
-    if feat_name == 'Number':
-        if value_key == '0':
-            return None
-        mappings = {
-            'singular': 'Sing', 'singular': 'Sing', 's': 'Sing',
-            'plural': 'Plur', 'plural': 'Plur', 'p': 'Plur',
-            'invariable': None, 'invariável': None, 'invariável': None, 'n': None,
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
-    # Person mappings
-    if feat_name == 'Person':
-        if value_key == '0':
-            return None
-        mappings = {
-            'first': '1', 'primera': '1', 'primeira': '1', '1': '1',
-            'second': '2', 'segunda': '2', '2': '2',
-            'third': '3', 'tercera': '3', 'terceira': '3', '3': '3',
-        }
-        return mappings.get(value_lower) or (value_key if value_key and value_key != '0' else None)
-    
-    # Mood mappings
-    if feat_name == 'Mood':
-        if value_key == '0':
-            return None
-        mappings = {
-            'indicative': 'Ind', 'indicativo': 'Ind', 'i': 'Ind',
-            'subjunctive': 'Sub', 'subjuntivo': 'Sub', 'conjuntivo': 'Sub', 's': 'Sub',
-            'imperative': 'Imp', 'imperativo': 'Imp', 'm': 'Imp',
-            'infinitive': None, 'infinitivo': 'Inf', 'n': None,
-            'gerund': 'Ger', 'gerundio': 'Ger', 'gerúndio': 'Ger', 'g': 'Ger',
-            'participle': 'Part', 'participio': 'Part', 'particípio': 'Part', 'p': 'Part',
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
-    # Tense mappings
-    if feat_name == 'Tense':
-        if value_key == '0':
-            return None
-        mappings = {
-            'present': 'Pres', 'presente': 'Pres', 'p': 'Pres',
-            'imperfective': 'Imp', 'pretérito imperfecto': 'Imp', 'pretérito imperfeito': 'Imp', 'i': 'Imp',
-            'future': 'Fut', 'futuro': 'Fut', 'f': 'Fut',
-            'past': 'Past', 'pretérito perfecto': 'Past', 'pretérito perfeito': 'Past', 's': 'Past',
-            'conditional': 'Cond', 'condicional': 'Cond', 'c': 'Cond',
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
-    # Case mappings
-    if feat_name == 'Case':
-        if value_key == '0':
-            return None
-        mappings = {
-            'nominative': 'Nom', 'nominativo': 'Nom', 'n': 'Nom',
-            'accusative': 'Acc', 'acusativo': 'Acc', 'a': 'Acc',
-            'dative': 'Dat', 'dativo': 'Dat', 'd': 'Dat',
-            'oblique': 'Obl', 'oblicuo': 'Obl', 'oblíquo': 'Obl', 'o': 'Obl',
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
-    # Degree mappings
-    if feat_name == 'Degree':
-        if value_key == '0':
-            return None
-        mappings = {
-            'comparative': 'Cmp', 'comparativo': 'Cmp', 'c': 'Cmp',
-            'superlative': 'Sup', 'superlativo': 'Sup', 'suerlativo': 'Sup', 's': 'Sup',
-            'augmentative': None, 'aumentativo': None, 'a': None,
-            'diminutive': None, 'diminutivo': None, 'd': None,
-        }
-        return mappings.get(value_lower) or (value_key.upper() if value_key and value_key != '0' else None)
-    
+    value_lower = value_display.lower().strip()
+    table = _VALUES.get(feat_name, {})
+    if feat_name == 'Gender' and value_lower in ('common', 'común', 'comum') and _common_is_either(sibling_displays):
+        return None
+    if value_lower in table:
+        return table[value_lower]
+    if feat_name == 'Person' and value_key in ('1', '2', '3'):
+        return {'Person': value_key}
+    allowed = _UD_VALUES.get(feat_name, set())
+    for candidate in (value_display.strip(), value_display.strip().capitalize()):
+        if candidate in allowed:
+            return {feat_name: candidate}
     return None
 
 
@@ -322,21 +335,24 @@ def xpos_to_upos_feats(xpos: str, tagset_def: Dict) -> Tuple[str, str]:
     # Get position definitions for this main category
     cat_pos_defs = position_defs.get(main_cat, {})
     
-    # Extract features from remaining positions
     for char_index, char in enumerate(remaining, start=1):
-        if char_index in cat_pos_defs:
-            pos_def = cat_pos_defs[char_index]
-            if char in pos_def:
-                char_info = pos_def[char]
-                ud_feat = char_info.get('ud_feat')
-                ud_value = char_info.get('ud_value')
-                # Only add if it's a valid UD feature with a value
-                if ud_feat and ud_value:
-                    feats_dict[ud_feat] = ud_value
+        char_info = cat_pos_defs.get(char_index, {}).get(char)
+        if not char_info:
+            continue
+        if char_info.get('upos'):
+            upos = char_info['upos']
+        for feat, value in (char_info.get('ud_feats') or {}).items():
+            if feats_dict.get(feat) == 'Cnd':
+                continue  # the conditional (EAGLES: a tense) wins over the mood position's indicative
+            feats_dict[feat] = value
+    if feats_dict.get('Mood') in _FINITE_MOODS and 'VerbForm' not in feats_dict:
+        feats_dict['VerbForm'] = 'Fin'
+    if 'VerbForm' in feats_dict and feats_dict['VerbForm'] != 'Fin':
+        feats_dict.pop('Mood', None)
     
-    # Convert feats_dict to UD format string
+    # Convert feats_dict to UD format string (features in UD's order: alphabetical, case-insensitive)
     if feats_dict:
-        feats = '|'.join(f"{k}={v}" for k, v in sorted(feats_dict.items()))
+        feats = '|'.join(f"{k}={v}" for k, v in sorted(feats_dict.items(), key=lambda kv: kv[0].lower()))
     else:
         feats = '_'
     

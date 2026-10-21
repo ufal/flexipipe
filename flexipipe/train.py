@@ -7,6 +7,7 @@ import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+import subprocess
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from .conllu import conllu_to_document, document_to_conllu
@@ -596,7 +597,9 @@ def _load_training_file(path: Path) -> Document:
 
 
 def _has_annotation(sentence: Sentence, annotation_type: str) -> bool:
-    """Check if a sentence has a specific type of annotation."""
+    """Check if a sentence has a specific type of annotation ("upos|xpos": either of them)."""
+    if "|" in annotation_type:
+        return any(_has_annotation(sentence, alt) for alt in annotation_type.split("|"))
     for token in sentence.tokens:
         # Check token-level annotations
         if annotation_type == "lemma" and token.lemma and token.lemma != "_":
@@ -705,14 +708,19 @@ def _collect_teitok_sentences(
         List of sentences that have the required annotations
     """
     teitok_files = []
+    seen = set()
     for ext in ("*.xml", "*.tei", "*.teitok"):
+        # recursive (rglob includes the top level); each file once — reading a file twice put every
+        # sentence into the data twice, and its copies into different splits (train / test leakage)
         try:
-            # Try both non-recursive and recursive search
-            teitok_files.extend(teitok_dir.glob(ext))
-            teitok_files.extend(teitok_dir.rglob(ext))
-        except (PermissionError, OSError) as e:
-            # If we can't access subdirectories, continue with what we found
-            pass
+            found = list(teitok_dir.rglob(ext))
+        except (PermissionError, OSError):
+            found = list(teitok_dir.glob(ext))  # subfolders not readable: the top level
+        for f in found:
+            key = f.resolve()
+            if key not in seen:
+                seen.add(key)
+                teitok_files.append(f)
     
     if not teitok_files:
         raise FileNotFoundError(
@@ -921,6 +929,7 @@ def _prepare_teitok_corpus(
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
     trslit_attr: Optional[str] = None,
+    pron_attr: Optional[str] = None,
     segmentation_policy: Optional[SegmentationPolicy] = None,
     language: Optional[str] = None,
     export_document_splits: bool = False,
@@ -1071,7 +1080,7 @@ def _prepare_teitok_corpus(
                     split_doc = Document(id=f"{split_name}_split")
                     split_doc.sentences = split_sents
                     output_file = output_dir / f"{split_name}.conllu"
-                    conllu_text = document_to_conllu(split_doc, create_implicit_mwt=False)
+                    conllu_text = document_to_conllu(split_doc, create_implicit_mwt=False, custom_misc_attrs=({pron_attr: "Pron"} if pron_attr else None))
                     output_file.write_text(conllu_text, encoding="utf-8")
                     result[split_name] = output_file
                     
@@ -1195,7 +1204,7 @@ def _prepare_teitok_corpus(
         # Write to CoNLL-U (flexitag document mode keeps heuristic train.conllu untouched)
         stem = _split_conllu_stem(split_name, document_split_files)
         output_file = output_dir / f"{stem}.conllu"
-        conllu_text = document_to_conllu(split_doc, create_implicit_mwt=False)
+        conllu_text = document_to_conllu(split_doc, create_implicit_mwt=False, custom_misc_attrs=({pron_attr: "Pron"} if pron_attr else None))
         output_file.write_text(conllu_text, encoding="utf-8")
         result[split_name] = output_file
         if document_split_files:
@@ -1238,7 +1247,7 @@ def _prepare_teitok_corpus(
             split_doc = Document(id=f"{split_name}_document_split")
             split_doc.sentences = split_sents
             doc_file = output_dir / f"{split_name}.document.conllu"
-            doc_file.write_text(document_to_conllu(split_doc, create_implicit_mwt=False), encoding="utf-8")
+            doc_file.write_text(document_to_conllu(split_doc, create_implicit_mwt=False, custom_misc_attrs=({pron_attr: "Pron"} if pron_attr else None)), encoding="utf-8")
             result[f"{split_name}.document"] = doc_file
             if verbose:
                 print(f"[flexipipe] Wrote document-level {split_name} to {doc_file}")
@@ -1658,6 +1667,92 @@ def _build_model_payload(
     return payload
 
 
+def _pron_rows(path: Path, pron_attr: str):
+    """Tokens (form, lemma, upos, xpos, feats, pron) from a CoNLL-U split: MISC Pron= (from the TEITOK attribute),
+    or Normalization= when the pronunciation was put in reg (--pron reg)."""
+    from .g2p_light import next_context
+
+    key = "Normalization" if pron_attr == "reg" else "Pron"
+
+    def rows(sentence):  # each with the next token's context (g2p_light: context="next")
+        for i, c in enumerate(sentence):
+            for part in (c[9].split("|") if c[9] != "_" else []):
+                if part.startswith(key + "="):
+                    following = next_context(sentence[i + 1][1] if i + 1 < len(sentence) else None)
+                    yield {"form": c[1], "lemma": c[2], "upos": c[3], "xpos": c[4], "feats": c[5],
+                           "pron": part[len(key) + 1:], "next": following}
+                    break
+
+    sentence: list = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                yield from rows(sentence)
+                sentence = []
+                continue
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 10 or "-" in c[0] or "." in c[0]:
+                continue
+            sentence.append(c)
+    yield from rows(sentence)
+
+
+def _train_pronunciation(splits: Dict[str, Any], output_dir: Path, pron_attr: str, *, include_dev: bool = False, verbose: bool = False, feats: Optional[List[str]] = None, g2p: str = "light", context: Optional[str] = None, language: Optional[str] = None) -> Optional[Path]:
+    """flexitag's pronunciation attribute (model_pron.json next to model_vocab.json): (form, tag) ->
+    pronunciation from the training data, a light G2P for other forms (g2p_light)."""
+    from itertools import chain
+    from .g2p_light import PronunciationModel
+
+    files = [splits.get("train")] + ([splits.get("dev")] if include_dev else [])
+    files = [Path(f) for f in files if f and Path(f).exists()]
+    if not files:
+        return None
+    rows = list(chain.from_iterable(_pron_rows(f, pron_attr) for f in files))
+    if not rows:
+        print(f"[flexipipe] --pron {pron_attr}: no pronunciations in the training data; no pronunciation model")
+        return None
+    meta = {"attribute": pron_attr, "tokens": len(rows), "feats": feats or []}
+    if context == "next":
+        meta["context"] = "next"
+    if language:  # flexipipe offers the model for documents in this language (task_routing.default_pron_models)
+        meta["language"] = language
+    model = PronunciationModel.train(rows, meta=meta)
+    # held-out scores (the gold tags of the test split, else dev): all, known and unknown forms
+    held_out = next((Path(splits[k]) for k in ("test", "dev") if splits.get(k) and Path(splits[k]).exists()), None)
+    if held_out is not None:
+        counts = {"all": [0, 0], "known": [0, 0], "unknown": [0, 0]}
+        for r in _pron_rows(held_out, pron_attr):
+            guess = model.predict(r["form"], r["xpos"], r["lemma"], r["upos"], r["feats"], r["next"])[0]
+            for k in ("all", "known" if r["form"].lower() in model.by_form else "unknown"):
+                counts[k][0] += 1
+                counts[k][1] += guess == r["pron"]
+        if counts["all"][0]:
+            model.meta["scores"] = {k: round(ok / n, 4) for k, (n, ok) in counts.items() if n}
+            model.meta["scores"]["tokens"] = counts["all"][0]
+            model.meta["scores"]["set"] = "test" if held_out == Path(splits.get("test") or "") else "dev"
+    path = output_dir / "model_pron.json"
+    model.save(path)
+    if g2p == "phonetisaurus":  # a Phonetisaurus model for unknown forms, from the same pairs
+        from .pron_backends import train_phonetisaurus
+
+        try:
+            fst = train_phonetisaurus(model.levels.get("form", {}).items(), output_dir / "model_pron.fst")
+            print(f"[flexipipe] Phonetisaurus model for unknown forms: {fst}")
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            print(f"[flexipipe] no Phonetisaurus model ({exc}); unknown forms use the light G2P")
+    levels = ", ".join(f"{n} {lv}" for lv, n in model.meta.get("levels", {}).items())
+    ctx = sum(model.meta.get("context_entries", {}).values())
+    sc = model.meta.get("scores") or {}
+    print(f"[flexipipe] pronunciation model: {levels}; {len(model.g2p.table)} G2P contexts"
+          + (f"; {ctx} answers that depend on the next word" if model.uses_context else "") + f" ({path})")
+    if sc:
+        print(f"[flexipipe] pronunciation on the {sc['set']} set ({sc['tokens']} tokens, gold tags): "
+              + ", ".join(f"{k} {100 * sc[k]:.1f}%" for k in ("all", "known", "unknown") if k in sc))
+    return path
+
+
 def train_ud_treebank(
     ud_root: Path,
     output_dir: Path,
@@ -1675,6 +1770,10 @@ def train_ud_treebank(
     expan_attr: Optional[str] = None,
     lemma_attr: Optional[str] = None,
     trslit_attr: Optional[str] = None,
+    pron_attr: Optional[str] = None,
+    pron_feats: Optional[List[str]] = None,
+    pron_g2p: str = "light",
+    pron_context: Optional[str] = None,
     segmentation_policy: Optional[SegmentationPolicy] = None,
     export_document_splits: bool = False,
     document_segmentation_policy: Optional[SegmentationPolicy] = None,
@@ -1692,6 +1791,11 @@ def train_ud_treebank(
 
     auto_select = tag_attribute_input in (None, "auto")
     candidate_tag_attributes = ["xpos", "upos", "utot"] if auto_select else [tag_attribute_input]
+    from .progress import Steps
+
+    # the stages, for a job page following the log (progress.py)
+    steps = Steps(5 + (finetune.lower() != "none") + bool(pron_attr))
+    steps.next("preparing the training data")
 
     ud_root = ud_root.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -1748,6 +1852,7 @@ def train_ud_treebank(
                 expan_attr=expan_attr,
                 lemma_attr=lemma_attr,
                 trslit_attr=trslit_attr,
+                pron_attr=pron_attr,
                 segmentation_policy=segmentation_policy,
                 language=language_code,
                 export_document_splits=export_document_splits,
@@ -1834,6 +1939,7 @@ def train_ud_treebank(
         else:
             print(f"[flexipipe] WARNING: no dev set found, cannot evaluate tag attributes. Using first candidate: {candidate_tag_attributes[0]}")
     
+    steps.next("building the vocabulary and testing the tag attribute" + ("s" if len(candidate_tag_attributes) > 1 else ""))
     for idx, attr in enumerate(candidate_tag_attributes, 1):
         if auto_select and len(candidate_tag_attributes) > 1:
             print(f"[flexipipe] testing {attr} ({idx}/{len(candidate_tag_attributes)})...", end=" ", flush=True)
@@ -1972,7 +2078,9 @@ def train_ud_treebank(
             "error": error,
         })
     
-    if auto_select and len(candidate_tag_attributes) > 1:
+    # no dev set (nothing evaluated, nothing failed): the first candidate, as said above — not an abort
+    no_dev = all(r["baseline"] is None and not r["error"] for r in candidate_results)
+    if auto_select and len(candidate_tag_attributes) > 1 and not no_dev:
         def _score_preview(result: Dict[str, Any]) -> float:
             baseline_result = result["baseline"]
             if not baseline_result:
@@ -2013,12 +2121,18 @@ def train_ud_treebank(
                     score += 0.005  # Small bias to prefer utot
         return score
 
-    best_result = max(candidate_results, key=_score)
-    if best_result["baseline"] is None:
-        raise RuntimeError("All tag attribute candidates failed to produce evaluation metrics; aborting training.")
+    best_result = candidate_results[0] if no_dev else max(candidate_results, key=_score)
+    if no_dev:
+        print(f"[flexipipe] no dev set: using {best_result['tag_attribute']} (give a dev set to choose the best one)")
+    elif best_result["baseline"] is None:
+        why = "; ".join(f"{r['tag_attribute']}: {r['error']}" for r in candidate_results if r.get("error"))
+        raise RuntimeError("All tag attribute candidates failed to produce evaluation metrics; aborting training."
+                           + (f" ({why})" if why else ""))
     tag_attribute = best_result["tag_attribute"]
     payload: Dict[str, Any] = best_result["payload"]
     metadata = payload["metadata"]
+    if nlpform and nlpform != "form":  # trained on the normalized forms: a run must tag those too (model_card.nlpform)
+        metadata["nlpform"] = nlpform
     if language_code:
         metadata["language"] = language_code
     default_settings = payload["settings"]
@@ -2061,6 +2175,7 @@ def train_ud_treebank(
     # NOTE: The vocabulary JSON doesn't store endings - they are computed when the lexicon loads.
     # The endlen setting affects how endings are indexed (prefixes vs suffixes), so we can
     # use the same vocabulary JSON and just pass different endlen values in the options.
+    steps.next("choosing how word endings are used for unknown words")
     endlen_candidates = [0, 3, -3]  # 0 = disabled, 3 = suffixes, -3 = prefixes
     best_endlen = default_settings.get("endlen", 6)  # Default fallback
     endlen_selection_entries: List[Dict[str, Any]] = []
@@ -2168,8 +2283,10 @@ def train_ud_treebank(
                     "[flexipipe] skipping fine-tuning because baseline evaluation was unavailable for the selected tag attribute"
                 )
             finetune_mode = "none"
+            steps.total -= 1  # no fine-tuning step after all
 
     if finetune_mode != "none":
+        steps.next(f"fine-tuning ({finetune_mode})")
         if verbose:
             print(
                 f"[flexipipe] fine-tuning on {evaluation_set_name} set ({len(evaluation_doc.sentences)} sentences)"
@@ -2203,8 +2320,10 @@ def train_ud_treebank(
             "speed": summary["best"]["speed"],
         }
         tuning_summary = summary
+        steps.next("writing the model")
         _write_model(output_path, payload)
     else:
+        steps.next("writing the model")
         _write_model(output_path, payload)
 
     if verbose:
@@ -2271,5 +2390,29 @@ def train_ud_treebank(
         except Exception:
             pass
 
+    if pron_attr:
+        steps.next("the pronunciation model")
+        _train_pronunciation(splits, output_dir, pron_attr, include_dev=include_dev, verbose=verbose, feats=pron_feats, g2p=pron_g2p, context=pron_context, language=language_code)
+    # the model on the held-out documents, as any later use runs it; flexipipe-model.json (train_report)
+    steps.next("measuring the model on the held-out documents")
+    _report_trained_model("flexitag", output_path, output_dir, splits, ud_root, language_code,
+                          {"tag_attribute": tag_attribute, "pron": pron_attr, "pron_context": pron_context,
+                           "nlpform": nlpform if nlpform != "form" else None})
     return output_path
+
+
+def _report_trained_model(backend: str, model_path, output_dir: Path, splits: Dict[str, Any], train_data,
+                          language: Optional[str], options: dict) -> dict:
+    """Score a new model on the test split (else dev) and write flexipipe-model.json next to it."""
+    from .train_report import evaluate_trained, write_manifest
+
+    held_out = next((k for k in ("test", "dev") if splits.get(k) and Path(splits[k]).exists()), None)
+    scores = evaluate_trained(backend, str(model_path), Path(splits[held_out]), language=language) if held_out else {}
+    if scores:
+        shown = ", ".join(f"{k} {100 * v:.1f}%" for k, v in scores.items() if k in ("upos", "xpos", "feats", "lemma", "las"))
+        print(f"[flexipipe] the new model on the {held_out} set ({scores.get('sentences', 0)} sentences): {shown}", flush=True)
+    write_manifest(output_dir, backend, str(model_path), train_data=str(train_data), language=language,
+                   scores=scores, options={k: v for k, v in options.items() if v}, held_out=held_out,
+                   train_split=Path(splits["train"]) if splits.get("train") else None)
+    return scores
 

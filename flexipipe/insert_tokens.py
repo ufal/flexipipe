@@ -243,6 +243,8 @@ def insert_tokens_into_teitok(
                     return getattr(settings, "resolve_xml_attribute", lambda a, **kw: a)(internal, default=internal) or internal
                 return internal
             def _set_attr_teitok(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
+                if internal_attr in set(getattr(settings, "excluded_layers", None) or ()):
+                    return  # left out by the user
                 target = _resolve_attr(internal_attr)
                 if value and value != "_":
                     node.set(target, value)
@@ -264,6 +266,7 @@ def insert_tokens_into_teitok(
                 _set_attr_teitok(tok_elem, "xpos", token.xpos or "")
                 _set_attr_teitok(tok_elem, "upos", token.upos or "")
                 _set_attr_teitok(tok_elem, "feats", token.feats or "")
+                _set_attr_teitok(tok_elem, "pron", (token.attrs or {}).get("pron", ""))  # task pron
                 if token.id:
                     _set_attr_teitok(tok_elem, "ord", str(token.id))
                 head_ord = token.head
@@ -300,18 +303,23 @@ def insert_tokens_into_teitok(
             tasks.add("tag")
         if any(t.head for s in document.sentences for t in s.tokens):
             tasks.add("parse")
+        if any((t.attrs or {}).get("pron") for s in document.sentences for t in s.tokens):
+            tasks.add("pron")
         if getattr(document, "spans", None) and document.spans.get("ner"):
             tasks.add("ner")
         elif any(getattr(s, "entities", None) for s in document.sentences):
             tasks.add("ner")
+        from .task_routing import routed_note, routed_tasks
+
+        tasks = set(tasks) | routed_tasks(document)  # steps another backend did (task_routing)
         tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
-        change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+        change_text = f"Tagged via {change_source} (tasks={tasks_summary_str}){routed_note(document)}"
         _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
         tree = ET.ElementTree(root)
-        if HAS_LXML:
-            tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True, pretty_print=False)
-        else:
-            tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
+        from .xml_safe_write import write_xml_tree
+
+        write_xml_tree(output_path_obj, tree, original=original_path_obj,
+                       expect_tokens=bool(backend_tokens))  # parsed, text kept, tokens there, atomic
         return
 
     # Parse original XML
@@ -748,6 +756,8 @@ def insert_tokens_into_teitok(
         tasks.add("tag")
     if any(t.head for s in document.sentences for t in s.tokens):
         tasks.add("parse")
+    if any((t.attrs or {}).get("pron") for s in document.sentences for t in s.tokens):
+        tasks.add("pron")
     # NER is stored in sentence.entities, not on tokens
     if getattr(document, "spans", None) and document.spans.get("ner"):
         tasks.add("ner")
@@ -757,19 +767,22 @@ def insert_tokens_into_teitok(
     if any(t.reg or t.expan or t.mod or t.trslit or t.ltrslit or t.corr or t.lex or (t.misc and t.misc != "_") for s in document.sentences for t in s.tokens):
         tasks.add("normalize")
     
+    from .task_routing import routed_note, routed_tasks
+
+    tasks = set(tasks) | routed_tasks(document)  # steps another backend did (task_routing)
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
-    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str}){routed_note(document)}"
     
     from .teitok_name_wrap import apply_name_wrappers_to_tree
     apply_name_wrappers_to_tree(root, document)
 
     _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
     
-    # Write updated XML (without pretty-printing)
-    if HAS_LXML:
-        tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True, pretty_print=False)
-    else:
-        tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
+    # Write updated XML (without pretty-printing): parsed first, written atomically
+    from .xml_safe_write import write_xml_tree
+
+    write_xml_tree(output_path_obj, tree, original=original_path_obj,
+                   expect_tokens=any(s.tokens for s in document.sentences))
 
 
 def _local_name(name: str) -> str:
@@ -1955,6 +1968,8 @@ def rebuild_xml_with_tokens(
     
     def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
         """Set attribute respecting TEITOK mappings."""
+        if internal_attr in set(getattr(settings, "excluded_layers", None) or ()):
+            return  # left out by the user
         target_attr = _resolve_attr_name(internal_attr)
         aliases = _attribute_aliases(internal_attr)
         
@@ -2477,6 +2492,7 @@ def rebuild_xml_with_tokens(
                             _set_attr(tok_elem, "xpos", token.xpos or "")
                             _set_attr(tok_elem, "upos", token.upos or "")
                             _set_attr(tok_elem, "feats", token.feats or "")
+                            _set_attr(tok_elem, "pron", (token.attrs or {}).get("pron", ""))  # task pron
                             
                             # Set ord attribute
                             if token.id:

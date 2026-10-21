@@ -32,6 +32,10 @@ def _capitalize_backend_name(name: str) -> str:
     return capitalization_map.get(name.lower(), name.capitalize())
 
 
+# the steps in pipeline order (task_registry names), for listing what a backend does
+_STEP_ORDER = ["normalize", "tokenize", "segment", "tag", "xpos", "lemmatize", "parse", "ner", "pron"]
+
+
 def list_backends(args: argparse.Namespace) -> int:
     """List all available backends with their functionality status."""
     output_format = getattr(args, "output_format", "table")
@@ -40,9 +44,14 @@ def list_backends(args: argparse.Namespace) -> int:
     from .backend_registry import list_backends, get_backend_status
     backends = list_backends(include_hidden=False)
     
+    from .task_routing import CAPABILITIES, MODEL_DEPENDENT
+    from .train_report import TRAINABLE
+
     backends_data = []
     for name, info in sorted(backends.items()):
         status_info = get_backend_status(name)
+        # what it can do: its steps, and those only some of its models add (flexitag + a pronunciation model)
+        steps = sorted(CAPABILITIES.get(name, set()) | MODEL_DEPENDENT.get(name, set()), key=_STEP_ORDER.index)
         display_name = _capitalize_backend_name(name)
         backend_entry = {
             "backend": name,
@@ -53,6 +62,10 @@ def list_backends(args: argparse.Namespace) -> int:
             "status": status_info["status"],
             "missing": status_info["missing"],
             "install_hint": status_info["install_hint"],
+            # what it does (task_routing.CAPABILITIES): the steps it can do; some only with some models
+            "tasks": steps,
+            "tasks_depend_on_model": sorted(MODEL_DEPENDENT.get(name, set()), key=_STEP_ORDER.index),
+            "trainable": name in TRAINABLE,  # flexipipe train can make a model with it from a corpus
         }
         backends_data.append(backend_entry)
     
@@ -62,7 +75,7 @@ def list_backends(args: argparse.Namespace) -> int:
     
     # Table format - separate name, description, and URL
     print("Available backends:")
-    print(f"{'Backend':<20} {'Status':<15} {'Description':<45} {'URL':<40}")
+    print(f"{'Backend':<20} {'Status':<15} {'Steps':<45} {'Description':<45}")
     print("=" * 120)
     
     for backend_info in backends_data:
@@ -80,9 +93,12 @@ def list_backends(args: argparse.Namespace) -> int:
         if len(url) > 40:
             url = url[:37] + "..."
         
+        steps = ",".join(t + ("*" if t in backend_info["tasks_depend_on_model"] else "") for t in backend_info["tasks"]) or "-"
+        if backend_info["trainable"]:
+            steps += " (trainable)"
         # Use properly capitalized name for display
         display_name = backend_info["name"]
-        print(f"{display_name:<20} {status_str:<15} {desc:<45} {url:<40}")
+        print(f"{display_name:<20} {status_str:<15} {steps:<45} {desc:<45}")
     
     # Show missing dependencies summary
     missing_backends = [b for b in backends_data if not b["available"]]
@@ -1564,6 +1580,12 @@ def run_info_cli(args: argparse.Namespace) -> int:
         return list_renderers(args)
     elif args.info_action == "teitok":
         return list_teitok_settings(args)
+    elif args.info_action == "document":
+        return show_document_status(args)
+    elif args.info_action == "corpus-models":
+        return show_corpus_models(args)
+    elif args.info_action == "training":
+        return show_training_options(args)
     elif args.info_action == "sessions":
         return list_sessions(args)
     elif args.info_action == "installation":
@@ -1571,3 +1593,114 @@ def run_info_cli(args: argparse.Namespace) -> int:
     else:
         print(f"Error: Unknown info action '{args.info_action}'")
         return 1
+
+
+def show_training_options(args) -> int:
+    """`flexipipe info training --corpus DIR` (corpus_training.py)."""
+    import json
+    from pathlib import Path
+
+    from .corpus_training import training_options
+    from .teitok_settings import TeitokSettings
+
+    root = Path(getattr(args, "corpus", None) or ".").resolve()
+    settings = None
+    if (root / "Resources" / "settings.xml").exists():
+        try:
+            settings = TeitokSettings.load(root / "Resources" / "settings.xml")
+        except Exception:
+            settings = None
+    opts = training_options(root, settings)
+    if getattr(args, "output_format", "table") == "json":
+        print(json.dumps(opts, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{root.name}: {opts['tokens']} tokens in {opts['documents']} documents (a sample)")
+    for a, f in opts["found"].items():
+        print(f"  {f['label']:24} @{f['attribute']}: {f['tokens']} tokens")
+    for b in opts["backends"]:
+        state = "can train" if b["can"] else ("not installed" if not b["available"] else "lacks " + ", ".join(b["lacks"] or b["needs"]))
+        print(f"  {b['backend']:12} {state}" + (f" — learns {', '.join(b['learns'])}" if b["can"] else ""))
+    return 0
+
+
+def show_corpus_models(args) -> int:
+    """`flexipipe info corpus-models --corpus DIR`: the models trained on a TEITOK corpus (corpus_models.py)."""
+    import json
+    from pathlib import Path
+
+    from .corpus_models import list_models
+    from .teitok_settings import TeitokSettings
+
+    root = Path(getattr(args, "corpus", None) or ".").resolve()
+    use = None
+    settings_file = root / "Resources" / "settings.xml"
+    if settings_file.exists():
+        try:
+            use = (TeitokSettings.load(settings_file).training or {}).get("use")
+        except Exception:
+            use = None
+    models = list_models(root, use)
+    if getattr(args, "output_format", "table") == "json":
+        print(json.dumps({"corpus": str(root), "models": models}, ensure_ascii=False, indent=2))
+        return 0
+    if not models:
+        print(f"No models trained on {root.name} (Resources/flexipipe-models/).")
+        return 0
+    for m in models:
+        print(f"{'*' if m['in_use'] else ' '} {m['folder']}: {m['about']}")
+        sc = m.get("scores") or {}
+        ps = (m.get("pron") or {}).get("scores") or {}
+        bits = [f"tags {100 * sc['tags']:.1f}%"] if sc.get("tags") is not None else []
+        bits += [f"lemmas {100 * sc['lemmas']:.1f}%"] if sc.get("lemmas") is not None else []
+        bits += [f"pronunciation {100 * ps['all']:.1f}% (new words {100 * ps.get('unknown', 0):.1f}%)"] if ps.get("all") is not None else []
+        if bits:
+            print("    " + ", ".join(bits))
+    return 0
+
+
+def show_document_status(args) -> int:
+    """`flexipipe info document --input FILE`: teitok_status.document_status, as JSON or a table."""
+    import json
+    from .teitok_status import document_status
+
+    try:
+        st = document_status(
+            args.input, getattr(args, "tasks", None), getattr(args, "backend", None), getattr(args, "model", None),
+            getattr(args, "keep", None), getattr(args, "language", None), getattr(args, "sentence_layout", None),
+            getattr(args, "task_backend", None),
+        )
+    except (OSError, ValueError) as exc:
+        if getattr(args, "output_format", "table") == "json":
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"Error: {exc}")
+        return 1
+    if getattr(args, "output_format", "table") == "json":
+        print(json.dumps(st, ensure_ascii=False, indent=2))
+        return 0
+    run = st["run"]
+    print(f"{st['file']}: {st['tokens']} tokens, {st['sentences']} sentences, {st['entities']} named entities")
+    for name, a in st["attributes"].items():
+        print(f"  {name:8} @{a['attribute']}: {a['tokens']} tokens")
+    print(f"run: language {run['language'] or '(detected)'} ({run['language_source'] or 'none set'}), "
+          f"{run['backend'] or '?'} / {run['model'] or '?'} ({run['model_source'] or 'none found'}), tasks {','.join(run['tasks'])}")
+    for step in run.get("steps", []):
+        if step["backend"]:
+            if step["source"] not in ("main", "flexipipe"):
+                print(f"  {step['task']}: {step['backend']}{' / ' + step['model'] if step['model'] else ''} ({step['source']})")
+                if step.get("about"):
+                    print(f"      {step['about']}")
+        else:
+            can = ", ".join(step.get("can") or []) or "only a main backend that provides it"
+            print(f"  {step['task']}: no backend does this step — left out (possible: {can})")
+    for o in run["overwrites"]:
+        print(f"  would overwrite @{o['attribute']} on {o['tokens']} tokens ({o['task']})")
+    for o in run.get("kept", []):
+        print(f"  keeps the existing @{o['attribute']} on {o['tokens']} tokens")
+    if run.get("new_attributes"):
+        print("  would add the attributes " + ", ".join("@" + a["attribute"] for a in run["new_attributes"]))
+    for a in run["adds"]:
+        print(f"  would add {a}")
+    if not st["writable"]:
+        print("  the file cannot be written by this user")
+    return 0

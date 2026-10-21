@@ -213,6 +213,11 @@ def run_install(args: argparse.Namespace) -> int:
     # Special case: install wrapper script (flexipipe install wrapper [--path DIR])
     if len(args.backends) == 1 and args.backends[0].lower() == "wrapper":
         return _install_wrapper_script(args)
+    # A model from the registry (flexipipe install model <backend>/<model>[@v<N>] [--force])
+    if args.backends and args.backends[0].lower() == "model":
+        from .model_hub import run_install_models
+        return run_install_models(args.backends[1:], force=bool(getattr(args, "force", False)),
+                                  name=getattr(args, "model_name_as", None), backend=getattr(args, "model_backend", None))
     # Special case: upgrade flexipipe (flexipipe install update)
     if len(args.backends) == 1 and args.backends[0].lower() == "update":
         return _run_self_update(args)

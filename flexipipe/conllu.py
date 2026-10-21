@@ -695,8 +695,11 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 tokid=sub_tokid,
                 space_after=True,  # Default; SpaceAfter only matters on range in CoNLL-U
             )
-            # Store head, deprel, deps, misc in attrs dict for subtokens
-            # (SubToken doesn't have these as direct attributes)
+            # The word's syntax on the subtoken itself (what the CoNLL-U writer prints); also kept in attrs, which
+            # TEITOK write-back reads for dtoks
+            st.head = head or 0
+            st.deprel = deprel or ""
+            st.deps = deps or ""
             if st.attrs is None:
                 st.attrs = {}
             if head:
@@ -1337,6 +1340,14 @@ def _format_misc(
                 seen_keys.add("TokId")
                 entries.append(f"TokId={tokid}")
     
+    # pronunciation (flexitag's pron task): Pron=, and where it came from (vocab / g2p)
+    tok_attrs = getattr(token, "attrs", {}) or {}
+    if tok_attrs.get("pron") and "Pron" not in seen_keys and not (custom_misc_attrs and "pron" in custom_misc_attrs):
+        seen_keys.add("Pron")
+        entries.append(f"Pron={tok_attrs['pron']}")
+        if tok_attrs.get("pron_source"):
+            entries.append(f"PronSource={tok_attrs['pron_source']}")
+
     # Add custom attributes from attrs dictionary
     if custom_misc_attrs:
         attrs = getattr(token, "attrs", {})

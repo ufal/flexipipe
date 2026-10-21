@@ -13,6 +13,7 @@ TASK_CHOICES = (
     "install",
     "benchmark",
     "validate",
+    "publish",
 )
 
 

@@ -914,6 +914,9 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
         if language:
             result["language"] = language
             result["fuzzy_matching"] = used_fuzzy
+            # what `process --language X` without --backend/--model would use now (it changes as
+            # models are installed or the registry is updated): {"backend", "model"} or null
+            result["auto"] = _auto_choice_for_language(language)
         import sys
         print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
         return 0
@@ -1063,6 +1066,22 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
         pass
     
     return 0
+
+
+def _auto_choice_for_language(language: str) -> Optional[dict]:
+    """The backend/model `process` would pick for `language` with neither --backend nor --model
+    (_auto_select_model_for_language, without settings.xml preferences), or None."""
+    probe = argparse.Namespace(
+        language=language, model=None, backend=None, params=None,
+        _backend_explicit=False, verbose=False, debug=False, refresh_cache=False,
+    )
+    try:
+        backend = _auto_select_model_for_language(probe, None)
+    except Exception:
+        return None
+    if backend and getattr(probe, "model", None):
+        return {"backend": backend, "model": probe.model}
+    return None
 
 
 def _auto_select_model_for_language(
@@ -2509,6 +2528,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_udmorph_args(process_parser)
     add_nametag_args(process_parser)
     process_parser.add_argument(
+        "--task-backend",
+        action="append",
+        default=[],
+        metavar="TASK=BACKEND[:MODEL]",
+        help="A backend for a step the main backend does not provide (repeatable): e.g. ner=nametag, "
+        "pron=light:/models/ortofon, normalize=hunspell:cs_CZ. Default: the corpus's settings.xml <flexipipe><task>.",
+    )
+    process_parser.add_argument(
+        "--pron-backend",
+        choices=["light", "phonetisaurus"],
+        default=None,
+        help="Pronunciation (task pron) after the main backend, from --pron-model: the vocabulary by form "
+        "and tag, then light G2P or Phonetisaurus for unknown forms.",
+    )
+    process_parser.add_argument(
+        "--pron-model",
+        metavar="PATH",
+        help="A pronunciation model: a folder with model_pron.json (and model_pron.fst), e.g. a flexitag "
+        "model trained with --pron.",
+    )
+    process_parser.add_argument(
         "--ner-backend",
         choices=["nametag"],
         default=None,
@@ -2588,9 +2628,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--spaceafter-handling",
-        choices=["preserve", "join"],
-        default="preserve",
-        help="How to handle SpaceAfter=No tokens when pretty-printing: 'preserve' (default) removes spaces, 'join' adds join='right' attribute",
+        choices=["join", "c", "preserve"],
+        default="join",
+        help="With --pretty-print, how the spacing between tokens is kept (TEITOK's text is the XML's text): "
+        "'join' (default) marks tokens without a following space join='right'; 'c' also writes every "
+        "whitespace as <c>…</c>; 'preserve' is the same as 'join'. Without --pretty-print nothing is indented.",
     )
     process_parser.add_argument(
         "--skip-spaceafter-for-breaking-elements",
@@ -2680,9 +2722,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="When using writeback on XML that had no <s> elements: insert <s> elements using sentence boundaries from the backend (e.g. UDPipe). Only applies when the original file had tokens but no sentences.",
     )
     process_parser.add_argument(
+        "--sentence-layout",
+        metavar="PRESET",
+        choices=["written", "conversation", "subtitles", "subtitles-standoff"],
+        help="How inserted <s> relate to the document's elements: written (p hard, inline elements split), "
+        "conversation (u = speaker turn, hard; <s> split inside seg), subtitles (sentences run across u and seg; "
+        "<s> split inside them), subtitles-standoff (as token lists). Default: settings.xml "
+        "<flexipipe><segmentation>, else written.",
+    )
+    process_parser.add_argument(
+        "--keep",
+        metavar="ATTRS",
+        help="Writeback: never overwrite existing values of these attributes (comma list of lemma, upos, xpos, "
+        "feats, head, deprel, reg; or 'all'), e.g. hand-checked lemmas. Annotation of tasks that do not run is "
+        "always left as it is.",
+    )
+    process_parser.add_argument(
+        "--replace",
+        metavar="ATTRS",
+        help="Replace the existing values of these attributes (comma list as --keep): they are left out of "
+        "the input, so the backend assigns them anew (flexitag otherwise keeps existing lemmas and tags).",
+    )
+    process_parser.add_argument(
         "--nobackup",
         action="store_true",
-        help="When using --writeback in TEITOK mode, skip creating the once-per-day backup copy.",
+        help="No effect any more: a backup is always made before a file is overwritten (backups/<name>-YYYYMMDD.xml, then -YYYYMMDDTHHMMSS.xml).",
     )
     process_parser.add_argument(
         "--tokenize",
@@ -3076,6 +3140,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: table). Use 'json' for machine-readable output.",
     )
     
+    # info document
+    document_parser = info_subparsers.add_parser(
+        "document",
+        help="What a TEITOK document contains and what a run would do (language, model, tasks, what it would overwrite)",
+        parents=[parent_parser],
+    )
+    document_parser.add_argument("--input", required=True, help="The TEITOK XML file")
+    document_parser.add_argument("--tasks", help="Tasks of the planned run (default: the backend's defaults)")
+    document_parser.add_argument("--backend", help="Backend of the planned run (default: the corpus's, else flexipipe's choice)")
+    document_parser.add_argument("--model", help="Model of the planned run")
+    document_parser.add_argument("--keep", help="Attributes the run keeps (as process --keep)")
+    document_parser.add_argument("--language", help="Language of the planned run (default: the document's, else the corpus's)")
+    document_parser.add_argument("--sentence-layout", help="Sentence layout preset of the planned run (default: the corpus's)")
+    document_parser.add_argument("--task-backend", action="append", metavar="TASK=BACKEND[:MODEL]", help="Backend (and model) for a step of the planned run the main backend does not do (repeatable)")
+    document_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
+    # info training
+    training_parser = info_subparsers.add_parser(
+        "training",
+        help="What can be trained on a TEITOK corpus: its annotations, and per backend what it would learn or lacks",
+        parents=[parent_parser],
+    )
+    training_parser.add_argument("--corpus", default=".", help="The TEITOK project folder (default: the current folder)")
+    training_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
+    # info corpus-models
+    corpus_models_parser = info_subparsers.add_parser(
+        "corpus-models",
+        help="Models trained on a TEITOK corpus (Resources/flexipipe-models/): when, on what, scores, which is in use",
+        parents=[parent_parser],
+    )
+    corpus_models_parser.add_argument("--corpus", default=".", help="The TEITOK project folder (default: the current folder)")
+    corpus_models_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
     # info teitok
     teitok_parser = info_subparsers.add_parser(
         "teitok",
@@ -3155,6 +3253,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--set-model-registry-base-url",
         type=str,
         help="Set the base URL for remote model registries (e.g., https://raw.githubusercontent.com/org/repo/main/registries)",
+    )
+    config_parser.add_argument(
+        "--set-model-hub-url",
+        type=str,
+        metavar="URL",
+        help="Set the address of flexipipe-hub, for models the registry gives as hub:<backend>/<model> (default: hub.json in the registry repository)",
     )
     config_parser.add_argument(
         "--set-model-registry-url",
@@ -3283,6 +3387,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="For 'flexipipe install wrapper': install the script into DIR (or DIR/flexipipe). Without this, you are prompted.",
     )
+    install_parser.add_argument("--name", dest="model_name_as", metavar="NAME",
+                        help="For 'flexipipe install model FILE': the name to install the package's model under")
+    install_parser.add_argument("--backend", dest="model_backend", metavar="BACKEND",
+                        help="For 'flexipipe install model FILE': the backend, when the package does not say")
+    install_parser.add_argument("--force", action="store_true",
+                                help="For 'flexipipe install model': replace a model that is already installed")
     
     # train ---------------------------------------------------------------
     train_parser = subparsers.add_parser("train", help="Train a model from training data", parents=[parent_parser])
@@ -3448,6 +3558,34 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--trslit",
         help="Attribute name(s) to use for transliteration in TEITOK files (comma-separated, e.g., 'roman'). Exported as Translit= in CoNLL-U.",
+    )
+    train_parser.add_argument(
+        "--pron",
+        metavar="ATTR",
+        help="flexitag: the TEITOK attribute holding a pronunciation (e.g. ORTOFON's 'phon'): learned per form and "
+        "tag, with a light G2P for unknown forms (model_pron.json). 'reg': the pronunciation is in the reg / "
+        "Normalization field of existing CoNLL-U splits.",
+    )
+    train_parser.add_argument(
+        "--pron-g2p",
+        choices=["light", "phonetisaurus"],
+        default="light",
+        help="With --pron: the G2P for forms not in the vocabulary — light (built in) or phonetisaurus "
+        "(also trains model_pron.fst; needs Phonetisaurus and MITLM's estimate-ngram).",
+    )
+    train_parser.add_argument(
+        "--pron-context",
+        choices=["none", "next"],
+        default="none",
+        help="With --pron: 'next' — the pronunciation may depend on the next word (its first letter): "
+        "assimilation across word boundaries in a narrow / realised transcription (tak → tag before a voiced "
+        "sound). Leave it off (none) for broad transcriptions.",
+    )
+    train_parser.add_argument(
+        "--pron-feats",
+        metavar="FEATS",
+        help="With --pron: the morphological features that tell pronunciations apart (comma list, e.g. "
+        "'Case,Number'; default: all feats). Used at the form + upos + feats level.",
     )
     _add_corpus_config_args(train_parser)
     train_parser.add_argument(
@@ -3895,6 +4033,15 @@ def _load_and_merge_teitok_settings(
             if args.verbose or args.debug:
                 print(f"[flexipipe] --teitok flag used but settings.xml not found at {settings_path}", file=sys.stderr)
     
+    # write back under the names the corpus uses (@nform for reg, @tag for xpos …): teitok_names.py
+    if settings is not None and input_path and str(input_path) != "-":
+        from .corpus_models import corpus_root as _corpus_root
+        from .teitok_names import adopt_corpus_names
+
+        _adopted = adopt_corpus_names(settings, Path(str(input_path)), _corpus_root(settings.settings_path) if settings.settings_path else None)
+        if _adopted and (args.verbose or args.debug):
+            print("[flexipipe] the corpus's names: " + ", ".join(f"{k} as @{v}" for k, v in _adopted.items()), file=sys.stderr)
+
     # Parse CLI attribute mappings
     cli_attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
     
@@ -3915,7 +4062,10 @@ def _load_and_merge_teitok_settings(
         # CLI overrides settings
         if attr_name in cli_attrs_map:
             merged_mappings[attr_name] = cli_attrs_map[attr_name]
-    
+    # ... also in the settings object itself: the writeback (update_teitok) names attributes from it
+    if settings and cli_attrs_map:
+        settings.apply_cli_mappings(cli_attrs_map)
+
     return settings, merged_mappings
 
 
@@ -4430,6 +4580,17 @@ def run_tag(args: argparse.Namespace) -> int:
         application_profile = load_application_profile(Path(application_path))
         apply_application_profile_defaults(args, application_profile)
 
+    from .task_routing import routes_from_args
+
+    try:
+        args._task_routes = routes_from_args(args)
+    except ValueError as exc:
+        print(f"[flexipipe] Error: {exc}", file=sys.stderr)
+        return 1
+    if "normalize" in args._task_routes and not getattr(args, "normalizer", None):
+        _nb, _nm = args._task_routes["normalize"]
+        args.normalizer = _nb + (f":{_nm}" if _nm else "")
+
     manifest_path = getattr(args, "manifest", None)
     if manifest_path:
         from .profile_config import load_model_manifest, apply_model_manifest_defaults
@@ -4442,6 +4603,8 @@ def run_tag(args: argparse.Namespace) -> int:
     backend_type = args.backend
     if backend_type:
         setattr(args, "_backend_explicit", True)
+    # a model given (command line, manifest, profile) — not one auto-selection picks later
+    setattr(args, "_model_given", bool(getattr(args, "model", None)))
     if not backend_type and getattr(args, "model", None):
         if _looks_like_transformers_model(args.model):
             args.backend = "transformers"
@@ -4709,6 +4872,23 @@ def run_tag(args: argparse.Namespace) -> int:
                             print(f"[flexipipe] Using language from input CoNLL-U: {lang_from_input}", file=sys.stderr)
                         break
     
+    # A TEITOK file without --language: its language (teiHeader, else settings.xml) is needed here
+    # already, for choosing the model — it is otherwise only read later, after this check
+    if (
+        not getattr(args, "language", None)
+        and (getattr(args, "teitok", False) or (getattr(args, "input_format", None) or "").lower() == "teitok")
+        and args.input
+        and str(args.input).lower().endswith(".xml")
+        and Path(args.input).is_file()
+    ):
+        from .teitok_status import document_language
+
+        early_lang = document_language(args.input)
+        if early_lang:
+            args.language = early_lang
+            if args.verbose or args.debug:
+                print(f"[flexipipe] Using language {early_lang} (TEITOK document / settings.xml)", file=sys.stderr)
+
     # If no model was selected for a locked/explicit backend, try auto-selection once
     # But skip if backend was explicitly set - let the backend factory handle model selection from language
     model_name = getattr(args, "model", None)
@@ -5081,6 +5261,8 @@ def run_tag(args: argparse.Namespace) -> int:
                         # Note: For stdin, settings won't be available, but that's OK
                         if not read_from_stdin:
                             teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                            # the writeback names attributes from this map: now with the corpus's names (@tag for xpos …)
+                            doc.meta["_teitok_attr_map"] = dict(merged_attrs_map)
                             if teitok_settings:
                                 if not teitok_settings_obj:
                                     teitok_settings_obj = teitok_settings
@@ -5266,6 +5448,8 @@ def run_tag(args: argparse.Namespace) -> int:
                 
                     # Load TEITOK settings even when file has no tokens (needed for writeback and language)
                     teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
+                    # the writeback names attributes from this map: now with the corpus's names (@tag for xpos …)
+                    doc.meta["_teitok_attr_map"] = dict(merged_attrs_map)
                     if teitok_settings:
                         if not teitok_settings_obj:
                             teitok_settings_obj = teitok_settings
@@ -5414,6 +5598,10 @@ def run_tag(args: argparse.Namespace) -> int:
                 pref_model = pref.get("model")
                 # Only apply settings.xml backend if not explicitly set via CLI
                 if pref_backend and not getattr(args, "_backend_explicit", False):
+                    if pref_backend != args.backend and not getattr(args, "_model_given", False):
+                        # backend and model are a pair: a model auto-selected for the default backend
+                        # (UDPipe's czech-cac…) is not a model of the corpus's backend
+                        args.model = None
                     args.backend = pref_backend
                     backend_type = pref_backend
                     setattr(args, "_backend_explicit", True)
@@ -5454,6 +5642,16 @@ def run_tag(args: argparse.Namespace) -> int:
             print(f"[flexipipe] Skipping auto-selection (backend explicitly set: {backend_explicit}, model set: {model_set}, settings.xml backend: {settings_xml_backend_set})", file=sys.stderr)
             if backend_type:
                 print(f"[flexipipe] Using backend: {backend_type}", file=sys.stderr)
+
+        # a model trained on the normalized forms tags those (unless --nlpform says otherwise)
+        if (getattr(args, "nlpform", "form") or "form") == "form" and getattr(args, "model", None):
+            from .model_card import model_nlpform
+
+            _trained_on = model_nlpform(args.model)
+            if _trained_on:
+                args.nlpform = _trained_on
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] the model was trained on the normalized forms: tagging those (--nlpform {_trained_on})", file=sys.stderr)
 
         # Apply normalization strategy for NLP components if requested
         if getattr(args, "nlpform", "form") != "form":
@@ -5862,6 +6060,14 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Apply normalization BEFORE backend processing (so backend uses corrected forms)
                 from .normalization import maybe_apply_normalization
                 normalizer_spec = getattr(args, "normalizer", None)
+                if not normalizer_spec and teitok_settings_obj and "normalize" in requested_tasks:
+                    _corpus_norm = (getattr(teitok_settings_obj, "task_backends", None) or {}).get("normalize")
+                    from .task_routing import backend_tasks as _backend_tasks
+
+                    if "reg" in (getattr(teitok_settings_obj, "excluded_layers", None) or ()):
+                        _corpus_norm = None  # the corpus leaves out normalized forms
+                    if _corpus_norm and "normalize" not in _backend_tasks(backend_type, getattr(args, "model", None)):
+                        normalizer_spec = _corpus_norm[0] + (f":{_corpus_norm[1]}" if _corpus_norm[1] else "")
                 normalizer_lang = getattr(args, "normalizer_language", None) or language
                 doc, normalization_applied = maybe_apply_normalization(
                     doc,
@@ -5918,13 +6124,6 @@ def run_tag(args: argparse.Namespace) -> int:
                         sent_count = len(neural_result.document.sentences)
                         tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
                         print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
-                    _run_secondary_ner_backend(
-                        neural_result.document,
-                        args,
-                        backend_type_lower,
-                        requested_tasks,
-                        verbose=bool(args.verbose or args.debug),
-                    )
                 except (
                     ValueError,
                     FileNotFoundError,
@@ -6172,7 +6371,68 @@ def run_tag(args: argparse.Namespace) -> int:
         if has_entities and "ner" not in requested_tasks:
             requested_tasks.add("ner")
 
+        # tokenizing was asked for, the input has text, and no token came back: a step failed quietly
+        # (e.g. the text extraction for TEITOK without xmltokenizer) — stop before anything is written
+        if "tokenize" in requested_tasks and not any(s.tokens for s in result.document.sentences):
+            _src = Path(str(args.input)) if args.input and str(args.input) != "-" else None
+            if _src is not None and _src.suffix.lower() == ".xml" and _src.is_file():
+                from .teitok_text_check import plain_text
+                from .teitok_writeback_xt import xmltokenizer_version
+
+                try:
+                    _has_text = bool(plain_text(_src.read_bytes()).strip())
+                except Exception:
+                    _has_text = False
+                if _has_text:
+                    print(f"[flexipipe] Error: the text of {_src.name} was not split into tokens (no token came back "
+                          f"from the tokenizer); nothing written. xmltokenizer: {xmltokenizer_version()}", file=sys.stderr)
+                    return 1
+
+        # who does which step (task_routing): steps the main backend does not provide go to the backend
+        # chosen for them (command line, else the corpus's settings); steps nobody provides are named
+        # and left out instead of coming out empty
+        from .task_routing import plan as _plan_tasks, run_secondary as _run_secondary_tasks
+
+        # layers the user leaves out (settings.xml <layers><item key exclude="yes">): the step that only
+        # produces one is not run (pron, normalize, lemmatize); the others are not written (below)
+        _excluded = set(getattr(teitok_settings_obj, "excluded_layers", None) or ()) if teitok_settings_obj else set()
+        for _layer, _task in (("pron", "pron"), ("reg", "normalize"), ("lemma", "lemmatize")):
+            if _layer in _excluded and _task in requested_tasks:
+                requested_tasks.discard(_task)
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] the step '{_task}' is left out (the corpus leaves out @{_layer})", file=sys.stderr)
+
+        _routes, _missing = _plan_tasks(
+            requested_tasks,
+            getattr(args, "backend", None),
+            getattr(args, "model", None),
+            getattr(args, "_task_routes", None) or {},
+            (getattr(teitok_settings_obj, "task_backends", None) or {}) if teitok_settings_obj else {},
+            language=getattr(args, "language", None),
+            corpus_model=_corpus_model_in_use(teitok_settings_obj),
+        )
+        for _task in _missing:
+            print(f"[flexipipe] no backend for the step '{_task}': {getattr(args, 'backend', None) or 'the main backend'} "
+                  f"does not do it; choose one with --task-backend {_task}=BACKEND[:MODEL] or in the corpus's settings "
+                  f"— the step is left out", file=sys.stderr)
+            requested_tasks.discard(_task)
+        try:
+            _done = _run_secondary_tasks(
+                result.document, _routes, getattr(args, "backend", None),
+                language=getattr(args, "language", None), verbose=bool(args.verbose or args.debug),
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            print(f"[flexipipe] Error: {exc}", file=sys.stderr)
+            return 1
+        _main = (getattr(args, "backend", None) or "").lower()
+        if _main and _main not in result.document.meta.setdefault("_backends_used", []):
+            result.document.meta["_backends_used"].append(_main)  # every branch: the <change> names the main backend
+        if _done:  # provenance per step, for the <change> entry (task_routing.routed_note)
+            result.document.meta.setdefault("_task_routes_used", []).extend(_done)
+
         _filter_document_by_tasks(result.document, requested_tasks)
+        if _excluded:  # nothing of a left-out layer reaches the writer
+            _clear_layers(result.document, _excluded)
 
         parsed_opts = getattr(args, "_parsed_options", None)
         if parsed_opts:
@@ -6435,52 +6695,8 @@ def run_tag(args: argparse.Namespace) -> int:
                     shutil.copy2(original_input_path, temp_name)
                     target_writeback_path = Path(temp_name)
                     temp_writeback_path = target_writeback_path
-                # Create backup before writeback (TEITOK-style once-a-day backup)
-                # Only create backup if we're in a TEITOK project (settings.xml exists)
-                from .teitok_backup import create_teitok_backup
-                from .teitok_settings import find_settings_xml
-            
-                backup_path = None
-                settings_path = find_settings_xml(original_input_path)
-                if args.test:
-                    if args.verbose or args.debug:
-                        print("[flexipipe] Skipping backup (--test dry-run)", file=sys.stderr)
-                elif getattr(args, "nobackup", False):
-                    if args.verbose or args.debug:
-                        print("[flexipipe] Skipping backup (--nobackup)", file=sys.stderr)
-                elif settings_path and settings_path.exists():
-                    try:
-                        backup_path = create_teitok_backup(str(original_input_path))
-                    except PermissionError as exc:
-                        print(
-                            f"[flexipipe] Warning: could not create TEITOK backup due to file permissions: {exc}. Continuing without backup.",
-                            file=sys.stderr,
-                        )
-                        backup_path = None
-                    except OSError as exc:
-                        print(
-                            f"[flexipipe] Warning: TEITOK backup failed ({exc}). Continuing without backup.",
-                            file=sys.stderr,
-                        )
-                        backup_path = None
-                    if backup_path:
-                        if args.verbose or args.debug:
-                            print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
-                    elif args.verbose or args.debug:
-                        from datetime import date
-                        today = date.today().strftime("%Y%m%d")
-                        filename = Path(original_input_path).name
-                        if "." in filename:
-                            name_part, ext_part = filename.rsplit(".", 1)
-                            backup_name = f"{name_part}-{today}.{ext_part}"
-                        else:
-                            backup_name = f"{filename}-{today}"
-                        backups_dir = Path.cwd() / "backups"
-                        existing_backup = backups_dir / backup_name
-                        if existing_backup.exists():
-                            print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
-                elif args.verbose or args.debug:
-                    print("[flexipipe] Skipping backup (not in a TEITOK project - settings.xml not found)", file=sys.stderr)
+                # The backup is made by the write itself (xml_safe_write → teitok_backup): before
+                # every replacement of a file, in the project's backups/ folder; no write without it.
             
                 from .teitok import update_teitok
                 from .insert_tokens import insert_tokens_into_teitok
@@ -6566,20 +6782,37 @@ def run_tag(args: argparse.Namespace) -> int:
                             # Safely check document metadata populated by load_teitok
                             meta = getattr(output_doc, "meta", {}) or {}
                             tokens_only_xml = bool(meta.get("_teitok_tokens_only_xml"))
+                            if not tokens_only_xml:
+                                # the backend's document may not carry load_teitok's metadata: the file itself
+                                from .teitok_status import has_tokens_without_sentences
+
+                                tokens_only_xml = has_tokens_without_sentences(target_writeback_path)
                             if tokens_only_xml and "segment" in requested_tasks:
                                 auto_insert_sentences = True
                     
+                        _update_settings = teitok_settings_obj
+                        if _update_settings is None and getattr(args, "attrs_map", None):
+                            # no settings.xml: the --attrs-map names still decide the attributes
+                            from .teitok_settings import TeitokSettings
+
+                            _update_settings = TeitokSettings()
+                            _update_settings.apply_cli_mappings(_parse_attrs_map(args.attrs_map))
                         update_teitok(
                             output_doc,
                             str(target_writeback_path),
                             output_path if output_path else None,
-                            settings=teitok_settings_obj,
+                            settings=_update_settings,
                             from_raw_text=processed_from_raw,
                             strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
                             unicode_normalization=output_unicode_normalize,
                             insert_sentences=auto_insert_sentences,
                             verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
                             keep_ohead=bool(getattr(args, "debug", False)),
+                            pretty_print=bool(getattr(args, "pretty_print", False)),
+                            spacing="c" if getattr(args, "spaceafter_handling", "join") == "c" else "join",
+                            keep=[k for k in (getattr(args, "keep", None) or "").split(",") if k.strip()],
+                            tasks=requested_tasks,
+                            sentence_layout=_sentence_layout_from_args(args),
                         )
                         if args.verbose or args.debug:
                             target = str(target_writeback_path) if not output_path else output_path
@@ -6596,9 +6829,33 @@ def run_tag(args: argparse.Namespace) -> int:
                     from .teitok_writeback_xt import xmltokenizer_version
 
                     _versions = f" [flexipipe {_fp_version}, xmltokenizer {xmltokenizer_version()}]"
-                    if use_writeback and not output_path:
+                    from .xml_safe_write import InvalidXMLError
+                    from .teitok_backup import BackupError
+
+                    # the fallback rebuilds the document (inline markup flattened): never over the
+                    # input file, and not when the writeback refused invalid XML
+                    _output_is_input = False
+                    if output_path:
+                        try:
+                            _out = Path(output_path).resolve()
+                            _output_is_input = _out == Path(target_writeback_path).resolve() or (
+                                bool(getattr(args, "input", None)) and _out == Path(args.input).expanduser().resolve()
+                            )
+                        except OSError:
+                            _output_is_input = True
+                    _refuse_fallback = (use_writeback and not output_path) or _output_is_input or isinstance(
+                        e, (InvalidXMLError, BackupError, PermissionError)
+                    )
+                    if _refuse_fallback:
+                        _why = (
+                            "the result was not valid XML" if isinstance(e, InvalidXMLError)
+                            else "no backup could be made" if isinstance(e, BackupError)
+                            else "the file cannot be written" if isinstance(e, PermissionError)
+                            else "--output is the input file" if _output_is_input
+                            else "--writeback was requested without --output"
+                        )
                         print(
-                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because --writeback was requested without --output.{_versions}",
+                            f"[flexipipe] Writeback failed for {target_writeback_path}: {e}. Refusing fallback save because {_why}; the input file is unchanged.{_versions}",
                             file=sys.stderr,
                         )
                     else:
@@ -6608,7 +6865,7 @@ def run_tag(args: argparse.Namespace) -> int:
                         )
                     if args.test and temp_writeback_path:
                         temp_writeback_path.unlink(missing_ok=True)
-                    if use_writeback and not output_path:
+                    if _refuse_fallback:
                         return 1
                 else:
                     if args.test and temp_writeback_path:
@@ -6640,6 +6897,9 @@ def run_tag(args: argparse.Namespace) -> int:
                 and (emit_teitok_output or output_path or args.test or not use_writeback)
             ):
                 tei_tasks = _detect_performed_tasks(output_doc)
+                from .task_routing import routed_note, routed_tasks
+
+                tei_tasks = set(tei_tasks) | routed_tasks(output_doc)  # steps another backend did (task_routing)
                 tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
                 pretty_print = getattr(args, "pretty_print", False)
                 spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
@@ -6672,7 +6932,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Build backend string - show all backends
                 backend_names = [b.upper() for b in backends_used]
                 change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
-                change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+                change_text = f"Tagged via {change_source} (tasks={tasks_summary_str}){routed_note(output_doc)}"
             
                 # Collect model/license info and acknowledgements for notes
                 api_notes = []
@@ -6718,8 +6978,9 @@ def run_tag(args: argparse.Namespace) -> int:
                     skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
                 )
                 if output_path:
-                    with open(output_path, "w", encoding="utf-8") as handle:
-                        handle.write(tei_output)
+                    from .xml_safe_write import write_xml_file
+
+                    write_xml_file(output_path, tei_output)  # parsed first; written atomically
                 elif emit_teitok_output:
                     print(tei_output)
         elif output_format == "json":
@@ -6878,12 +7139,13 @@ def _required_annotations_for_backend(
         # fastText needs UPOS, XPOS, and FEATS for training
         required = ["upos", "xpos"]
         return required
+    # a part-of-speech layer: UD's or the corpus's own tags will do ("upos|xpos": either)
     if backend_key in ("spacy", "transformers"):
-        required = ["xpos", "upos", "lemma", "head", "deprel"]
+        required = ["upos|xpos", "lemma", "head", "deprel"]
     else:
-        required = ["xpos", "upos", "lemma"]
-    if xpos_attr and "xpos" not in required:
-        required.append("xpos")
+        required = ["upos|xpos", "lemma"]
+    if xpos_attr:  # the corpus's tags were named: sentences without them teach nothing about them
+        required[0] = "xpos"
     return required
 
 
@@ -7216,6 +7478,10 @@ def run_train(args: argparse.Namespace) -> int:
             expan_attr=expan_attr,
             lemma_attr=lemma_attr,
             trslit_attr=trslit_attr,
+            pron_attr=getattr(args, "pron", None),
+            pron_feats=[f.strip() for f in (getattr(args, "pron_feats", None) or "").split(",") if f.strip()] or None,
+            pron_g2p=getattr(args, "pron_g2p", None) or "light",
+            pron_context=getattr(args, "pron_context", None),
             segmentation_policy=segmentation_policy,
             export_document_splits=export_document_splits,
             document_segmentation_policy=document_segmentation_policy,
@@ -7264,7 +7530,13 @@ def run_train(args: argparse.Namespace) -> int:
         if not args.train_data:
             raise SystemExit("--train-data is required for neural backends")
         train_path = Path(args.train_data)
+        train_source = train_path
         dev_path = Path(args.dev_data) if args.dev_data else None
+        from .progress import Steps
+
+        pron_attr = getattr(args, "pron", None)
+        steps = Steps(3 + bool(pron_attr))  # data, training, [pronunciation], measuring (a job page reads these)
+        steps.next("preparing the training data")
         
         ud_folder = getattr(args, "ud_folder", None)
         ud_folder_path = Path(ud_folder).expanduser().resolve() if ud_folder else None
@@ -7315,8 +7587,9 @@ def run_train(args: argparse.Namespace) -> int:
                     language=getattr(args, "language", None),
                     export_document_splits=export_document_splits,
                     document_segmentation_policy=document_segmentation_policy,
+                    pron_attr=pron_attr,
                 )
-                splits = prepared_splits
+                splits = dict(prepared_splits)
                 train_path = prepared_splits["train"]
                 if "dev" in prepared_splits:
                     dev_path = prepared_splits["dev"]
@@ -7483,12 +7756,24 @@ def run_train(args: argparse.Namespace) -> int:
                 train_kwargs["tagset_file"] = getattr(args, "tagset_file", None)
                 train_kwargs["wordvec_pretrain_file"] = getattr(args, "wordvec_pretrain_file", None)
             
+            steps.next(f"training the {backend_type} model")
             model_path = backend.train(
                 train_data=train_path,
                 output_dir=output_dir,
                 dev_data=dev_path,
                 **train_kwargs,
             )
+            from .train import _report_trained_model, _train_pronunciation
+
+            if pron_attr:  # a pronunciation model next to it (task pron: light G2P + vocabulary)
+                steps.next("the pronunciation model")
+                _train_pronunciation(splits, output_dir, pron_attr, context=getattr(args, "pron_context", None),
+                                     feats=[f.strip() for f in (getattr(args, "pron_feats", None) or "").split(",") if f.strip()] or None,
+                                     language=args.language)
+            steps.next("measuring the model on the held-out documents")
+            _report_trained_model(backend_type, model_path, output_dir, splits, train_source, args.language,
+                                  {"pron": pron_attr, "pron_context": getattr(args, "pron_context", None),
+                                   "nlpform": None if (getattr(args, "nlpform", "form") or "form") == "form" else args.nlpform})
             # For classla, the backend already prints detailed status messages
             # Only print a generic message if not verbose (verbose output already shown)
             if backend_type == "classla" and not (args.verbose or args.debug):
@@ -8158,7 +8443,7 @@ def _load_teitok_for_process(
     from .teitok import load_teitok
 
     policy = getattr(args, "_runtime_segmentation_policy", None)
-    return load_teitok(
+    doc = load_teitok(
         path,
         xpos_attr=merged_attrs_map.get("xpos"),
         reg_attr=merged_attrs_map.get("reg"),
@@ -8166,6 +8451,72 @@ def _load_teitok_for_process(
         lemma_attr=merged_attrs_map.get("lemma"),
         segmentation_policy=policy,
     )
+    replace = [r for r in (getattr(args, "replace", None) or "").split(",") if r.strip()]
+    if replace:
+        _clear_annotation(doc, replace)
+    return doc
+
+
+def _clear_layers(document, layers) -> None:
+    """Empty the given layers (xpos, lemma, reg, expan, trslit, pron) on every token and subtoken."""
+    fields = {"xpos": "xpos", "lemma": "lemma", "reg": "reg", "expan": "expan", "trslit": "trslit"}
+    for sentence in document.sentences:
+        for token in sentence.tokens:
+            for t in (token, *(token.subtokens or ())):
+                for layer in layers:
+                    if layer in fields and hasattr(t, fields[layer]):
+                        setattr(t, fields[layer], "")
+                    if isinstance(getattr(t, "attrs", None), dict):
+                        t.attrs.pop(layer, None)
+                        if layer == "pron":
+                            t.attrs.pop("pron_source", None)
+                            t.attrs.pop("pron_conf", None)
+
+
+def _corpus_model_in_use(settings) -> Optional[str]:
+    """The model trained on this TEITOK corpus that is in use (corpus_models.py), as a folder path."""
+    if settings is None or not getattr(settings, "settings_path", None):
+        return None
+    from .corpus_models import corpus_root, in_use
+
+    root = corpus_root(settings.settings_path)
+    found = in_use(root, (getattr(settings, "training", None) or {}).get("use"))
+    return str(found) if found else None
+
+
+def _sentence_layout_from_args(args: argparse.Namespace):
+    """--sentence-layout PRESET, else an application profile's segmentation layout; None: settings.xml's."""
+    preset = getattr(args, "sentence_layout", None)
+    if preset:
+        from .sentence_layout import SentenceLayout
+
+        return SentenceLayout(preset=preset)
+    return getattr(args, "_sentence_layout", None)
+
+
+def _clear_annotation(document: Document, names: Collection[str]) -> None:
+    """--replace: these attributes are left out of the input, so the backend assigns them anew
+    (flexitag only fills empty values and treats existing tags as given; here they start empty)."""
+    names = {n.strip().lower() for n in names}
+    for sentence in document.sentences:
+        for token in sentence.tokens:
+            for t in (token, *token.subtokens):
+                if "lemma" in names:
+                    t.lemma = ""
+                if "upos" in names:
+                    t.upos = ""
+                if "xpos" in names:
+                    t.xpos = ""
+                if "feats" in names:
+                    t.feats = ""
+                if "reg" in names and hasattr(t, "reg"):
+                    t.reg = ""
+                if "head" in names:
+                    t.head = 0
+                if "deprel" in names:
+                    t.deprel = ""
+                for n in names:
+                    t.attrs.pop(n, None)
 
 
 def _load_document(path: Path, fmt: str, *, args: Optional[argparse.Namespace] = None) -> Document:
@@ -8919,6 +9270,13 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"[flexipipe] Backend registries will be fetched from: {args.set_model_registry_base_url}/{{backend}}.json")
         return 0
     
+    if getattr(args, "set_model_hub_url", None):
+        from .model_storage import write_config
+        write_config({"model_hub_url": args.set_model_hub_url.rstrip("/")})
+        print(f"[flexipipe] flexipipe-hub address set to: {args.set_model_hub_url.rstrip('/')}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+
     if args.set_model_registry_url:
         # Set backend-specific registry URL (format: backend:url)
         from .model_storage import write_config, read_config

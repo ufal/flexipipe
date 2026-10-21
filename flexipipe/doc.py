@@ -118,6 +118,11 @@ class SubToken(AttrsMixin):
     xpos: str = ""
     upos: str = ""
     feats: str = ""
+    # the word's own syntax (a word of a multiword token is a full word in UD): head = its position in the
+    # sentence (1-based, counting words), 0 = root / none
+    head: int = 0
+    deprel: str = ""
+    deps: str = ""
     source: str = ""
     source_id: str = ""
     space_after: bool = True
@@ -246,6 +251,9 @@ class SubToken(AttrsMixin):
             xpos=data.get("xpos", ""),
             upos=data.get("upos", ""),
             feats=data.get("feats", ""),
+            head=int(data.get("head", 0) or 0),
+            deprel=data.get("deprel", ""),
+            deps=data.get("deps", ""),
             source=data.get("source", ""),
             source_id=data.get("source_id", data.get("tokid", "")),
             space_after=bool(data.get("space_after", True)),
@@ -281,6 +289,12 @@ class SubToken(AttrsMixin):
             "space_after": self.space_after,
             "attrs": dict(self.attrs),
         }
+        if self.head:
+            result["head"] = self.head
+        if self.deprel:
+            result["deprel"] = self.deprel
+        if self.deps:
+            result["deps"] = self.deps
         if self.char_start is not None:
             result["char_start"] = self.char_start
         if self.char_end is not None:

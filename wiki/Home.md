@@ -38,5 +38,6 @@ Use `flexipipe info backends`, `flexipipe info models --backend <name>`, etc. to
 * [Installation](Installation.md) — requirements, pip install, wrapper, optional extras, language detection
 * [Quick Start](Quick-Start.md) — tagging, benchmarking, training, configuration examples
 * [Backends](Backends.md) — backend overview table, Transformers backend details
+* [TEITOK Integration](TEITOK-Integration.md) — TEITOK XML: settings.xml, write-back, attribute mappings, tokenization
 * [Reference](Reference.md) — input/output formats, NER, MWT, info commands, convert, evaluation tips
 * [Contributing](Contributing.md) — project layout, development notes

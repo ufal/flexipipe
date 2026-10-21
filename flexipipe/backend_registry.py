@@ -94,6 +94,9 @@ def get_backend_status(backend_name: str) -> Dict[str, Any]:
     cli_backends = {
         "udpipe1": ("udpipe binary", "Install UDPipe and ensure 'udpipe' is on PATH"),
         "treetagger": ("tree-tagger binary", "Install TreeTagger and ensure 'tree-tagger' is on PATH"),
+        "phonetisaurus": ("phonetisaurus-g2pfst binary",
+                          "Build Phonetisaurus (github.com/AdolfVonKleist/Phonetisaurus, needs OpenFst; training also MITLM) "
+                          "and put its programs on PATH or in $FLEXIPIPE_PHONETISAURUS_DIR"),
     }
     
     # Backends that need Java
@@ -146,7 +149,12 @@ def get_backend_status(backend_name: str) -> Dict[str, Any]:
         binary_cmd = backend_key.replace("1", "")  # udpipe1 -> udpipe
         if backend_key == "treetagger":
             binary_cmd = "tree-tagger"
-        if shutil.which(binary_cmd) is None:
+        found = shutil.which(binary_cmd) is not None
+        if backend_key == "phonetisaurus":
+            from .pron_backends import phonetisaurus_available
+
+            found = phonetisaurus_available()[0]
+        if not found:
             missing.append(binary_name)
             status = "missing_binary"
             return {

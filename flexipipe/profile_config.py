@@ -31,6 +31,14 @@ def _segmentation_policy_from_block(data: Optional[Dict[str, Any]]) -> Optional[
     )
 
 
+def _sentence_layout_from_block(data: Optional[Dict[str, Any]]):
+    if not data or not isinstance(data, dict) or not data.get("layout"):
+        return None
+    from .sentence_layout import SentenceLayout
+
+    return SentenceLayout.from_dict(data["layout"])
+
+
 @dataclass
 class ApplicationProfile:
     """How a model should be applied in a target environment (e.g. TEITOK writeback)."""
@@ -44,6 +52,8 @@ class ApplicationProfile:
     writeback_insert_sentences: Optional[bool] = None
     segmenter: Optional[str] = None
     segmentation: Optional[SegmentationPolicy] = None
+    # how inserted <s> relate to u / seg / p … (sentence_layout.py): segmentation: {layout: …}
+    sentence_layout: Optional[Any] = None
     attrs: Dict[str, str] = field(default_factory=dict)
     tasks: List[str] = field(default_factory=list)
     backend_options: Dict[str, Any] = field(default_factory=dict)
@@ -77,6 +87,7 @@ class ApplicationProfile:
             writeback_insert_sentences=insert_sentences,
             segmenter=segmenter,
             segmentation=_segmentation_policy_from_block(block.get("segmentation")),
+            sentence_layout=_sentence_layout_from_block(block.get("segmentation")),
             attrs=attrs,
             tasks=tasks,
             backend_options=dict(options),
@@ -243,6 +254,8 @@ def apply_application_profile_defaults(args, profile: ApplicationProfile) -> Non
 
     if profile.segmentation is not None:
         setattr(args, "_runtime_segmentation_policy", profile.segmentation)
+    if profile.sentence_layout is not None and getattr(args, "_sentence_layout", None) is None:
+        setattr(args, "_sentence_layout", profile.sentence_layout)
 
     if profile.writeback_insert_sentences is not None:
         args.writeback_insert_sentences = profile.writeback_insert_sentences

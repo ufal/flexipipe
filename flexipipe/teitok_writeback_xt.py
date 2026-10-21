@@ -378,6 +378,8 @@ def _build_change_metadata(document: Document) -> Tuple[str, str]:
         tasks.add("tag")
     if any(t.head for s in document.sentences for t in s.tokens):
         tasks.add("parse")
+    if any((t.attrs or {}).get("pron") for s in document.sentences for t in s.tokens):
+        tasks.add("pron")
     if getattr(document, "spans", None) and document.spans.get("ner"):
         tasks.add("ner")
     elif any(getattr(s, "entities", None) for s in document.sentences):
@@ -389,8 +391,11 @@ def _build_change_metadata(document: Document) -> Tuple[str, str]:
         for t in s.tokens
     ):
         tasks.add("normalize")
+    from .task_routing import routed_note, routed_tasks
+
+    tasks = set(tasks) | routed_tasks(document)  # steps another backend did (task_routing)
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
-    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str}){routed_note(document)}"
     return change_text, tasks_summary_str
 
 
@@ -440,6 +445,7 @@ def _token_values(token) -> dict[str, str]:
         "reg": token.reg or attrs.get("reg", ""),
         "expan": token.expan or attrs.get("expan", ""),
         "trslit": token.trslit or attrs.get("trslit", ""),
+        "pron": attrs.get("pron", ""),
     }
 
 
@@ -531,6 +537,7 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
         "reg": _preferred_attr_name(attr_map.get("reg"), "reg"),
         "expan": _preferred_attr_name(attr_map.get("expan"), "expan"),
         "trslit": _preferred_attr_name(attr_map.get("trslit"), "trslit"),
+        "pron": _preferred_attr_name(attr_map.get("pron"), "pron"),
     }
 
     tok_elems = [e for e in root.iter() if _local_tag(e) == "tok"]
@@ -865,7 +872,10 @@ def writeback_teitok_with_xmltokenizer(
     else:
         out_bytes = folded_after
 
-    output_path_obj.write_bytes(out_bytes)
+    from .xml_safe_write import write_xml_file
+
+    # parsed first, its text compared with the input's: never replaces the file with broken XML
+    write_xml_file(output_path_obj, out_bytes, original=original_path_obj)
 
     import re as _re
 

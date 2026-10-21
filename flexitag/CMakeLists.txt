@@ -168,6 +168,13 @@ if(FLEXITAG_BUILD_PYTHON)
         endif()
         find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
     endif()
+    # libflexitag next to the module: $ORIGIN on Linux; macOS does not know $ORIGIN (dyld takes it
+    # literally and the module does not load), its equivalent is @loader_path
+    if(APPLE)
+        set(FLEXITAG_MODULE_RPATH "@loader_path")
+    else()
+        set(FLEXITAG_MODULE_RPATH "$ORIGIN")
+    endif()
     find_package(pybind11 CONFIG QUIET)
     if(pybind11_FOUND)
         pybind11_add_module(flexitag_py bindings/python/module.cpp)
@@ -176,7 +183,7 @@ if(FLEXITAG_BUILD_PYTHON)
         # Look for libflexitag.so next to the module when shared builds are used.
         set_target_properties(flexitag_py PROPERTIES
             BUILD_RPATH_USE_ORIGIN TRUE
-            INSTALL_RPATH "$ORIGIN"
+            INSTALL_RPATH "${FLEXITAG_MODULE_RPATH}"
             BUILD_WITH_INSTALL_RPATH TRUE
         )
         # Python module needs ICU headers (inherited from flexitag, but ensure they're available)
@@ -196,7 +203,7 @@ if(FLEXITAG_BUILD_PYTHON)
         target_link_libraries(flexitag_py PRIVATE flexitag)
         set_target_properties(flexitag_py PROPERTIES
             BUILD_RPATH_USE_ORIGIN TRUE
-            INSTALL_RPATH "$ORIGIN"
+            INSTALL_RPATH "${FLEXITAG_MODULE_RPATH}"
             BUILD_WITH_INSTALL_RPATH TRUE
         )
         # Python module needs ICU headers (inherited from flexitag, but ensure they're available)

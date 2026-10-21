@@ -5,7 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Collection, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .teitok_settings import TeitokSettings
@@ -517,6 +517,26 @@ def load_teitok(
     return doc
 
 
+def _inner_text(elem: ET.Element) -> str:
+    """TEITOK's innerText (pform) of a token: all its text, also inside and after elements within it (a word broken
+    over a line, <lb/>; an expansion, <ex>), but not that of its <dtok>s."""
+    parts = [elem.text or ""]
+    for child in elem:
+        if child.tag != "dtok":
+            parts.append("".join(child.itertext()))
+        parts.append(child.tail or "")
+    return "".join(parts).strip()
+
+
+def _teitok_form(elem: ET.Element) -> str:
+    """The base form of a <tok> / <dtok>, as TEITOK computes it: @form, else the innerText (form inherits from pform).
+    A token with elements inside should carry @form (TEITOK warns when it does not)."""
+    value = (elem.get("form") or "").strip()
+    if value and value != "--":
+        return value
+    return _inner_text(elem)
+
+
 def _get_attr_value_with_fallback(
     elem: ET.Element,
     attr_names: List[str],
@@ -539,7 +559,7 @@ def _get_attr_value_with_fallback(
             return value.strip()
     
     if fallback_to_text:
-        text = (elem.text or "").strip()
+        text = _inner_text(elem)
         if text and text != "--":
             return text
     
@@ -548,8 +568,9 @@ def _get_attr_value_with_fallback(
 
 def _xml_surface_form_like_load(elem: ET.Element) -> str:
     """
-    Surface string for a <tok> for alignment / verification, using the same rule as
-    TEITOK load: when inner text and @form disagree, trust inner text (stale @form).
+    Surface string for a <tok> for alignment / verification during write-back: the visible text; when inner text
+    and @form disagree, trust inner text (stale @form). Not the loading rule (since 2026-10-21 loading takes @form,
+    TEITOK's computational form); kept as it was because write-back alignment depends on it.
     """
     form_attr = (elem.get("form") or "").strip()
     form_text = (elem.text or "").strip()
@@ -883,12 +904,7 @@ def _token_from_tok_elem(
     form_attr = tok_elem.get("form", "")
     if form_attr == "--":
         return None
-    form_attr_val = (tok_elem.get("form") or "").strip()
-    form_text = (tok_elem.text or "").strip()
-    if form_text and form_attr_val and form_text != form_attr_val:
-        form = form_text
-    else:
-        form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True) or form_text
+    form = _teitok_form(tok_elem)
     if not form:
         return None
     tokid = tok_elem.get("id") or tok_elem.get(f"{XML_NS}id", "")
@@ -933,12 +949,7 @@ def _token_from_tok_elem(
     for dtok_elem in tok_elem.findall("dtok") or tok_elem.findall("{*}dtok"):
         if dtok_elem.get("form", "") == "--":
             continue
-        dtok_form_attr = (dtok_elem.get("form") or "").strip()
-        dtok_form_text = (dtok_elem.text or "").strip()
-        if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
-            dtok_form = dtok_form_text
-        else:
-            dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True) or dtok_form_text
+        dtok_form = _teitok_form(dtok_elem)
         subtokens.append(
             SubToken(
                 id=len(subtokens) + 1,
@@ -1038,9 +1049,9 @@ def _load_teitok_with_mappings(
         xpos_attrs = ["xpos", "msd", "pos"]
     
     if reg_attrs:
-        reg_attrs.extend(["reg", "nform"])
+        reg_attrs.extend(["reg", "nform", "norm"])
     else:
-        reg_attrs = ["reg", "nform"]
+        reg_attrs = ["reg", "nform", "norm"]
     
     if expan_attrs:
         expan_attrs.extend(["expan", "fform"])
@@ -1168,19 +1179,12 @@ def _load_teitok_with_mappings(
                 except ValueError:
                     pass
             
-            # Get form (required)
-            form_attr = (tok_elem.get("form") or "").strip()
-            form_text = (tok_elem.text or "").strip()
-            # Prefer visible token text when it disagrees with @form.
-            # Some corpora contain stale/incorrect @form values from earlier runs
-            # (e.g. quote+word merged into one token), while inner text reflects the
-            # actual token segmentation in XML.
-            if form_text and form_attr and form_text != form_attr:
-                form = form_text
-            else:
-                form = _get_attr_value_with_fallback(tok_elem, ["form"], fallback_to_text=True)
-                if not form:
-                    form = form_text
+            # Get form (required): TEITOK's computed base form, @form, else the innerText (all of it, also after an
+            # <lb/> inside the word). @form wins over the text: it is the form for computational purposes, and it may
+            # rightly differ from the text (deletions inside the token, corrections that are not part of the form,
+            # a form that simplifies, long s to s), so a difference does not mean a stale @form and cannot be "fixed"
+            # from the text.
+            form = _teitok_form(tok_elem)
             
             # Infer space_after from XML structure
             # When sentence uses sameAs, tokens live elsewhere so use only each token's tail.
@@ -1319,14 +1323,7 @@ def _load_teitok_with_mappings(
                 if dtok_form_attr == "--":
                     continue  # Skip suppressed subtokens
                 
-                dtok_form_attr = (dtok_elem.get("form") or "").strip()
-                dtok_form_text = (dtok_elem.text or "").strip()
-                if dtok_form_text and dtok_form_attr and dtok_form_text != dtok_form_attr:
-                    dtok_form = dtok_form_text
-                else:
-                    dtok_form = _get_attr_value_with_fallback(dtok_elem, ["form"], fallback_to_text=True)
-                    if not dtok_form:
-                        dtok_form = dtok_form_text
+                dtok_form = _teitok_form(dtok_elem)
                 
                 # Only fall back to form/innerText if "form" is explicitly in the attribute list
                 dtok_lemma_has_form = "form" in lemma_attrs
@@ -1363,6 +1360,8 @@ def _load_teitok_with_mappings(
                     xpos=dtok_xpos,
                     upos=dtok_upos,
                     feats=dtok_feats,
+                    deprel=dtok_elem.get("deprel", ""),  # @head (a tok / dtok id) is resolved per sentence below
+                    deps=dtok_elem.get("deps", ""),
                     reg=dtok_reg,
                     expan=dtok_expan,
                     space_after=False,  # Will be set later
@@ -1410,14 +1409,18 @@ def _load_teitok_with_mappings(
         # Extract entities from <name> elements
         # Build a map of token indices (in tok_elements) to their token IDs (in sentence.tokens)
         # This accounts for suppressed tokens that were skipped
+        # Word positions, as CoNLL-U numbers them: a <tok> with <dtok>s counts as its dtoks (an entity on it spans them)
         tok_elem_idx_to_token_id: Dict[int, int] = {}
+        tok_elem_idx_to_last_id: Dict[int, int] = {}
         token_id_counter = 1
         for tok_idx, tok_elem in enumerate(tok_elements):
             form_attr = tok_elem.get("form", "")
             if form_attr == "--":
                 continue  # Skip suppressed tokens
+            n_words = len([d for d in tok_elem.findall("dtok") if d.get("form", "") != "--"]) or 1
             tok_elem_idx_to_token_id[tok_idx] = token_id_counter
-            token_id_counter += 1
+            tok_elem_idx_to_last_id[tok_idx] = token_id_counter + n_words - 1
+            token_id_counter += n_words
         
         # Create Entity objects from <name> elements
         for name_elem, name_tok_elems in name_to_tokens.items():
@@ -1444,7 +1447,7 @@ def _load_teitok_with_mappings(
             
             # Map to actual token IDs (accounting for suppressed tokens)
             first_token_id = tok_elem_idx_to_token_id.get(first_tok_idx)
-            last_token_id = tok_elem_idx_to_token_id.get(last_tok_idx)
+            last_token_id = tok_elem_idx_to_last_id.get(last_tok_idx)
             
             if first_token_id is None or last_token_id is None:
                 continue  # Skip if tokens were suppressed
@@ -1467,12 +1470,10 @@ def _load_teitok_with_mappings(
         
         # Sentence text: use exact character sequence from XML when tokens are under this <s>;
         # when sentence uses sameAs, tokens live elsewhere so build from form+space_after.
+        # All the text in the <s> (also inside elements within tokens, <lb/>, <ex>, and between them, </name>), with
+        # whitespace runs as one space (# text is one line), as TEITOK's own CoNLL-U export has it.
         if tok_elements and not from_same_as:
-            xml_parts = [s_elem.text or ""]
-            for te in tok_elements:
-                xml_parts.append(te.text or "")
-                xml_parts.append(te.tail or "")
-            sentence.text = "".join(xml_parts).strip()
+            sentence.text = re.sub(r"\s+", " ", "".join(s_elem.itertext())).strip()
         elif sentence.tokens:
             parts = []
             for tok in sentence.tokens:
@@ -1536,24 +1537,39 @@ def _load_teitok_with_mappings(
             )
             _renumber_tokens(document.sentences)
     
-    # Post-process: convert head from tokid to ord if needed
-    # Build tokid -> ord mapping for all tokens
-    tokid_to_ord: Dict[str, int] = {}
+    # Post-process: @head (a tokid) -> the head's position in its sentence (CoNLL-U: 1-based within
+    # the sentence). Token ids may run on across the document (segmentation renumbers them), so the
+    # position is the id relative to the sentence's first; a head in another sentence cannot be
+    # expressed and stays 0.
+    # The position is counted here (words in order, a token's dtoks each a word, as the CoNLL-U writer numbers them),
+    # not taken from token.id: ids come from the <tok> id's number and do not count dtoks, so after a contraction they
+    # no longer match the written numbering. A head may be a <tok> id or a <dtok> id (dtoks keep their id in attrs).
     for sentence in document.sentences:
+        tokid_to_ord: Dict[str, int] = {}
+        pos = 0
         for token in sentence.tokens:
-            if token.tokid and token.id:
-                tokid_to_ord[token.tokid] = token.id
-    
-    # Convert head from tokid to ord for tokens that have head_tokid in attrs
-    for sentence in document.sentences:
+            if token.subtokens:
+                if token.tokid:
+                    tokid_to_ord[token.tokid] = pos + 1  # the <tok> around dtoks: its first word
+                for sub in token.subtokens:
+                    pos += 1
+                    sub_id = sub.attrs.get("id") or sub.tokid
+                    if sub_id:
+                        tokid_to_ord[sub_id] = pos
+            else:
+                pos += 1
+                if token.tokid:
+                    tokid_to_ord[token.tokid] = pos
         for token in sentence.tokens:
             if "head_tokid" in token.attrs:
-                head_tokid = token.attrs["head_tokid"]
-                head_ord = tokid_to_ord.get(head_tokid, 0)
+                head_ord = tokid_to_ord.get(token.attrs["head_tokid"], 0)
                 if head_ord > 0:
                     token.head = head_ord
-                # Remove the temporary head_tokid from attrs
                 del token.attrs["head_tokid"]
+            for sub in token.subtokens:
+                raw = sub.attrs.get("head")
+                if not sub.head and isinstance(raw, str) and raw:
+                    sub.head = tokid_to_ord.get(raw, 0) or (int(raw) if raw.isdigit() else 0)
     
     # Record basic TEITOK structure metadata for later writeback decisions
     try:
@@ -1609,7 +1625,9 @@ def save_teitok(
         settings=settings,
         unicode_normalization=unicode_normalization,
     )
-    Path(path).write_text(xml_str, encoding="utf-8")
+    from .xml_safe_write import write_xml_file
+
+    write_xml_file(path, xml_str)  # parsed first; written atomically
 
 
 def dump_teitok(
@@ -1746,118 +1764,18 @@ def _remap_teitok_attributes(xml_str: str, settings: "TeitokSettings") -> str:
 def pretty_print_teitok_xml(
     xml_str: str,
     *,
-    spaceafter_handling: str = "preserve",
+    spaceafter_handling: str = "join",
     skip_spaceafter_for_breaking_elements: bool = True,
 ) -> str:
     """
-    Pretty-print TEITOK XML with proper indentation using lxml.
-    
-    Args:
-        xml_str: The XML string to pretty-print
-        spaceafter_handling: How to handle SpaceAfter=No tokens:
-            - "preserve" (default): Remove spaces between tokens with SpaceAfter=No and next token
-            - "join": Add join="right" attribute to tokens with SpaceAfter=No
-        skip_spaceafter_for_breaking_elements: If True (default), skip SpaceAfter handling
-            if there's a hard-breaking element (like <p>) between tokens. Only used with
-            spaceafter_handling="preserve".
-        
-    Returns:
-        Pretty-printed XML string
+    Pretty-print TEITOK XML without changing its text (teitok_pretty.py): the spacing between
+    tokens is recorded first — join="right" ("join", default; "preserve" is the same), and with
+    "c" also every whitespace as <c>…</c> — then only element-only content is indented.
+    `skip_spaceafter_for_breaking_elements` is no longer needed (kept for callers).
     """
-    # Use lxml for proper XML pretty-printing
-    try:
-        from lxml import etree
-    except ImportError:
-        # Fall back to ElementTree - it doesn't support pretty_print
-        return xml_str
-    
-    # Parse the XML
-    parser = etree.XMLParser(remove_blank_text=False)
-    tree = etree.fromstring(xml_str.encode("utf-8"), parser)
-    
-    # Use lxml's indent function for pretty-printing first
-    etree.indent(tree, space="  ")
-    
-    # Handle SpaceAfter=No tokens (after indent to ensure attributes are preserved)
-    # In both modes, we add join="Right" as a marker so we can check for it consistently
-    # (SpaceAfter=No is CoNLL-U specific, but join="Right" is a universal marker)
-    for tok_elem in tree.xpath('.//tok'):
-        misc = tok_elem.get("misc", "")
-        if misc and "SpaceAfter=No" in misc:
-            tok_elem.set("join", "Right")
-    
-    # Generate the pretty-printed XML
-    # Note: encoding="unicode" doesn't support xml_declaration, so we add it manually if needed
-    updated = etree.tostring(tree, encoding="unicode", pretty_print=True)
-    
-    # Post-process SpaceAfter=No handling for preserve approach (string-based)
-    if spaceafter_handling == "preserve":
-        import re
-        
-        # 1. Remove ALL whitespace (including newlines) around <dtok> elements
-        # Pattern: match all whitespace before and after <dtok> tags
-        def clean_dtok_spaces(m):
-            before = m.group(1)
-            tag = m.group(2)
-            after = m.group(3)
-            # Remove all whitespace (spaces, tabs, newlines)
-            return tag
-        
-        updated = re.sub(r'(\s*)(</?dtok[^>]*>)(\s*)', clean_dtok_spaces, updated)
-        
-        # 2. Remove spaces between tokens with SpaceAfter=No and the next token
-        # This includes spaces in the token's tail and any spaces in parent element tails
-        
-        # First, find all tokens with SpaceAfter=No
-        # Pattern: <tok[^>]*misc="[^"]*SpaceAfter=No[^"]*"[^>]*>.*?</tok>
-        # We need to match the entire token element and remove spaces after it until the next <tok>
-        
-        # Strategy: Find tokens with SpaceAfter=No, then remove all whitespace (except newlines for indentation)
-        # between the closing </tok> and the next <tok> or </name> or other closing tag
-        
-        # Pattern to match: </tok> followed by optional whitespace and closing tags, then optional whitespace, then <tok
-        # We want to remove spaces but preserve newlines for indentation
-        
-        # More precise: match </tok> with SpaceAfter=No, then remove spaces (but keep newlines) until next <tok
-        def remove_spaces_after_token(match):
-            """Remove spaces after a token with SpaceAfter=No, preserving newlines for indentation."""
-            token_tag = match.group(0)
-            # The token tag is already matched, now we need to find the closing </tok> and remove spaces after it
-            return token_tag
-        
-        # Find all <tok> elements with SpaceAfter=No in the XML string
-        # We'll use a regex to find the pattern: <tok[^>]*misc="[^"]*SpaceAfter=No[^"]*"[^>]*>...?</tok>
-        # Then remove whitespace (except newlines) between </tok> and the next <tok> or closing tag
-        
-        # Better approach: use regex to find </tok> that follows a token with SpaceAfter=No
-        # Pattern: match </tok> that comes after a token with SpaceAfter=No, then remove spaces before next <tok>
-        
-        # 2. Remove ALL whitespace (including newlines) between tokens with join="Right" and the next token
-        # We only check for join="Right" attribute (not SpaceAfter=No, which is CoNLL-U specific)
-        # This includes spaces in the token's tail and any spaces in parent element tails
-        
-        def remove_all_whitespace_after_join_token(m):
-            """Remove all whitespace (including newlines) after a token with join="Right"."""
-            tok_element = m.group(1)  # The entire <tok>...</tok> element
-            whitespace1 = m.group(2)  # Whitespace after </tok>
-            closing_name = m.group(3) or ''  # Optional </name>
-            whitespace2 = m.group(4) or ''  # Whitespace after </name> (if present)
-            next_tok = m.group(5)  # The next <tok> tag
-            
-            # Remove ALL whitespace (spaces, tabs, newlines) - no whitespace between tokens
-            return tok_element + closing_name + next_tok
-        
-        # Match token with join="Right", then optional whitespace, optional </name>, optional whitespace, then <tok>
-        # Pattern matches tokens that have join="Right" anywhere in the tag
-        # Be careful: match the attribute value exactly to avoid false matches
-        pattern = r'(<tok[^>]*join="Right"[^>]*>.*?</tok>)(\s*)(</name>)?(\s*)(<tok)'
-        updated = re.sub(pattern, remove_all_whitespace_after_join_token, updated, flags=re.DOTALL)
-    
-    # Add XML declaration if not present
-    if not updated.startswith("<?xml"):
-        updated = '<?xml version="1.0" encoding="UTF-8"?>\n' + updated
-    
-    return updated
+    from .teitok_pretty import pretty_print_xml_string
+
+    return pretty_print_xml_string(xml_str, "c" if spaceafter_handling == "c" else "join")
 
 
 def _verify_character_level_alignment(
@@ -2195,9 +2113,23 @@ def update_teitok(
     insert_sentences: bool = False,
     verbose: bool = False,
     keep_ohead: bool = False,
+    pretty_print: bool = False,
+    spacing: str = "join",
+    keep: Optional[Collection[str]] = None,
+    tasks: Optional[Collection[str]] = None,
+    sentence_layout: Optional[Any] = None,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
+    The file's text is never changed: no pretty-printing unless `pretty_print` (then with the
+    spacing recorded as `spacing`: "join" / "c", teitok_pretty.py), and the write refuses a result
+    whose text differs from the input's (xml_safe_write).
+
+    `keep`: internal attribute names (lemma, xpos, …; "all") whose existing non-empty values are
+    never overwritten. `tasks`: the tasks that ran — an attribute is only removed (empty result)
+    when one of its tasks ran; the annotation of other tasks is left as it is.
+    `sentence_layout`: how inserted <s> relate to the document's elements (sentence_layout.py);
+    default: settings.xml's <flexipipe><segmentation>, else the written preset.
     
     This function preserves the original XML structure, comments, and metadata while only
     updating the annotation attributes (xpos, lemma, upos, feats, head, deprel, etc.) on
@@ -2225,6 +2157,17 @@ def update_teitok(
         import xml.etree.ElementTree as ET
         preserve_comments = False
     
+    keep_set = {k.strip().lower() for k in (keep or []) if k and k.strip()}
+    # layers the user leaves out (settings: <layers><item key exclude="yes">): never written, never removed
+    excluded_layers = set(getattr(settings, "excluded_layers", None) or ())
+    if tasks is None:
+        written_attrs = {"lemma", "upos", "xpos", "feats", "head", "deprel", "deps", "reg", "misc"}
+    else:
+        from .teitok_status import TASK_ATTRS
+
+        written_attrs = {a for t in tasks for a in TASK_ATTRS.get(t, [])}
+        if "parse" in tasks:
+            written_attrs |= {"deps"}
     original_path_obj = Path(original_path)
     if not original_path_obj.exists():
         raise FileNotFoundError(f"Original TEITOK file not found: {original_path}")
@@ -3222,8 +3165,18 @@ def update_teitok(
             # Update token attributes
             def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
                 """Set attribute respecting TEITOK mappings. Normalizes text attributes (form, lemma, etc.) but not tags."""
+                if internal_attr in excluded_layers:
+                    return
                 target_attr = _resolve_attr_name(internal_attr)
                 aliases = _attribute_aliases(internal_attr)
+                existing = next(
+                    (node.get(a) for a in [target_attr, *aliases] if a and (node.get(a) or "").strip() not in ("", "_")),
+                    None,
+                )
+                if existing is not None and (internal_attr in keep_set or "all" in keep_set):
+                    return  # kept: an existing (e.g. hand-checked) value is never overwritten
+                if existing is not None and not (value and value != "_") and internal_attr not in written_attrs:
+                    return  # no task of this attribute ran: its annotation stays
                 
                 # Normalize text attributes (form, lemma, reg, expan, mod, trslit, ltrslit) but not tags (xpos, upos, feats)
                 text_attrs = {"form", "lemma", "reg", "expan", "mod", "trslit", "ltrslit"}
@@ -3715,6 +3668,8 @@ def update_teitok(
                 _set_attr(tok_node, "upos", upos_val)
                 _set_attr(tok_node, "feats", feats_val)
                 _set_attr(tok_node, "reg", token.reg)
+                if "pron" in written_attrs:  # the pron task ran: the canonical pronunciation
+                    _set_attr(tok_node, "pron", (token.attrs or {}).get("pron", ""))
                 _set_attr(tok_node, "expan", token.expan)
                 _set_attr(tok_node, "mod", token.mod)
                 _set_attr(tok_node, "trslit", token.trslit)
@@ -3881,67 +3836,47 @@ def update_teitok(
                 current_list.append(node)
         if current_list:
             groups.append((current_sent, current_list))
-        # Strategy 1: If all tok nodes share the same parent, wrap each group in an <s> and move toks into it
+        # Place <s> by the corpus's element roles (sentence_layout / sentence_placement): never across
+        # a hard edge (p, div; u in conversations), split into linked parts inside elements that must
+        # stay whole (u, seg), split inline elements (hi), or a token list (standoff)
         if groups:
-            parent = get_parent(groups[0][1][0])
-            same_parent = parent is not None and all(
-                get_parent(node) is parent for _, tok_list in groups for node in tok_list
-            )
-            if same_parent:
-                for sent_idx, tok_list in groups:
-                    sent = sanitized.sentences[sent_idx] if sent_idx < len(sanitized.sentences) else None
-                    sent_id = f"s-{sent_idx + 1}"
-                    # Build sentence text from token forms and space_after so spacing is correct
-                    if sent and sent.tokens:
-                        sent_text = "".join(
-                            t.form + (" " if (t.space_after and i < len(sent.tokens) - 1) else "")
-                            for i, t in enumerate(sent.tokens)
-                        ).strip()
-                    else:
-                        sent_text = sent.text if sent and sent.text else ""
-                    s_elem = ET.Element("s")
-                    s_elem.set("id", sent_id)
-                    if sent_text:
-                        s_elem.set("text", sent_text)
-                    idx = list(parent).index(tok_list[0])
-                    parent.insert(idx, s_elem)
-                    for tok in tok_list:
-                        s_elem.append(tok)
+            from .sentence_layout import SentenceLayout
+            from .sentence_placement import place_sentences
+
+            texts = []
+            for sent_idx, _ in groups:
+                sent = sanitized.sentences[sent_idx] if sent_idx < len(sanitized.sentences) else None
+                if sent and sent.tokens:
+                    texts.append("".join(
+                        t.form + (" " if (t.space_after and i < len(sent.tokens) - 1) else "")
+                        for i, t in enumerate(sent.tokens)
+                    ).strip() or None)
+                else:
+                    texts.append(sent.text if sent and sent.text else None)
+            corpus_layout = (getattr(settings, "sentence_layout", None) if settings else None) or SentenceLayout()
+            if sentence_layout is not None and not sentence_layout.overrides:
+                # a preset chosen for this run: the corpus's own element settings still apply
+                layout = corpus_layout.with_preset(sentence_layout.preset)
             else:
-                # Strategy 2: Tokens have different parents - insert empty <s> with @corresp pointing to token IDs (TEITOK convention)
-                for sent_idx, tok_list in groups:
-                    sent = sanitized.sentences[sent_idx] if sent_idx < len(sanitized.sentences) else None
-                    sent_id = f"s-{sent_idx + 1}"
-                    # Build sentence text from token forms and space_after so spacing is correct
-                    if sent and sent.tokens:
-                        sent_text = "".join(
-                            t.form + (" " if (t.space_after and i < len(sent.tokens) - 1) else "")
-                            for i, t in enumerate(sent.tokens)
-                        ).strip()
-                    else:
-                        sent_text = sent.text if sent and sent.text else ""
-                    corresp_ids = []
-                    for tok in tok_list:
-                        tid = tok.get("id") or tok.get("{http://www.w3.org/XML/1998/namespace}id")
-                        if tid:
-                            corresp_ids.append(f"#{tid}")
-                    if not corresp_ids:
-                        continue
-                    s_elem = ET.Element("s")
-                    s_elem.set("id", sent_id)
-                    if sent_text:
-                        s_elem.set("text", sent_text)
-                    s_elem.set("corresp", " ".join(corresp_ids))
-                    first_tok = tok_list[0]
-                    insert_parent = get_parent(first_tok)
-                    if insert_parent is not None:
-                        try:
-                            insert_idx = list(insert_parent).index(first_tok)
-                        except ValueError:
-                            insert_idx = 0
-                        insert_parent.insert(insert_idx, s_elem)
-                    else:
-                        root.append(s_elem)
+                layout = sentence_layout or corpus_layout
+            tokrefs = getattr(settings, "sentence_tokref_attributes", None) if settings else None
+            placement = place_sentences(
+                root,
+                [tok_list for _, tok_list in groups],
+                layout,
+                texts=texts,
+                tokref_attr=(tokrefs[0] if tokrefs else "sameAs"),
+            )
+            document.meta["_sentence_placement"] = dict(placement.as_dict(), layout=layout.preset)
+            if verbose:
+                st = placement
+                splits = ", ".join(f"{n}×{c}" for n, c in sorted(st.split_elements.items()))
+                print(
+                    f"[flexipipe] sentences ({layout.preset}): {st.sentences} placed, {st.split_sentences} split into "
+                    f"{st.parts} parts, {st.standoff} as token lists, {st.cut_at_hard} cut at hard edges"
+                    + (f"; elements split: {splits}" if splits else ""),
+                    file=sys.stderr,
+                )
     
     from .teitok_name_wrap import apply_name_wrappers_to_tree
     from .doc_utils import collect_span_entities_by_sentence
@@ -3996,6 +3931,8 @@ def update_teitok(
             tasks.add("tag")
         if any(t.head for s in document.sentences for t in s.tokens):
             tasks.add("parse")
+        if any((t.attrs or {}).get("pron") for s in document.sentences for t in s.tokens):
+            tasks.add("pron")
         # NER is stored in sentence.entities, not on tokens
         if getattr(document, "spans", None) and document.spans.get("ner"):
             tasks.add("ner")
@@ -4008,16 +3945,26 @@ def update_teitok(
                for s in document.sentences for t in s.tokens):
             tasks.add("normalize")
     
+    from .task_routing import routed_note, routed_tasks
+
+    tasks = set(tasks) | routed_tasks(document)  # steps another backend did (task_routing)
     tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
-    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str}){routed_note(document)}"
     
     _add_change_to_tei_header(root, change_text, change_when, tasks_summary_str)
     
-    # Write updated XML
-    if preserve_comments:
-        # lxml preserves comments and formatting better
-        tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True, pretty_print=True)
-    else:
-        # ElementTree - basic write
-        tree.write(str(output_path_obj), encoding="utf-8", xml_declaration=True)
+    # Write updated XML: parsed first, its text compared with the input's, written atomically
+    from .xml_safe_write import write_xml_tree
+
+    if pretty_print and preserve_comments:  # lxml (pretty_print_tree needs it)
+        from .teitok_pretty import pretty_print_tree
+
+        pretty_print_tree(root, spacing)
+    write_xml_tree(
+        output_path_obj,
+        tree,
+        original=original_path_obj,
+        pretty=bool(pretty_print),
+        normalization=unicode_normalization,
+    )
 

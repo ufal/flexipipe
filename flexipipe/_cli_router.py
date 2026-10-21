@@ -24,6 +24,9 @@ def run(argv: list[str] | None = None) -> int:
     if sub == "install":
         from ._cli_install import main
         return main(argv)
+    if sub == "publish":
+        from ._cli_publish import main
+        return main(argv)
     if sub == "info":
         from ._cli_info import main
         return main(argv)

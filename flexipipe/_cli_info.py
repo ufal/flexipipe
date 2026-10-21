@@ -196,6 +196,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output format (default: table). Use 'json' for machine-readable output.",
     )
 
+    # info document
+    document_parser = info_subparsers.add_parser(
+        "document",
+        help="What a TEITOK document contains and what a run would do (language, model, tasks, what it would overwrite)",
+        parents=[parent_parser],
+    )
+    document_parser.add_argument("--input", required=True, help="The TEITOK XML file")
+    document_parser.add_argument("--tasks", help="Tasks of the planned run (default: the backend's defaults)")
+    document_parser.add_argument("--backend", help="Backend of the planned run (default: the corpus's, else flexipipe's choice)")
+    document_parser.add_argument("--model", help="Model of the planned run")
+    document_parser.add_argument("--keep", help="Attributes the run keeps (as process --keep)")
+    document_parser.add_argument("--language", help="Language of the planned run (default: the document's, else the corpus's)")
+    document_parser.add_argument("--sentence-layout", help="Sentence layout preset of the planned run (default: the corpus's)")
+    document_parser.add_argument("--task-backend", action="append", metavar="TASK=BACKEND[:MODEL]", help="Backend (and model) for a step of the planned run the main backend does not do (repeatable)")
+    document_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
+    # info training
+    training_parser = info_subparsers.add_parser(
+        "training",
+        help="What can be trained on a TEITOK corpus: its annotations, and per backend what it would learn or lacks",
+        parents=[parent_parser],
+    )
+    training_parser.add_argument("--corpus", default=".", help="The TEITOK project folder (default: the current folder)")
+    training_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
+    # info corpus-models
+    corpus_models_parser = info_subparsers.add_parser(
+        "corpus-models",
+        help="Models trained on a TEITOK corpus (Resources/flexipipe-models/): when, on what, scores, which is in use",
+        parents=[parent_parser],
+    )
+    corpus_models_parser.add_argument("--corpus", default=".", help="The TEITOK project folder (default: the current folder)")
+    corpus_models_parser.add_argument("--output-format", choices=["table", "json"], default="table")
+
     # info teitok
     teitok_parser = info_subparsers.add_parser(
         "teitok",
