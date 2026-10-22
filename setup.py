@@ -109,6 +109,20 @@ EXTRAS["dev"] = sorted(
 DEPS_BASE = Path(__file__).parent
 
 
+def _patch_rapidjson(rapidjson_dir: Path) -> None:
+    """rapidjson v1.1.0 (its latest release) defines GenericStringRef::operator= by assigning a const member;
+    GCC 14 and later reject that even unused (-Wtemplate-body). rapidjson's own development version declares the
+    operator without a body; do the same."""
+    header = rapidjson_dir / "include" / "rapidjson" / "document.h"
+    try:
+        text = header.read_text(encoding="utf-8")
+    except OSError:
+        return
+    bad = "GenericStringRef& operator=(const GenericStringRef& rhs) { s = rhs.s; length = rhs.length; }"
+    if bad in text:
+        header.write_text(text.replace(bad, "GenericStringRef& operator=(const GenericStringRef& rhs) /* = delete */;"), encoding="utf-8")
+
+
 def _download_and_extract(url: str, target_dir: Path) -> Path:
     if target_dir.exists():
         return target_dir
@@ -366,6 +380,7 @@ class FlexiBuildExt(build_ext):
         rapidjson_dir = _download_and_extract(self.RAPIDJSON_URL, deps_dir / "rapidjson")
         pugixml_dir = _download_and_extract(self.PUGIXML_URL, deps_dir / "pugixml")
 
+        _patch_rapidjson(rapidjson_dir)
         rapidjson_include = str((rapidjson_dir / "include").resolve())
         pugixml_src_dir = str((pugixml_dir / "src").resolve())
         pugixml_source = str((pugixml_dir / "src" / "pugixml.cpp").resolve())
