@@ -4536,6 +4536,8 @@ def _get_process_entries(args: argparse.Namespace) -> List[Tuple[Optional[Path],
 
 
 def run_tag(args: argparse.Namespace) -> int:
+    import copy as _copy
+    _args_as_given = _copy.copy(args)   # per-file runs of a directory start from these (see below)
     # Apply defaults from config if not specified
     from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model, get_unicode_normalization
     from .doc import Document
@@ -4945,9 +4947,29 @@ def run_tag(args: argparse.Namespace) -> int:
     if not _process_entries:
         print("[flexipipe] No files matched. When --input is a directory, use --input-glob to specify a pattern (default: *.xml).", file=sys.stderr)
         return 1
-    # Reuse backend across files when processing a directory (avoids loading model N times)
+    # Several files (--input a directory): each on its own, so one that fails does not stop the others;
+    # the backend is loaded once and reused (avoids loading the model N times)
     if len(_process_entries) > 1:
-        args._backend_cache = {}
+        _backend_cache: dict = {}
+        _failed = []
+        for _inp, _out in _process_entries:
+            _one = _copy.copy(_args_as_given)
+            _one._backend_cache = _backend_cache
+            _one.input = str(_inp)
+            if _out is not None:
+                _one.output = str(_out)
+            try:
+                _rc = run_tag(_one)
+            except Exception as _exc:   # a file the pipeline cannot handle: reported, the others go on
+                print(f"[flexipipe] {_inp}: {_exc}", file=sys.stderr)
+                _rc = 1
+            if _rc != 0:
+                _failed.append(str(_inp))
+        if _failed:
+            print(f"[flexipipe] {len(_failed)} of {len(_process_entries)} files failed: " + ", ".join(_failed),
+                  file=sys.stderr)
+            return 1
+        return 0
     for _inp, _out in _process_entries:
         if _inp is not None:
             args.input = str(_inp)
