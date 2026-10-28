@@ -13,6 +13,12 @@
  * If a file <dirname(executable)/flexipipe.venv> exists (written at install time
  * when run from a venv), its first line is used as VENV_PATH so the launcher
  * uses the same Python that was used to install the wrapper.
+ *
+ * <executable>.python (written at every install): line 1 the Python the wrapper was
+ * installed with, line 2 (optional) the repository it was installed from (a source
+ * checkout, used as PYTHONPATH). Used when no venv is set or active, before PATH:
+ * the first python3 on PATH may be another installation without flexipipe's
+ * dependencies.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -28,6 +34,7 @@
 static const char *const MODULE = "flexipipe";
 static const char *const PYTHON_NAMES[] = { "python3", "python", NULL };
 static const char *const VENV_FILE = "flexipipe.venv";
+static char install_repo[PATH_MAX];   /* line 2 of <executable>.python */
 
 static int exists(const char *path) {
     return access(path, X_OK) == 0;
@@ -74,7 +81,33 @@ static void maybe_load_venv_file(void) {
     fclose(f);
 }
 
-/* Find Python: VENV_PATH (env or from .venv file), then VIRTUAL_ENV, then PATH (python3, python). */
+/* <executable>.python: the install-time Python (into buf) and repository (install_repo). */
+static int load_install_python(char *buf, size_t size) {
+    char exe[PATH_MAX];
+    if (get_executable_path(exe, sizeof(exe)) != 0) return 0;
+    char path[PATH_MAX + 8];
+    snprintf(path, sizeof(path), "%s.python", exe);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int found = 0;
+    char line[PATH_MAX];
+    if (fgets(line, (int)sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] && exists(line)) {
+            snprintf(buf, size, "%s", line);
+            found = 1;
+        }
+    }
+    if (found && fgets(line, (int)sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        snprintf(install_repo, sizeof(install_repo), "%s", line);
+    }
+    fclose(f);
+    return found;
+}
+
+/* Find Python: VENV_PATH (env or from .venv file), then VIRTUAL_ENV, then <executable>.python,
+   then PATH (python3, python). */
 static char *find_python(char *buf, size_t size) {
     maybe_load_venv_file();
     const char *venv = getenv("VENV_PATH");
@@ -87,6 +120,7 @@ static char *find_python(char *buf, size_t size) {
         snprintf(buf, size, "%s/bin/python", venv);
         if (exists(buf)) return buf;
     }
+    if (load_install_python(buf, size)) return buf;
     const char *path_env = getenv("PATH");
     if (!path_env) path_env = "/usr/bin:/bin";
     for (const char *const *p = PYTHON_NAMES; *p; p++) {
@@ -107,8 +141,9 @@ int main(int argc, char **argv) {
         return 127;
     }
 
-    /* Optional: dev install via FLEXIPIPE_REPO_PATH */
+    /* Optional: dev install via FLEXIPIPE_REPO_PATH, else the repository recorded at install */
     const char *repo = getenv("FLEXIPIPE_REPO_PATH");
+    if (!(repo && repo[0]) && install_repo[0]) repo = install_repo;
     if (repo && repo[0]) {
         char *old = getenv("PYTHONPATH");
         char newpath[4096];

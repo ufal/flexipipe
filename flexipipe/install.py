@@ -22,6 +22,31 @@ def _get_install_time_venv_base() -> Path | None:
     return None
 
 
+def _install_time_python() -> tuple[str, str | None]:
+    """The Python running the install, and the repository flexipipe is imported from when that is a source
+    checkout (not an installed package): the wrapper keeps using them, whatever python3 comes first on PATH."""
+    import site
+
+    import flexipipe
+
+    package_parent = Path(flexipipe.__file__).resolve().parent.parent
+    site_dirs = [Path(p).resolve() for p in [*getattr(site, "getsitepackages", lambda: [])(),
+                                              getattr(site, "getusersitepackages", lambda: "")()] if p]
+    installed = any(package_parent == d or d in package_parent.parents for d in site_dirs)
+    return sys.executable, None if installed else str(package_parent)
+
+
+def _inject_python_into_wrapper_script(script_content: str, python: str, repo: str | None) -> str:
+    """The shell wrapper's counterpart of <launcher>.python: this Python (and repository) unless a venv is set."""
+    lines = f'INSTALL_PYTHON="{python}"  # set at install time\n'
+    if repo:
+        lines += f'[ -z "$FLEXIPIPE_REPO_PATH" ] && FLEXIPIPE_REPO_PATH="{repo}"  # set at install time\n'
+    marker = "# Function to find Python executable"
+    if marker in script_content:
+        return script_content.replace(marker, lines + marker, 1)
+    return script_content.replace("find_python() {", lines + "find_python() {", 1)
+
+
 def _inject_venv_into_wrapper_script(script_content: str, venv_base: Path) -> str:
     """Inject VENV_PATH at install time so the wrapper uses this Python even when venv is not activated."""
     line = f'VENV_PATH="{venv_base}"  # set at install time (use this Python)\n'
@@ -75,6 +100,7 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
         script_content = script_path.read_text()
         if venv_base is not None:
             script_content = _inject_venv_into_wrapper_script(script_content, venv_base)
+        script_content = _inject_python_into_wrapper_script(script_content, *_install_time_python())
 
     install_path = getattr(args, "wrapper_path", None)
     use_sudo = False
@@ -159,6 +185,22 @@ def _install_wrapper_script(args: argparse.Namespace) -> int:
                 venv_file.write_text(str(venv_base))
             except Exception:
                 pass
+        if use_launcher_bin:
+            # the Python (and source checkout) of this install, used before PATH (flexipipe_launcher.c)
+            python, repo = _install_time_python()
+            python_file = install_path.parent / (install_path.name + ".python")
+            content = python + "\n" + (repo + "\n" if repo else "")
+            if use_sudo:
+                with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".python") as tf:
+                    tf.write(content)
+                    ppath = tf.name
+                subprocess.run(["sudo", "cp", ppath, str(python_file)], capture_output=True)
+                Path(ppath).unlink(missing_ok=True)
+            else:
+                try:
+                    python_file.write_text(content)
+                except Exception:
+                    pass
         kind = "C launcher" if use_launcher_bin else "Wrapper script"
         print(f"[flexipipe] ✓ {kind} installed to: {install_path}")
         if install_path.parent == Path.home() / "bin":

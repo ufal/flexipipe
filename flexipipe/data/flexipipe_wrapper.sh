@@ -35,6 +35,12 @@ find_python() {
         echo "$VIRTUAL_ENV/bin/python"
         return 0
     fi
+
+    # The Python the wrapper was installed with (set at install time)
+    if [ -n "$INSTALL_PYTHON" ] && [ -x "$INSTALL_PYTHON" ]; then
+        echo "$INSTALL_PYTHON"
+        return 0
+    fi
     
     # Check for common Python executables
     for py in python3 python; do
