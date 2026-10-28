@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from ..backend_spec import BackendSpec
 from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document, Entity
+from ._batching import split_document
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
     LANGUAGE_FIELD_NAME,
@@ -387,17 +388,7 @@ class NameTagRESTBackend(BackendManager):
 
     def _split_document(self, document: Document) -> list[Document]:
         """Split document sentences into batches to avoid oversized payloads."""
-        if not document.sentences:
-            return [document]
-        batches: list[Document] = []
-        for start_idx in range(0, len(document.sentences), self.batch_size):
-            batch = Document(
-                id=f"{document.id or 'doc'}-batch-{len(batches)+1}",
-                meta=dict(document.meta),
-                sentences=[*document.sentences[start_idx:start_idx + self.batch_size]],
-            )
-            batches.append(batch)
-        return batches
+        return split_document(document, self.batch_size)
 
     def _build_payload(
         self,

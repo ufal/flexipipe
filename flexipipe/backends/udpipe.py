@@ -13,6 +13,7 @@ import requests
 from ..backend_spec import BackendSpec
 from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document
+from ._batching import split_document, split_text
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
     LANGUAGE_FIELD_NAME,
@@ -386,6 +387,7 @@ class UDPipeRESTBackend(BackendManager):
         headers: Optional[Dict[str, str]] = None,
         session: Any = None,
         log_requests: bool = False,
+        max_raw_chars: int = 200_000,
     ):
         self._endpoint = endpoint_url
         self._model = model
@@ -395,6 +397,7 @@ class UDPipeRESTBackend(BackendManager):
         self._headers = headers or {}
         self._session = session or requests.Session()
         self._log = log_requests
+        self._max_raw_chars = max_raw_chars
 
     def _request(self, data: str, input_format: str = "plain") -> dict:
         """
@@ -550,6 +553,16 @@ class UDPipeRESTBackend(BackendManager):
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _raw_text_mode(document: Document, use_raw_text: bool) -> bool:
+        # Respect caller-selected mode first.
+        # The CLI decides whether we should preserve existing tokenization (CoNLL-U input)
+        # or allow retokenization (plain-text input). We only auto-fallback to raw text
+        # when pretokenized mode was requested but there are no tokens to serialize.
+        force_pretokenized = document.meta.get("_force_pretokenized", False)
+        has_tokens = any(sent.tokens for sent in document.sentences)
+        return bool(use_raw_text) or (not force_pretokenized and not has_tokens)
+
     def tag(
         self,
         document: Document,
@@ -559,17 +572,19 @@ class UDPipeRESTBackend(BackendManager):
         components: Optional[List[str]] = None,
         use_raw_text: bool = False,
     ) -> NeuralResult:
+        """Pretokenized documents go to the service in batches of `batch_size` sentences (it refuses large
+        payloads, as UDMorph and NameTag do); raw text in parts at paragraph barriers (_tag_single)."""
         del overrides, preserve_pos_tags, components
-        
-        # Respect caller-selected mode first.
-        # The CLI decides whether we should preserve existing tokenization (CoNLL-U input)
-        # or allow retokenization (plain-text input). We only auto-fallback to raw text
-        # when pretokenized mode was requested but there are no tokens to serialize.
-        force_pretokenized = document.meta.get("_force_pretokenized", False)
-        has_tokens = any(sent.tokens for sent in document.sentences)
-        should_use_raw_text = bool(use_raw_text)
-        if not should_use_raw_text and not force_pretokenized and not has_tokens:
-            should_use_raw_text = True
+        batches = split_document(document, self._batch_size)
+        if len(batches) == 1 or self._raw_text_mode(document, use_raw_text):
+            return self._tag_single(document, use_raw_text=use_raw_text)
+        tagged = Document(id=document.id, meta=dict(document.meta))
+        for batch in batches:
+            tagged.sentences.extend(self._tag_single(batch, use_raw_text=use_raw_text).document.sentences)
+        return NeuralResult(document=tagged, stats={})
+
+    def _tag_single(self, document: Document, *, use_raw_text: bool = False) -> NeuralResult:
+        should_use_raw_text = self._raw_text_mode(document, use_raw_text)
         
         if should_use_raw_text:
             # Raw text mode: extract text from sentences and send as plain text
@@ -619,7 +634,9 @@ class UDPipeRESTBackend(BackendManager):
                     # Fallback: if no sentence text, try to reconstruct from tokens
                     from ..conllu import _reconstruct_sentence_text
                     text = "\n".join(_reconstruct_sentence_text(sent.tokens) or "" for sent in document.sentences if sent.tokens)
-            response = self._request(text, input_format="plain")
+            parts = [p for p in split_text(text, self._max_raw_chars) if p.strip()]
+            results = [self._request(p, input_format="plain").get("result", "").rstrip("\n") for p in parts]
+            response = {"result": "\n\n".join(r for r in results if r) + "\n"}
         else:
             # Pretokenized mode: send CoNLL-U format to preserve tokenization and TokIds
             # UDPipe REST API should preserve TokIds in MISC column when input=conllu
