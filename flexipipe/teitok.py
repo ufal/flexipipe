@@ -456,24 +456,24 @@ def load_teitok(
                         seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
             
             # Check if there are duplicates
-                has_duplicates = any(count > 1 for count in seen_sent_ids.values()) or any(count > 1 for count in seen_tokids.values())
+            has_duplicates = any(count > 1 for count in seen_sent_ids.values()) or any(count > 1 for count in seen_tokids.values())
                 
-                if has_duplicates:
-                    had_duplicates = True
-                    _fix_duplicate_ids(root)
-                    # Write fixed XML back to a temp file
-                    # (We'll use this temp file for loading)
-                    import tempfile
-                    # Include XML declaration
-                    fixed_content = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
-                    # Write to temp file
-                    temp_fd, temp_path = tempfile.mkstemp(suffix=".xml", text=True)
-                    try:
-                        with os.fdopen(temp_fd, "w", encoding="utf-8") as tf:
-                            tf.write(fixed_content)
-                    except Exception:
-                        os.close(temp_fd)
-                        temp_path = None
+            if has_duplicates:
+                had_duplicates = True
+                _fix_duplicate_ids(root)
+                # Write fixed XML back to a temp file
+                # (We'll use this temp file for loading)
+                import tempfile
+                # Include XML declaration
+                fixed_content = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
+                # Write to temp file
+                temp_fd, temp_path = tempfile.mkstemp(suffix=".xml", text=True)
+                try:
+                    with os.fdopen(temp_fd, "w", encoding="utf-8") as tf:
+                        tf.write(fixed_content)
+                except Exception:
+                    os.close(temp_fd)
+                    temp_path = None
     except Exception:
         # If fixing fails, just use original file
         pass
@@ -3099,6 +3099,11 @@ def update_teitok(
                     global_ord_to_tokid[token.id] = token.tokid
     
     # Now process sentences for updates
+    # XML node → the backend tokens mapped to it, per sentence (a split: several), built once: a scan of the whole
+    # map per token made writing back a large document quadratic (10k sentences: minutes)
+    tokens_by_node: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    for (s_i, t_i), node in global_token_to_tok_node.items():
+        tokens_by_node.setdefault((s_i, id(node)), []).append((s_i, t_i))
     for sent_idx, sent in enumerate(sanitized.sentences):
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = None
@@ -3195,8 +3200,7 @@ def update_teitok(
             
             # Check if this backend token is part of a split sequence (will be handled as dtok)
             # This can happen in both raw text mode and pretokenized mode when backends split tokens
-            tokens_for_this_node = [(s, t) for (s, t), node in global_token_to_tok_node.items() 
-                                   if node == tok_node and s == sent_idx]
+            tokens_for_this_node = tokens_by_node.get((sent_idx, id(tok_node)), [])
             if len(tokens_for_this_node) > 1:
                 # Multiple backend tokens map to this XML node - this is a split
                 sorted_tokens = sorted(tokens_for_this_node, key=lambda x: x[1])
@@ -3266,8 +3270,7 @@ def update_teitok(
             # we need to create <dtok> elements for the split tokens
             # This can happen in both raw text mode and pretokenized mode when backends split tokens
             # Check if this XML node is mapped to multiple backend tokens
-            tokens_for_this_node = [(s, t) for (s, t), node in global_token_to_tok_node.items() 
-                                   if node == tok_node and s == sent_idx]
+            tokens_for_this_node = tokens_by_node.get((sent_idx, id(tok_node)), [])
             split_tokens = []
             if len(tokens_for_this_node) > 1:
                 # Multiple backend tokens map to this XML node - this is a split
