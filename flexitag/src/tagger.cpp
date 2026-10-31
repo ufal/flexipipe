@@ -509,6 +509,19 @@ Document FlexitagTagger::tag(const Document& doc, TaggerStats* stats) {
         // Then paths are normalized at the end
         
         for (std::size_t i = 0; i < lattice.size(); ++i) {
+            // A token without candidates (empty form, e.g. TEITOK <tok><ee/></tok>, or "--") is
+            // transparent: carry the previous states over unchanged, so the path neither dies here
+            // nor loses the words before it. The token itself gets no tag (best_path reset below).
+            if (lattice[i].empty()) {
+                if (i > 0) {
+                    for (const auto& [prev_tag, prev_state] : dp[i - 1]) {
+                        DPState pass = prev_state;
+                        pass.prev_tag = prev_tag;
+                        dp[i][prev_tag] = pass;
+                    }
+                }
+                continue;
+            }
             // For each candidate at position i
             for (std::size_t j = 0; j < lattice[i].size(); ++j) {
                 // Safety check: if we already have too many states, skip low-probability candidates
@@ -845,8 +858,15 @@ Document FlexitagTagger::tag(const Document& doc, TaggerStats* stats) {
                 }
             }
             
+            // Transparent positions carried the previous token's state: do not copy it onto them.
+            for (std::size_t i = 0; i < lattice.size(); ++i) {
+                if (lattice[i].empty()) {
+                    best_path[i] = nullptr;
+                }
+            }
+
             if (settings_.debug) {
-                std::cerr << "[flexitag] Path length: " << path_length 
+                std::cerr << "[flexitag] Path length: " << path_length
                           << " (expected: " << sentence.tokens.size() << ")\n";
             }
 
@@ -1331,7 +1351,9 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
                     if (!entry.expan.empty()) {
                         cand.lex_attributes->expan = entry.expan;
                     }
-                    // Copy contraction-level attributes (mod, trslit, ltrslit, tokid)
+                    // Copy contraction-level attributes (mod, trslit, ltrslit). Never tokid: it
+                    // identifies one occurrence in the training data (older models store it), and
+                    // copying it re-labels the token being tagged, so write-back cannot find it.
                     if (!entry.mod.empty()) {
                         cand.lex_attributes->mod = entry.mod;
                     }
@@ -1340,9 +1362,6 @@ std::vector<WordCandidate> FlexitagTagger::morpho_parse(Token& token) const {
                     }
                     if (!entry.ltrslit.empty()) {
                         cand.lex_attributes->ltrslit = entry.ltrslit;
-                    }
-                    if (!entry.tokid.empty()) {
-                        cand.lex_attributes->tokid = entry.tokid;
                     }
                     // Use entry.key as form (normalized form)
                     if (!entry.key.empty()) {
@@ -2278,9 +2297,6 @@ void FlexitagTagger::update_token(Token& token, const WordCandidate& best) const
             if (!attrs.ltrslit.empty()) {
                 token.ltrslit = attrs.ltrslit;
             }
-            if (!attrs.tokid.empty()) {
-                token.tokid = attrs.tokid;
-            }
         }
         
         token.source = best.source;
@@ -2440,7 +2456,7 @@ void FlexitagTagger::update_token(Token& token, const WordCandidate& best) const
             token.expan = best.lex_attributes->expan;
         }
         
-        // Copy additional attributes (mod, trslit, ltrslit, tokid) if available and token doesn't have them
+        // Copy additional attributes (mod, trslit, ltrslit) if available and token doesn't have them
         if (!best.lex_attributes->mod.empty() && (token.mod.empty() || token.mod == "_")) {
             token.mod = best.lex_attributes->mod;
         }
@@ -2449,9 +2465,6 @@ void FlexitagTagger::update_token(Token& token, const WordCandidate& best) const
         }
         if (!best.lex_attributes->ltrslit.empty() && (token.ltrslit.empty() || token.ltrslit == "_")) {
             token.ltrslit = best.lex_attributes->ltrslit;
-        }
-        if (!best.lex_attributes->tokid.empty() && (token.tokid.empty() || token.tokid == "_")) {
-            token.tokid = best.lex_attributes->tokid;
         }
     } else {
         // Fallback: use lemma from candidate if token doesn't have one

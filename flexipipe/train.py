@@ -1464,7 +1464,7 @@ def _build_model_payload(
         feats_value = getattr(sub, "feats", "") or ""
         return _compose_tag(sub.xpos, sub.upos, feats_value)
 
-    vocab: Dict[str, Dict[Tuple[str, str, str, str, str, str], Counter]] = defaultdict(lambda: defaultdict(Counter))
+    vocab: Dict[str, Dict[Tuple[str, str, str, str, str, str, str], Counter]] = defaultdict(lambda: defaultdict(Counter))
     multiword_parts: Dict[str, Counter] = defaultdict(Counter)
     multiword_parts_tags: Dict[Tuple[str, Tuple[str, ...]], Tuple[str, ...]] = {}
     multiword_parts_full: Dict[Tuple[str, Tuple[str, ...]], List[Dict]] = {}  # Store full part objects
@@ -1513,8 +1513,9 @@ def _build_model_payload(
                         if hasattr(sub, "expan") and sub.expan:
                             part_obj["expan"] = sub.expan
                         part_objects.append(part_obj)
-                    # Store contraction-level attributes (reg, expan, mod, trslit, ltrslit, tokid)
-                    # These are at the parent token level, not the parts level
+                    # Store contraction-level attributes (reg, expan, mod, trslit, ltrslit)
+                    # These are at the parent token level, not the parts level. Never the TokId:
+                    # it names one occurrence, and the tagger would stamp it on every match.
                     contraction_attrs = {}
                     if hasattr(token, "reg") and token.reg:
                         contraction_attrs["reg"] = token.reg
@@ -1526,13 +1527,13 @@ def _build_model_payload(
                         contraction_attrs["trslit"] = token.trslit
                     if hasattr(token, "ltrslit") and token.ltrslit:
                         contraction_attrs["ltrslit"] = token.ltrslit
-                    if hasattr(token, "tokid") and token.tokid:
-                        contraction_attrs["tokid"] = token.tokid
                     if contraction_attrs:
                         multiword_parts_full[(token.form, parts)] = (part_objects, contraction_attrs)
                     else:
                         multiword_parts_full[(token.form, parts)] = part_objects
                     for sub in token.subtokens:
+                        if not _subtoken_tag_value(sub) and not _clean(sub.lemma):
+                            continue
                         sub_key = (
                             sub.lemma or "",
                             sub.xpos or "",
@@ -1540,10 +1541,15 @@ def _build_model_payload(
                             getattr(sub, "feats", "") or "",
                             getattr(sub, "reg", "") or "",
                             getattr(sub, "expan", "") or "",
+                            getattr(sub, "trslit", "") or "",
                         )
                         vocab[sub.form][sub_key]["count"] += 1
                     continue
 
+                # A token nobody annotated (no tag, no lemma; e.g. a TEITOK file still being
+                # corrected) is not evidence for a "_" analysis: leave it out of the lexicon.
+                if not _token_tag_value(token) and not _clean(token.lemma):
+                    continue
                 key = (
                     token.lemma or "",
                     token.xpos or "",
@@ -1551,6 +1557,7 @@ def _build_model_payload(
                     token.feats or "",
                     token.reg or "",
                     token.expan or "",
+                    getattr(token, "trslit", "") or "",
                 )
                 vocab[token.form][key]["count"] += 1
 
@@ -1582,7 +1589,7 @@ def _build_model_payload(
     vocab_json = {}
     for form, analyses in vocab.items():
         entries = []
-        for (lemma, xpos, upos, feats, reg, expan), counters in analyses.items():
+        for (lemma, xpos, upos, feats, reg, expan, trslit), counters in analyses.items():
             tag_value = _compose_tag(xpos, upos, feats) or "_"
             entry = {
                 "lemma": lemma or "_",
@@ -1596,6 +1603,8 @@ def _build_model_payload(
                 entry["reg"] = reg
             if expan:
                 entry["expan"] = expan
+            if trslit:
+                entry["trslit"] = trslit
             entries.append(entry)
         if len(entries) == 1:
             vocab_json[form] = entries[0]
@@ -1618,7 +1627,7 @@ def _build_model_payload(
                     entry["parts"] = part_objects
                     # Store contraction-level attributes
                     if contraction_attrs:
-                        for attr_name in ["reg", "expan", "mod", "trslit", "ltrslit", "tokid"]:
+                        for attr_name in ["reg", "expan", "mod", "trslit", "ltrslit"]:
                             if attr_name in contraction_attrs:
                                 entry[attr_name] = contraction_attrs[attr_name]
                 else:

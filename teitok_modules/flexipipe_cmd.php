@@ -150,7 +150,9 @@ class FlexipipeCmd
 	 * (attributes whose existing values stay: comma list or "all"), replace (attributes assigned
 	 * anew: left out of the input),
 	 * application (profile file), writeback (default true), test (preview: nothing written),
-	 * verbose. Tokenization is not forced: flexipipe tokenizes only when the file has no tokens
+	 * mark (an attribute: the tokens the run tags by guessing get it, --mark-guesses), verbose.
+	 * A manifest's extra-vocab (a vocabulary file merged into the model) is passed when the file exists.
+	 * Tokenization is not forced: flexipipe tokenizes only when the file has no tokens
 	 * and `tokenize` is among the tasks.
 	 */
 	static function process_args( $path, $manifest = null, $opt = array() ) {
@@ -161,6 +163,8 @@ class FlexipipeCmd
 			if ( !empty( $manifest['model'] ) ) array_push( $a, '--model', $manifest['model'] );
 			$bundle = $manifest['bundle'] ?? ( $manifest['path'] ?? '' );
 			if ( $bundle !== '' && file_exists( $bundle ) ) array_push( $a, '--manifest', $bundle );
+			$extra = $manifest['extra-vocab'] ?? '';
+			if ( $extra !== '' && file_exists( $extra ) ) array_push( $a, '--extra-vocab', $extra );
 		}
 		if ( $tasks !== '' ) {
 			array_push( $a, '--tasks', $tasks );
@@ -172,6 +176,7 @@ class FlexipipeCmd
 		if ( !empty( $opt['keep'] ) ) array_push( $a, '--keep', $opt['keep'] );
 		if ( !empty( $opt['replace'] ) ) array_push( $a, '--replace', $opt['replace'] );
 		if ( !empty( $opt['layout'] ) ) array_push( $a, '--sentence-layout', $opt['layout'] );
+		if ( !empty( $opt['mark'] ) ) array_push( $a, '--mark-guesses', $opt['mark'] );
 		if ( !empty( $opt['application'] ) && file_exists( $opt['application'] ) ) array_push( $a, '--application', $opt['application'] );
 		if ( !empty( $opt['test'] ) ) $a[] = '--test';
 		elseif ( !isset( $opt['writeback'] ) || $opt['writeback'] ) $a[] = '--writeback';

@@ -46,8 +46,9 @@ def xml_problem(data: bytes) -> Optional[str]:
     """Why `data` is not well-formed XML ("line N, column M: …"), or None when it is."""
     if _lxml_etree is not None:
         try:
-            # huge_tree: large corpus files; no network, no entity expansion
-            parser = _lxml_etree.XMLParser(huge_tree=True, resolve_entities=False, no_network=True)
+            # huge_tree: large corpus files; no network, no entity expansion; collect_ids=False: a
+            # repeated xml:id is a validity matter, not well-formedness (Word bookmarks in converted files)
+            parser = _lxml_etree.XMLParser(huge_tree=True, resolve_entities=False, no_network=True, collect_ids=False)
             _lxml_etree.fromstring(data, parser)
             return None
         except _lxml_etree.XMLSyntaxError as exc:

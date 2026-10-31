@@ -582,6 +582,32 @@ def _xml_surface_form_like_load(elem: ET.Element) -> str:
     return (v or "").strip()
 
 
+# flexitag's source for a tag it guessed (the word is not in the model's lexicon)
+GUESSED_SOURCES = frozenset({"ending", "prefix", "unknown", "fallback"})
+
+
+def _s_tok_nodes(
+    s_elem: ET.Element,
+    id_to_tok: Dict[str, ET.Element],
+    ref_attrs: Optional[List[str]] = None,
+) -> List[ET.Element]:
+    """The <tok>s of an <s>: those its @sameAs / @corresp names; those it contains when it names none,
+    or when the reference is stale (names tokens that no longer exist, e.g. after renumbering) and the
+    <s> contains tokens. Loading and write-back use this same rule."""
+    ref = ""
+    for a in ref_attrs or ["sameAs", "sameas", "corresp"]:
+        ref = s_elem.get(a) or ""
+        if ref:
+            break
+    contained = s_elem.findall(".//{*}tok") or s_elem.findall(".//tok") or []
+    if ref and id_to_tok:
+        ids = [p.strip().lstrip("#").strip() for p in ref.split() if p.strip()]
+        named = [id_to_tok[i] for i in ids if i in id_to_tok]
+        if named and (len(named) == len(ids) or not contained):
+            return named
+    return contained
+
+
 def _build_parent_map(elem: ET.Element, parent_map: Dict[ET.Element, ET.Element]) -> None:
     """Build a map of element -> parent for all elements in the tree."""
     for child in elem:
@@ -822,36 +848,50 @@ def _fix_duplicate_ids(root: ET.Element) -> None:
 
 def _remove_duplicate_tok_nodes(root: ET.Element) -> None:
     """
-    Remove duplicate <tok> and <s> nodes so each id appears once (keep first in document order).
-    Call after _fix_duplicate_ids so duplicate ids have been renamed; this removes the
-    renamed duplicate nodes from the tree to avoid duplicate content in the output.
+    Make each <s> id appear once (the first in document order keeps it): a repeated <s> (e.g. nested
+    in or next to the first, in hand-edited files) is unwrapped, its content staying where it is.
+    A repeated <tok> id is left in place: removing the <tok> would remove its text; the first one
+    keeps the id (write-back maps the id to the first).
     """
     parent_map: Dict[ET.Element, ET.Element] = {}
     for parent in root.iter():
         for child in parent:
             parent_map[child] = parent
-    seen_tokids: Set[str] = set()
     seen_sent_ids: Set[str] = set()
-    to_remove: List[ET.Element] = []
+    to_unwrap: List[ET.Element] = []
     for node in root.iter():
-        if _elem_is(node, "tok"):
-            tokid = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
-            if tokid:
-                if tokid in seen_tokids:
-                    to_remove.append(node)
-                else:
-                    seen_tokids.add(tokid)
-        elif _elem_is(node, "s"):
+        if _elem_is(node, "s"):
             sent_id = node.get("id") or node.get("{http://www.w3.org/XML/1998/namespace}id")
             if sent_id:
                 if sent_id in seen_sent_ids:
-                    to_remove.append(node)
+                    to_unwrap.append(node)
                 else:
                     seen_sent_ids.add(sent_id)
-    for node in to_remove:
+    for node in to_unwrap:
         parent = parent_map.get(node)
-        if parent is not None:
-            parent.remove(node)
+        if parent is None:
+            continue
+        idx = list(parent).index(node)
+        children = list(node)
+        # text and tail of the unwrapped <s> join the text around it
+        lead, tail = node.text or "", node.tail or ""
+        if idx > 0:
+            prev = parent[idx - 1]
+            prev.tail = (prev.tail or "") + lead
+        else:
+            parent.text = (parent.text or "") + lead
+        node.text = None
+        for i, child in enumerate(children):
+            parent.insert(idx + i, child)
+            parent_map[child] = parent
+        node.tail = None
+        if children:
+            children[-1].tail = (children[-1].tail or "") + tail
+        elif idx > 0:
+            parent[idx - 1].tail = (parent[idx - 1].tail or "") + tail
+        else:
+            parent.text = (parent.text or "") + tail
+        parent.remove(node)
 
 
 def _build_tok_line_keys(root: ET.Element) -> Dict[ET.Element, str]:
@@ -1099,6 +1139,7 @@ def _load_teitok_with_mappings(
     # Find all sentence elements (with or without namespace, e.g. TEI)
     sentence_counter = 1
     s_elems = root.findall(".//{*}s") or root.findall(".//s")
+    covered_tok_elems: Set[ET.Element] = set()  # <tok>s some <s> holds or references
     for s_elem in s_elems:
         xml_sent_id = s_elem.get("id") or s_elem.get(f"{XML_NS}id", "") or ""
         sent_id_attr = s_elem.get("sent_id", "")
@@ -1125,17 +1166,20 @@ def _load_teitok_with_mappings(
         # Get token elements: from sameAs/corresp (sentence references tokens elsewhere) or from children
         # Older TEITOK uses corresp; which attribute is used can be in settings.xml
         ref_attr = s_elem.get("sameAs") or s_elem.get("sameas") or s_elem.get("corresp") or ""
-        from_same_as = False
+        named: List[ET.Element] = []
         if ref_attr and id_to_tok:
             # Parse "#w-15 #w-16 #w-17" -> list of token elements in order
-            ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split()]
-            ref_ids = [i for i in ref_ids if i]
-            tok_elements = [id_to_tok[tid] for tid in ref_ids if tid in id_to_tok]
-            from_same_as = len(tok_elements) > 0
-        if not from_same_as:
-            # Get all token elements recursively (including those inside <name> elements)
-            tok_elements = s_elem.findall(".//{*}tok") or s_elem.findall(".//tok")
-        
+            named = [id_to_tok[tid] for tid in (p.strip().lstrip("#").strip() for p in ref_attr.split()) if tid in id_to_tok]
+        # The referenced tokens, else (none, or a stale reference) the contained ones, also inside <name>
+        tok_elements = _s_tok_nodes(s_elem, id_to_tok)
+        from_same_as = bool(named) and tok_elements == named
+        # A <tok> is in one sentence: an <s> repeating one before it (nested or duplicated in
+        # hand-edited files) adds no second copy of its tokens.
+        if tok_elements and all(n in covered_tok_elems for n in tok_elements):
+            continue
+        tok_elements = [n for n in tok_elements if n not in covered_tok_elems]
+        covered_tok_elems.update(tok_elements)
+
         # Build a map of token elements to their containing <name> elements
         # This will help us extract entity information
         tok_to_name: Dict[ET.Element, ET.Element] = {}
@@ -1493,22 +1537,23 @@ def _load_teitok_with_mappings(
         document.sentences.append(sentence)
         sentence_counter += 1
     
-    # If no <s> elements but we have <tok> elements, create sentence(s) via SegmentationPolicy.
-    if not document.sentences:
-        from .segmentation_policy import (
-            SegmentationPolicy,
-            TokenSegmentContext,
-            _renumber_tokens,
-            build_sentences_from_tokens,
-        )
+    # <tok>s outside any <s> (no <s> at all, or <s> covering only part of the text) become
+    # sentences via SegmentationPolicy, so they are tagged too.
+    from .segmentation_policy import (
+        SegmentationPolicy,
+        TokenSegmentContext,
+        _renumber_tokens,
+        build_sentences_from_tokens,
+    )
 
-        all_tok_elems = [n for n in root.iter() if _elem_is(n, "tok")]
-        if all_tok_elems:
+    def _sentences_from_tok_elems(tok_elems: List[ET.Element]) -> List[Sentence]:
+        sentences: List[Sentence] = []
+        if tok_elems:
             line_keys = _build_tok_line_keys(root)
             collected_tokens: List[Token] = []
             collected_contexts: List[TokenSegmentContext] = []
             token_id = 1
-            for tok_elem in all_tok_elems:
+            for tok_elem in tok_elems:
                 token = _token_from_tok_elem(
                     tok_elem,
                     lemma_attrs=lemma_attrs,
@@ -1529,14 +1574,52 @@ def _load_teitok_with_mappings(
                     )
                 )
             policy = segmentation_policy or SegmentationPolicy(mode="block")
-            document.sentences = build_sentences_from_tokens(
+            sentences = build_sentences_from_tokens(
                 collected_tokens,
                 collected_contexts,
                 policy,
                 language=language,
             )
-            _renumber_tokens(document.sentences)
-    
+            _renumber_tokens(sentences)
+        return sentences
+
+    all_tok_elems = [n for n in root.iter() if _elem_is(n, "tok")]
+    if not document.sentences:
+        document.sentences = _sentences_from_tok_elems(all_tok_elems)
+    else:
+        uncovered = [n for n in all_tok_elems if n not in covered_tok_elems]
+        extra = _sentences_from_tok_elems(uncovered)
+        if extra:
+            # Ids no <s> in the file has (the policy numbers from s-1), and no source <s>.
+            taken = {s.id for s in document.sentences} | {
+                n.get("id") or n.get(f"{XML_NS}id") or "" for n in s_elems
+            }
+            n_extra = 0
+            for sentence in extra:
+                n_extra += 1
+                while f"s-nos{n_extra}" in taken:
+                    n_extra += 1
+                sentence.id = sentence.sent_id = f"s-nos{n_extra}"
+                sentence.source_id = ""
+            # In document order: each before the first <s> sentence that starts after it.
+            tok_pos = {tid: i for i, tid in enumerate(n.get("id") or n.get(f"{XML_NS}id") or "" for n in all_tok_elems) if tid}
+
+            def _start(sentence: Sentence) -> int:
+                for token in sentence.tokens:
+                    if token.tokid in tok_pos:
+                        return tok_pos[token.tokid]
+                return -1
+
+            merged: List[Sentence] = []
+            pending = sorted(extra, key=_start)
+            for sentence in document.sentences:
+                start = _start(sentence)
+                while pending and start >= 0 and _start(pending[0]) < start:
+                    merged.append(pending.pop(0))
+                merged.append(sentence)
+            merged.extend(pending)
+            document.sentences = merged
+
     # Post-process: @head (a tokid) -> the head's position in its sentence (CoNLL-U: 1-based within
     # the sentence). Token ids may run on across the document (segmentation renumbers them), so the
     # position is the id relative to the sentence's first; a head in another sentence cannot be
@@ -1886,6 +1969,13 @@ def _verify_character_level_alignment(
                 # XML may omit surface for a placeholder <tok> while backend has literal '_'.
                 if el is not None and not (xf or "").strip() and bf == "_":
                     xf = "_"
+                # The backend got the token's @form (TEITOK's computational form, what loading takes)
+                # where it differs from the transcription: "su" with @form "su<add>s</add>", "and"
+                # with @form "&". Same token, unchanged: not a mismatch.
+                if el is not None and xf != bf:
+                    form_attr = (el.get("form") or "").strip()
+                    if form_attr and (normalize_unicode(form_attr, "NFC") or form_attr) == (normalize_unicode(bf, "NFC") or bf):
+                        xf = bf
                 xml_chunks.append(xf)
                 has_space_after = True
                 if token.space_after is False:
@@ -2174,6 +2264,7 @@ def update_teitok(
     keep: Optional[Collection[str]] = None,
     tasks: Optional[Collection[str]] = None,
     sentence_layout: Optional[Any] = None,
+    mark_guesses: Optional[str] = None,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
@@ -2186,6 +2277,8 @@ def update_teitok(
     when one of its tasks ran; the annotation of other tasks is left as it is.
     `sentence_layout`: how inserted <s> relate to the document's elements (sentence_layout.py);
     default: settings.xml's <flexipipe><segmentation>, else the written preset.
+    `mark_guesses`: an attribute name; a token this run tags by guessing (flexitag's source: ending,
+    prefix, unknown, fallback) gets it, with that source as value. Tokens tagged before are not marked.
     
     This function preserves the original XML structure, comments, and metadata while only
     updating the annotation attributes (xpos, lemma, upos, feats, head, deprel, etc.) on
@@ -2230,9 +2323,10 @@ def update_teitok(
     
     output_path_obj = Path(output_path) if output_path else original_path_obj
     
-    # Parse original XML
+    # Parse original XML. collect_ids=False: a repeated xml:id (e.g. Word bookmarks in converted
+    # files) is not a reason to refuse the file; TEITOK accepts it.
     if preserve_comments:
-        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
+        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False, collect_ids=False)
         tree = ET.parse(str(original_path_obj), parser)
         root = tree.getroot()
     else:
@@ -2307,12 +2401,23 @@ def update_teitok(
     # Prefer id over xml:id when reading
     # Note: Duplicate IDs are already fixed during loading
     global_token_counter = 1
+    # A generated id must not be one the file already uses (a <tok/> without id at position 400
+    # must not become a second "w-400"): then the next number no token has.
+    existing_tokids: Set[str] = set()
+    for node in root.iter():
+        if _elem_is(node, "tok") or _elem_is(node, "dtok"):
+            existing_tokids.update(v for v in (node.get("id"), node.get("{http://www.w3.org/XML/1998/namespace}id")) if v)
+    next_free_tokid = len(all_tok_nodes) + 1
     for tok_node in all_tok_nodes:
         tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
         if not tokid:
             # Generate ID with continuous numbering across all sentences
             # Prefer id over xml:id when writing
             tokid = f"w-{global_token_counter}"
+            while tokid in existing_tokids:
+                tokid = f"w-{next_free_tokid}"
+                next_free_tokid += 1
+            existing_tokids.add(tokid)
             tok_node.set("id", tokid)
         elif tok_node.get("{http://www.w3.org/XML/1998/namespace}id") and not tok_node.get("id"):
             # Has xml:id but not id - move to id (prefer id over xml:id)
@@ -2320,7 +2425,7 @@ def update_teitok(
             tok_node.set("id", xml_id)
             del tok_node.attrib["{http://www.w3.org/XML/1998/namespace}id"]
             tokid = xml_id
-        if tokid:
+        if tokid and tokid not in tokid_to_node:  # a repeated id: the first <tok> keeps it
             tokid_to_node[tokid] = tok_node
         global_token_counter += 1
     
@@ -2340,14 +2445,31 @@ def update_teitok(
                         else:
                             tokid = f"dtok-{idx}"
                         dtok_node.set("{http://www.w3.org/XML/1998/namespace}id", tokid)
-            if tokid:
+            # A <dtok> may repeat its <tok>'s id (hand-edited files): the id stays the <tok>'s.
+            if tokid and not (tokid in tokid_to_node and _elem_is(tokid_to_node[tokid], "tok")):
                 tokid_to_node[tokid] = dtok_node
     
     # When XML has no <s> elements but has <tok> (tokens-only), we will match by tokid in the first pass below
     tokens_only_mode = bool(not sentid_to_node and tokid_to_node)
-    
+
     # Update nodes from tagged Document
     sanitized = _sanitize_document(document)
+
+    # Sentences made at load time from <tok>s outside every <s> (when <s> cover only part of the
+    # text) have no <s> of their own: match their tokens by tokid, as in tokens_only_mode.
+    by_tokid_sents: Set[int] = set()
+    if not tokens_only_mode:
+        _refs = getattr(settings, "sentence_tokref_attributes", None) if settings else None
+        covered_tok_nodes: Set[ET.Element] = set()
+        for _s in root.iter():
+            if _elem_is(_s, "s"):
+                covered_tok_nodes.update(_s_tok_nodes(_s, tokid_to_node, _refs))
+        for _idx, _sent in enumerate(sanitized.sentences):
+            if sentid_to_node.get(_sent.sent_id or _sent.id or _sent.source_id) is not None:
+                continue
+            _nodes = [tokid_to_node.get(_t.tokid or "") for _t in _sent.tokens]
+            if _nodes and all(_n is not None and _n not in covered_tok_nodes for _n in _nodes):
+                by_tokid_sents.add(_idx)
     matched_tokens = 0
     skipped_tokens = 0
     matched_sentences = 0
@@ -2428,8 +2550,10 @@ def update_teitok(
             if token.id and token.tokid:
                 global_ord_to_tokid[token.id] = token.tokid
     
-    if tokens_only_mode:
+    if tokens_only_mode or by_tokid_sents:
         for sent_idx, sent in enumerate(sanitized.sentences):
+            if not tokens_only_mode and sent_idx not in by_tokid_sents:
+                continue
             for token_idx, token in enumerate(sent.tokens):
                 if token.tokid:
                     tok_node = tokid_to_node.get(token.tokid)
@@ -2460,28 +2584,14 @@ def update_teitok(
         
         if s_node is None and not tokens_only_mode:
             continue  # Skip for now, will handle in main loop
-        if tokens_only_mode:
+        if tokens_only_mode or sent_idx in by_tokid_sents:
             continue  # Already filled global_token_to_tok_node by tokid; skip s_node matching
         
         # Match tokens to XML nodes and build mapping
         # Get tok nodes: direct children or from sameAs/corresp (sentence references tokens elsewhere)
         attrs_to_try = getattr(settings, "sentence_tokref_attributes", None) if settings else None
-        if not attrs_to_try:
-            attrs_to_try = ["sameAs", "sameas", "corresp"]
-        ref_attr = ""
-        for a in attrs_to_try:
-            v = s_node.get(a)
-            if v:
-                ref_attr = v
-                break
-        if ref_attr and tokid_to_node:
-            ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
-            sent_tok_nodes = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
-        else:
-            sent_tok_nodes = [n for n in s_node if _elem_is(n, "tok")]
-            if not sent_tok_nodes:
-                # Include tokens from descendants (e.g. inside <name>)
-                sent_tok_nodes = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
+        # referenced tokens, else (none, or a stale reference) contained ones, also inside <name>
+        sent_tok_nodes = _s_tok_nodes(s_node, tokid_to_node, attrs_to_try)
         sent_tok_nodes_set: Set[ET.Element] = set(sent_tok_nodes)
         sent_tokid_to_node: Dict[str, ET.Element] = {}
         sent_ord_to_node: Dict[int, ET.Element] = {}
@@ -3130,7 +3240,7 @@ def update_teitok(
             # Sentence node not found in XML.
             # Some backends can introduce empty trailing sentences (e.g. from extra newlines).
             # Do not count sentences with no real tokens against alignment.
-            if not tokens_only_mode:
+            if not tokens_only_mode and sent_idx not in by_tokid_sents:
                 has_real_tokens = any((not is_comment_line_token(t)) for t in sent.tokens)
                 if not has_real_tokens:
                     continue
@@ -3158,21 +3268,7 @@ def update_teitok(
         # accidental cross-sentence mappings if backend token IDs drift.
         if s_node is not None:
             attrs_to_try = getattr(settings, "sentence_tokref_attributes", None) if settings else None
-            if not attrs_to_try:
-                attrs_to_try = ["sameAs", "sameas", "corresp"]
-            ref_attr = ""
-            for a in attrs_to_try:
-                v = s_node.get(a)
-                if v:
-                    ref_attr = v
-                    break
-            if ref_attr and tokid_to_node:
-                ref_ids = [p.strip().lstrip("#").strip() for p in ref_attr.split() if p.strip()]
-                sent_tok_nodes_for_heads = [tokid_to_node[tid] for tid in ref_ids if tid in tokid_to_node]
-            else:
-                sent_tok_nodes_for_heads = [n for n in s_node if _elem_is(n, "tok")]
-                if not sent_tok_nodes_for_heads:
-                    sent_tok_nodes_for_heads = s_node.findall(".//{*}tok") or s_node.findall(".//tok") or []
+            sent_tok_nodes_for_heads = _s_tok_nodes(s_node, tokid_to_node, attrs_to_try)
             for xml_tok in sent_tok_nodes_for_heads:
                 tokid_val = xml_tok.get("id") or xml_tok.get("{http://www.w3.org/XML/1998/namespace}id")
                 ord_val = xml_tok.get("ord")
@@ -3299,13 +3395,14 @@ def update_teitok(
             if not is_split:
                 # Not a split token - set attributes normally on <tok>
                 # In tokens_only_mode preserve original XML form (do not overwrite with backend); only add lemma, xpos, etc.
-                if not tokens_only_mode:
+                if not tokens_only_mode and sent_idx not in by_tokid_sents:
                     # Only write @form if it's different from inner text or if there are children
                     if token.form:
                         if has_children or token.form != inner_text:
                             tok_node.set("form", _normalize_annotation_attr(token.form, unicode_normalization))
-                        elif tok_node.get("form") and token.form == inner_text:
+                        elif tok_node.get("form") and token.form == inner_text and not ({"form", "all"} & keep_set):
                             # Remove @form if it matches inner text and there are no children
+                            # (not under --keep: then existing attributes stay as they are)
                             tok_node.attrib.pop("form", None)
                 
                 # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
@@ -3638,22 +3735,15 @@ def update_teitok(
                             suffix += 1
                         dtok_tokid = f"{base_tokid}.{idx+1}.{suffix}"
                     
-                    # Always ensure dtok has the correct ID (prefer id over xml:id)
-                    # Remove old ID from mapping if it exists (even if it's the old format)
+                    # An existing dtok id stays (TEITOK's d-30-1, or anything a corpus uses: other
+                    # annotation may point at it); a new <dtok> gets w-30.1 (prefer id over xml:id)
                     current_dtok_id = dtok_node.get("id") or dtok_node.get("{http://www.w3.org/XML/1998/namespace}id")
-                    if current_dtok_id and current_dtok_id != dtok_tokid:
-                        if current_dtok_id in tokid_to_node and tokid_to_node[current_dtok_id] is dtok_node:
-                            del tokid_to_node[current_dtok_id]
-                        # Set new ID (prefer id over xml:id)
-                        if dtok_node.get("{http://www.w3.org/XML/1998/namespace}id") and not dtok_node.get("id"):
-                            dtok_node.set("{http://www.w3.org/XML/1998/namespace}id", dtok_tokid)
-                        else:
-                            dtok_node.set("id", dtok_tokid)
-                    elif not current_dtok_id:
-                        # No existing ID, set it
+                    if current_dtok_id:
+                        dtok_tokid = current_dtok_id
+                    else:
                         dtok_node.set("id", dtok_tokid)
-                    # Always update mapping with new format
-                    tokid_to_node[dtok_tokid] = dtok_node
+                    if not (dtok_tokid in tokid_to_node and _elem_is(tokid_to_node[dtok_tokid], "tok")):
+                        tokid_to_node[dtok_tokid] = dtok_node
                     
                     # Check both direct fields and attrs dict (backends may store in either)
                     dtok_lemma = subtoken.lemma or subtoken.attrs.get("lemma", "")
@@ -3723,7 +3813,14 @@ def update_teitok(
                 misc_val = token.misc or token.attrs.get("misc", "")
                 
                 _set_attr(tok_node, "lemma", lemma_val, default_empty=True)
+                if mark_guesses:
+                    _tag_names = [n for n in [_resolve_attr_name("xpos"), *_attribute_aliases("xpos")] if n]
+                    _had_tag = any((tok_node.get(n) or "").strip() not in ("", "_") for n in _tag_names)
                 _set_attr(tok_node, "xpos", xpos_val)
+                if mark_guesses and not _had_tag and xpos_val and xpos_val != "_":
+                    _how = (getattr(token, "source", "") or "").split(":")[-1]
+                    if _how in GUESSED_SOURCES:
+                        tok_node.set(mark_guesses, _how)
                 _set_attr(tok_node, "upos", upos_val)
                 _set_attr(tok_node, "feats", feats_val)
                 _set_attr(tok_node, "reg", token.reg)

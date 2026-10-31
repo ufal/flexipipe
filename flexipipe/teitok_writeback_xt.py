@@ -542,6 +542,8 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
 
     tok_elems = [e for e in root.iter() if _local_tag(e) == "tok"]
     flat_tokens = _flatten_surface_tokens(document)
+    mark_attr = document.meta.get("_mark_guesses") or ""
+    from .teitok import GUESSED_SOURCES
 
     if len(tok_elems) != len(flat_tokens):
         print(
@@ -587,6 +589,8 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
                     _set_mapped_attrs(dtok_elem, _subtoken_values(sub), target)
             else:
                 _set_mapped_attrs(elem, _token_values(tok), target)
+            if mark_attr and (getattr(tok, "source", "") or "").split(":")[-1] in GUESSED_SOURCES:
+                elem.set(mark_attr, tok.source.split(":")[-1])  # --mark-guesses: tagged by guessing
 
         if target["xpos"] != "xpos":
             for elem in list(root.iter()):

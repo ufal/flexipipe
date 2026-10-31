@@ -30,7 +30,8 @@ def _local(tag) -> str:
 
 
 def _parse(data: bytes):
-    parser = etree.XMLParser(huge_tree=True, resolve_entities=False, no_network=True, remove_blank_text=False)
+    # collect_ids=False: a repeated xml:id (Word bookmarks) must not stop the comparison
+    parser = etree.XMLParser(huge_tree=True, resolve_entities=False, no_network=True, remove_blank_text=False, collect_ids=False)
     return etree.fromstring(data, parser)
 
 

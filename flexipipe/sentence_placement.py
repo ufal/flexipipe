@@ -177,7 +177,10 @@ class _Placer:
                     self.split_before(k, inside[0])
                 else:              # it goes on after the sentence: split at its first token after it
                     in_k = self.toks_in(k)
-                    self.split_before(k, in_k[[id(t) for t in in_k].index(id(inside[-1])) + 1])
+                    after = [id(t) for t in in_k].index(id(inside[-1])) + 1
+                    if after >= len(in_k):  # its other tokens are not after the sentence (out of order)
+                        return None  # unexpected: standoff
+                    self.split_before(k, in_k[after])
                 continue
             elements = [e for e in kids if _local(e.tag) != "tok" and self.toks_in(e)]
             if any(role(e) == "standoff" for e in elements):

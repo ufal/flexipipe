@@ -148,7 +148,7 @@ function flexipipe_document_page( $fp_settings, $fp_cmd, $action, $act, $cid ) {
 	if ( strpos( $bm, ':' ) > 0 ) list( $choice['backend'], $choice['model'] ) = explode( ':', $bm, 2 );
 	if ( !isset( flexipipe_layouts()[ $choice['layout'] ] ) ) $choice['layout'] = '';
 	list( $st, $problem ) = flexipipe_document_status( $fp_cmd, $path, $manifest, $tasks, 'all', $choice );
-	if ( !$st ) return $out . "<p class=wrong>flexipipe could not read this document.</p>" . ( $is_admin && $problem ? "<p class='fp-help'>" . $h( $problem ) . "</p>" : '' );
+	if ( !$st ) return $out . "<p class=wrong>flexipipe could not read this document.</p>" . ( $problem ? "<p class='fp-help'>" . $h( $problem ) . "</p>" : '' );
 
 	$writable = !empty( $st['writable'] );
 	// existing annotation is kept; it is only replaced where the user ticks "Replace" (per attribute)
@@ -163,7 +163,8 @@ function flexipipe_document_page( $fp_settings, $fp_cmd, $action, $act, $cid ) {
 		if ( !$writable ) {
 			$out .= "<p class=wrong>flexipipe cannot save this document: the web server may not change it or its folder.</p>";
 		} else {
-			return $out . flexipipe_document_run( $fp_cmd, $path, $manifest, $tasks, $keep, implode( ',', $replace ), $st['run'] + array( 'layout' => $choice['layout'] ), $doclink, $is_admin, $action, $cid );
+			$mark = !empty( $_POST['mark'] ) ? flexipipe_mark_attribute( $manifest ) : '';
+			return $out . flexipipe_document_run( $fp_cmd, $path, $manifest, $tasks, $keep, implode( ',', $replace ), $st['run'] + array( 'layout' => $choice['layout'], 'mark' => $mark ), $doclink, $is_admin, $action, $cid );
 		}
 	}
 
@@ -195,6 +196,9 @@ function flexipipe_document_page( $fp_settings, $fp_cmd, $action, $act, $cid ) {
 		$out .= "<p><label><input type='checkbox' name='replace[]' value='" . $h( $o['name'] ) . "'$on> Replace the existing "
 			. $h( $o['name'] ) . " of " . (int)$o['tokens'] . " tokens <span class='fp-help'>(@" . $h( $o['attribute'] ) . "; otherwise kept, and used as given where the tagger can)</span></label></p>";
 	}
+	$mattr = flexipipe_mark_attribute( $manifest );
+	$out .= "<p><label><input type='checkbox' name='mark' value='1' checked> Mark the words the model had to guess"
+		. " <span class='fp-help'>(@" . $h( $mattr ) . ": words it does not know, tagged from their ending; listed after the run, to check first)</span></label></p>";
 	$out .= "<p><button type='submit'>Run flexipipe on this document</button>
 		<span class='fp-help'>A copy of the document as it is now is kept in the backups (file management → backups).</span></p></form>";
 	return $out;
@@ -211,7 +215,7 @@ function flexipipe_document_run( $fp_cmd, $path, $manifest, $tasks, $keep, $repl
 		$use['backend'] = $plan['backend'];
 		$use['model'] = $plan['model'] ?? '';
 	}
-	$opt = array( 'tasks' => $tasks, 'language' => $plan['language'] ?? '', 'keep' => $keep, 'replace' => $replace, 'layout' => $plan['layout'] ?? '' );
+	$opt = array( 'tasks' => $tasks, 'language' => $plan['language'] ?? '', 'keep' => $keep, 'replace' => $replace, 'layout' => $plan['layout'] ?? '', 'mark' => $plan['mark'] ?? '' );
 	list( $rc, $out, $err ) = $fp_cmd->run( FlexipipeCmd::process_args( $path, $use, $opt ) );
 	$secs = round( microtime( true ) - $started, 1 );
 	$summary = null;
@@ -232,7 +236,8 @@ function flexipipe_document_run( $fp_cmd, $path, $manifest, $tasks, $keep, $repl
 	if ( $ok ) {
 		$res = "<p class=right>flexipipe annotated the document ($secs s)"
 			. ( $summary && !empty( $summary['backend'] ) ? " with " . $h( $summary['backend'] . ' / ' . ( $summary['model'] ?? '' ) ) : '' ) . ".</p>"
-			. "<p><a href='$doclink'>View the document</a> · <a href='index.php?action=$action&act=status&cid=" . rawurlencode( $cid ) . "'>What it contains now</a></p>";
+			. "<p><a href='$doclink'>View the document</a> · <a href='index.php?action=$action&act=status&cid=" . rawurlencode( $cid ) . "'>What it contains now</a></p>"
+			. ( !empty( $plan['mark'] ) ? flexipipe_document_guesses( $path, $plan['mark'], $cid ) : '' );
 	} else {
 		$res = "<p class=wrong>flexipipe did not change the document.</p>";
 		if ( $reasons ) $res .= "<ul><li>" . implode( "</li><li>", array_map( $h, array_slice( $reasons, -3 ) ) ) . "</li></ul>";
@@ -245,6 +250,35 @@ function flexipipe_document_run( $fp_cmd, $path, $manifest, $tasks, $keep, $repl
 	return $res;
 }
 
+
+/** The attribute that marks the tokens a run tagged by guessing: the manifest's mark-guesses, else "check". */
+function flexipipe_mark_attribute( $manifest ) {
+	$a = is_array( $manifest ) ? trim( (string)( $manifest['mark-guesses'] ?? '' ) ) : '';
+	return preg_match( '/^[A-Za-z_][A-Za-z0-9_-]*$/', $a ) ? $a : 'check';
+}
+
+/** After a run with marking: the words the model had to guess, most frequent first, each a link to edit a token. */
+function flexipipe_document_guesses( $path, $attr, $cid, $max = 300 ) {
+	$h = 'flexipipe_h';
+	$dom = new DOMDocument();
+	if ( !@$dom->load( $path ) ) return '';
+	$toks = ( new DOMXPath( $dom ) )->query( "//tok[@$attr]" );
+	if ( !$toks || $toks->length === 0 ) return "<p>The model knew all the words it tagged.</p>";
+	$by = array();  // word -> token ids
+	foreach ( $toks as $t ) {
+		$w = trim( $t->getAttribute( 'form' ) !== '' ? $t->getAttribute( 'form' ) : $t->textContent );
+		$by[ $w ][] = $t->getAttribute( 'id' );
+	}
+	uasort( $by, function ( $a, $b ) { return count( $b ) - count( $a ); } );
+	$links = array();
+	foreach ( array_slice( $by, 0, $max, true ) as $w => $ids ) {
+		$links[] = "<a href='index.php?action=tokedit&cid=" . rawurlencode( $cid ) . "&tid=" . rawurlencode( $ids[0] ) . "'>" . $h( $w ) . "</a>"
+			. ( count( $ids ) > 1 ? " <span class='fp-help'>×" . count( $ids ) . "</span>" : '' );
+	}
+	return "<h2>Words to check first</h2><p>" . $toks->length . " tokens (" . count( $by ) . " different words) were tagged from their ending: the model does not know them."
+		. " They carry @" . $h( $attr ) . "; remove it once a token is checked. Most frequent first"
+		. ( count( $by ) > $max ? " (the first $max)" : '' ) . ":</p><p class='fp-guesses'>" . implode( ' · ', $links ) . "</p>";
+}
 
 /** A trial run of the sentence step only (--test: nothing is written): how the sentences would be placed. */
 function flexipipe_document_preview( $fp_cmd, $path, $manifest, $plan ) {

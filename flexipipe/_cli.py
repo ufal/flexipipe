@@ -2738,6 +2738,13 @@ def build_parser() -> argparse.ArgumentParser:
         "always left as it is.",
     )
     process_parser.add_argument(
+        "--mark-guesses",
+        metavar="ATTR",
+        help="Writeback: on the tokens this run tagged by guessing (a word the model does not know: tagged "
+        "from its ending, or not at all), set ATTR to how (ending, prefix, unknown, fallback), so they can be "
+        "found and checked first (e.g. in TEITOK: [ATTR=\".+\"]). Tokens tagged before are left as they are.",
+    )
+    process_parser.add_argument(
         "--replace",
         metavar="ATTRS",
         help="Replace the existing values of these attributes (comma list as --keep): they are left out of "
@@ -4073,13 +4080,23 @@ def _parse_attrs_map(attrs_map: Optional[List[str]]) -> Dict[str, str]:
     """
     Parse --attrs-map arguments into attribute mappings.
     
-    Format: 'attr:value1,value2' (e.g., 'xpos:msd,pos' or 'reg:nform')
+    Format: 'attr:value1,value2' (e.g., 'xpos:msd,pos' or 'reg:nform'), repeated for more
+    attributes; several in one argument also work ('xpos:pos,reg:nform,expan:spa'): a
+    comma-separated piece with a colon starts the next attribute (XML attribute names on
+    tokens have no colon).
     Returns a dict mapping attribute names to comma-separated value lists.
     """
     mappings: dict[str, str] = {}
     if not attrs_map:
         return mappings
-    for item in attrs_map:
+    items: List[str] = []
+    for arg in attrs_map:
+        for piece in arg.split(","):
+            if ":" in piece or not items:
+                items.append(piece)
+            else:
+                items[-1] += "," + piece
+    for item in items:
         if ":" not in item:
             raise SystemExit(f"Invalid attrs-map '{item}'. Expected ATTR:VALUES (e.g., 'xpos:msd,pos').")
         attr, values = item.split(":", 1)
@@ -6757,6 +6774,8 @@ def run_tag(args: argparse.Namespace) -> int:
                                 "(not update_teitok)",
                                 file=sys.stderr,
                             )
+                        if getattr(args, "mark_guesses", None):  # all tokens are this run's
+                            output_doc.meta["_mark_guesses"] = args.mark_guesses
                         insert_tokens_into_teitok(
                             output_doc,
                             str(target_writeback_path),
@@ -6835,6 +6854,7 @@ def run_tag(args: argparse.Namespace) -> int:
                             keep=[k for k in (getattr(args, "keep", None) or "").split(",") if k.strip()],
                             tasks=requested_tasks,
                             sentence_layout=_sentence_layout_from_args(args),
+                            mark_guesses=getattr(args, "mark_guesses", None),
                         )
                         if args.verbose or args.debug:
                             target = str(target_writeback_path) if not output_path else output_path
