@@ -59,3 +59,9 @@ Use **`flexipipe <subcommand> --help`** for full options. Use **`flexipipe info 
 - `wiki/` — full documentation (Markdown); [wiki/README.md](wiki/README.md) is the index.
 
 See [Contributing](wiki/Contributing.md) for development notes.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
+If you use flexipipe in research, please cite it: [`CITATION.cff`](CITATION.cff) has the reference (GitHub shows it as "Cite this repository").
