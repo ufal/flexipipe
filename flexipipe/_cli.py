@@ -2793,7 +2793,7 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--no-writeback-fallback",
         action="store_true",
-        help="If xmltokenizer writeback fails, do not fall back to flexipipe standoff writeback.",
+        help="If the writeback fails, write nothing: no fall back to flexipipe standoff writeback or to a regular save.",
     )
     process_parser.add_argument(
         "--option",
@@ -6885,7 +6885,8 @@ def run_tag(args: argparse.Namespace) -> int:
                             )
                         except OSError:
                             _output_is_input = True
-                    _refuse_fallback = (use_writeback and not output_path) or _output_is_input or isinstance(
+                    _no_fallback = bool(getattr(args, "no_writeback_fallback", False))
+                    _refuse_fallback = (use_writeback and not output_path) or _output_is_input or _no_fallback or isinstance(
                         e, (InvalidXMLError, BackupError, PermissionError)
                     )
                     if _refuse_fallback:
@@ -6894,6 +6895,7 @@ def run_tag(args: argparse.Namespace) -> int:
                             else "no backup could be made" if isinstance(e, BackupError)
                             else "the file cannot be written" if isinstance(e, PermissionError)
                             else "--output is the input file" if _output_is_input
+                            else "--no-writeback-fallback was given" if _no_fallback
                             else "--writeback was requested without --output"
                         )
                         print(

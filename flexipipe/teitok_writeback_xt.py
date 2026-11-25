@@ -416,6 +416,7 @@ def _postprocess_output_tree(root: ET.Element, document: Document) -> None:
     change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     apply_name_wrappers_to_tree(root, document)
     _apply_teitok_attribute_mapping(root, document)
+    _apply_teitok_ids_and_heads(root, document)
     _add_change_to_tei_header(root, change_text, change_when, tasks=tasks_summary_str)
 
 
@@ -601,6 +602,82 @@ def _apply_teitok_attribute_mapping(root: ET.Element, document: Document) -> Non
     if not has_sentence_tags:
         for elem in tok_elems:
             elem.attrib.pop("ord", None)
+
+
+_XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
+
+
+def _elem_id(elem: ET.Element) -> str:
+    return elem.get("id") or elem.get(_XML_ID) or ""
+
+
+def _apply_teitok_ids_and_heads(root: ET.Element, document: Document) -> None:
+    """TEITOK ids and heads on the folded tree, as the regular TEITOK writer writes them.
+
+    xmltokenizer's CoNLL-U layer writes the dependency head as ``ohead`` (the head's ord
+    within the sentence) and leaves ``<dtok>`` without id. TEITOK, flexencoder and the tree
+    view want ``head`` = the head word's id. So:
+
+    - a ``<dtok>`` without id gets ``<tok id>.<k>`` (k = its position in the ``<tok>``),
+      the id teitok.py gives new dtoks; an existing id stays;
+    - ``ohead="N"`` becomes ``head="<id of the tok/dtok with ord N in the same <s>>"``;
+      ``ohead="0"`` (root) gets no head; a target outside the sentence is dropped and counted.
+      ``ohead`` itself stays only with --debug (as in teitok.py); an existing ``head`` wins.
+    """
+    attr_map = document.meta.get("_teitok_attr_map")
+    if not isinstance(attr_map, dict):
+        attr_map = {}
+    head_name = _preferred_attr_name(attr_map.get("head"), "head")
+    keep_ohead = bool(document.meta.get("_flexipipe_debug"))
+
+    taken = {i for i in (_elem_id(e) for e in root.iter()) if i}
+    for tok in root.iter():
+        if _local_tag(tok) != "tok" or not _elem_id(tok):
+            continue
+        base = _elem_id(tok)
+        k = 0
+        for child in tok:
+            if _local_tag(child) != "dtok":
+                continue
+            k += 1
+            if _elem_id(child):
+                continue
+            new_id = f"{base}.{k}"
+            suffix = 1
+            while new_id in taken:
+                suffix += 1
+                new_id = f"{base}.{k}.{suffix}"
+            child.set("id", new_id)
+            taken.add(new_id)
+
+    unresolved = 0
+    for sent in root.iter():
+        if _local_tag(sent) != "s":
+            continue
+        words = [e for e in sent.iter() if _local_tag(e) in {"tok", "dtok"}]
+        by_ord = {
+            e.get("ord"): _elem_id(e)
+            for e in words
+            if (e.get("ord") or "").isdigit() and _elem_id(e)
+        }
+        for elem in words:
+            ohead = elem.get("ohead")
+            if ohead is None or head_name in elem.attrib:
+                continue
+            if ohead != "0":
+                target = by_ord.get(ohead)
+                if target:
+                    elem.set(head_name, target)
+                else:
+                    unresolved += 1
+            if not keep_ohead:
+                del elem.attrib["ohead"]
+    if unresolved:
+        print(
+            f"[flexipipe] WARNING: writeback: {unresolved} head(s) point outside their <s> "
+            "(sentence cut at a block boundary?); left without head",
+            file=sys.stderr,
+        )
 
 
 def _flatten_surface_tokens(document: Document) -> list:

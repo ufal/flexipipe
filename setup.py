@@ -41,6 +41,7 @@ if init_file.exists():
 BASE_REQUIREMENTS = [
     "pybind11>=2.10",
     "langcodes>=3.3.0",
+    "lxml>=4.9",  # TEITOK reading/writing (teitok_text_check, teitok_status, write-back)
     "language-data>=1.1.0",
     "pycountry>=23.12.0",
     "requests>=2.31.0",
