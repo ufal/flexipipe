@@ -171,6 +171,10 @@ def _create_implicit_mwt(sentence: Sentence) -> Sentence:
                         trslit=tok.trslit,
                         ltrslit=tok.ltrslit,
                         tokid=tok.tokid,
+                        # a word of a multiword token keeps its own syntax
+                        head=tok.head,
+                        deprel=tok.deprel,
+                        deps=tok.deps,
                         space_after=False,  # No space after subtokens (they're not orthographic)
                     )
                     parent.subtokens.append(subtoken)
@@ -265,6 +269,9 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
                     ltrslit=current.ltrslit,
                     tokid=current.tokid,
                     source=current.source,
+                    head=current.head,  # each word keeps its own syntax
+                    deprel=current.deprel,
+                    deps=current.deps,
                     space_after=False,  # No space after first part
                 )
                 
@@ -282,6 +289,9 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
                     ltrslit=next_token.ltrslit,
                     tokid=next_token.tokid,
                     source=next_token.source,
+                    head=next_token.head,  # each word keeps its own syntax
+                    deprel=next_token.deprel,
+                    deps=next_token.deps,
                     space_after=next_token.space_after if next_token.space_after is not None else True,
                 )
                 

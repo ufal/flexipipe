@@ -13,7 +13,7 @@ import requests
 from ..backend_spec import BackendSpec
 from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document
-from ._batching import split_document, split_text
+from ._batching import join_conllu_parts, split_document, split_text
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
     LANGUAGE_FIELD_NAME,
@@ -635,8 +635,8 @@ class UDPipeRESTBackend(BackendManager):
                     from ..conllu import _reconstruct_sentence_text
                     text = "\n".join(_reconstruct_sentence_text(sent.tokens) or "" for sent in document.sentences if sent.tokens)
             parts = [p for p in split_text(text, self._max_raw_chars) if p.strip()]
-            results = [self._request(p, input_format="plain").get("result", "").rstrip("\n") for p in parts]
-            response = {"result": "\n\n".join(r for r in results if r) + "\n"}
+            results = [self._request(p, input_format="plain").get("result", "") for p in parts]
+            response = {"result": join_conllu_parts(results)}
         else:
             # Pretokenized mode: send CoNLL-U format to preserve tokenization and TokIds
             # UDPipe REST API should preserve TokIds in MISC column when input=conllu

@@ -40,6 +40,36 @@ def split_text(text: str, max_chars: int) -> List[str]:
     return parts
 
 
+def join_conllu_parts(parts: List[str]) -> str:
+    """The CoNLL-U results of the parts of one text (from `split_text`) as one document.
+
+    Each part comes back numbered on its own (`# sent_id = 1` again, a new `# newdoc`).
+    Pasted together as they are, sentence ids repeat, and a reader that groups tokens by
+    sent_id merges sentences far apart (xmltokenizer then cut them at every paragraph in
+    between and dropped their heads: ELTeC, 2026-11-26). Sentence ids are renumbered
+    1, 2, 3, ... across the parts; `# newdoc` is kept only before the first sentence.
+    """
+    out: List[str] = []
+    n = 0
+    seen_doc = False
+    for part in parts:
+        part = part.rstrip("\n")
+        if not part.strip():
+            continue
+        if out:
+            out.append("")
+        for line in part.split("\n"):
+            if line.startswith("# newdoc"):
+                if seen_doc:
+                    continue
+                seen_doc = True
+            elif line.startswith("# sent_id"):
+                n += 1
+                line = f"# sent_id = {n}"
+            out.append(line)
+    return "\n".join(out) + "\n" if out else "\n"
+
+
 def _lines_if_large(paragraph: str, max_chars: int) -> List[str]:
     if len(paragraph) <= max_chars:
         return [paragraph]
