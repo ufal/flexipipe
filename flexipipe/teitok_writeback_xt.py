@@ -79,14 +79,83 @@ def _dump_folded_xml_for_debug(
     return path
 
 
+_XMLNSOFF_PREFIX = b"xmlnsoff:"
+
+
+def _start_tag_attr_offsets(data: bytes, offset: int) -> list[int]:
+    """Byte offsets of the attribute names in the start tag at ``offset`` (quote-aware)."""
+    i = offset + 1
+    n = len(data)
+    while i < n and data[i] not in b" \t\r\n/>":
+        i += 1  # element name
+    names: list[int] = []
+    while i < n:
+        c = data[i]
+        if c in b" \t\r\n":
+            i += 1
+            continue
+        if c == ord(">") or (c == ord("/") and data[i + 1:i + 2] == b">"):
+            return names
+        names.append(i)
+        while i < n and data[i] not in b" \t\r\n=":
+            i += 1
+        while i < n and data[i] in b" \t\r\n=":
+            i += 1
+        quote = data[i:i + 1]
+        i = data.index(quote, i + 1) + 1
+    return names
+
+
+def _reactivate_prefixed_namespaces(raw_de: bytes) -> bytes:
+    """Undo xmltokenizer's deactivation for prefixed declarations only, for lxml.
+
+    xmltokenizer deactivates every namespace declaration, prefixed ones too
+    (``xmlns:e=`` → ``xmlnsoff:e=``). The default namespace off is what TEITOK
+    wants, but an element ``<e:size>`` then has an undeclared prefix and lxml
+    (namespace-aware) refuses the file (ELTeC headers). Here ``xmlnsoff:P=`` goes
+    back to ``xmlns:P=``: lxml reads ``e:`` elements as namespaced and writes them
+    back with the same prefix and declaration; ``xt.reactivate`` restores the rest
+    on output. Attributes are located with expat (no namespace processing) and a
+    quote-aware lexer of the start tag, never by searching the text.
+    """
+    if _XMLNSOFF_PREFIX not in raw_de:
+        return raw_de
+    import xml.parsers.expat
+
+    offsets: list[int] = []
+    parser = xml.parsers.expat.ParserCreate()
+
+    def start(name, attrs):
+        if any(a.startswith("xmlnsoff:") for a in attrs):
+            tag_at = parser.CurrentByteIndex
+            for pos in _start_tag_attr_offsets(raw_de, tag_at):
+                if raw_de.startswith(_XMLNSOFF_PREFIX, pos):
+                    offsets.append(pos)
+
+    parser.StartElementHandler = start
+    parser.Parse(raw_de, True)
+    if not offsets:
+        return raw_de
+    out = bytearray(raw_de)
+    for pos in sorted(offsets, reverse=True):
+        out[pos:pos + len(_XMLNSOFF_PREFIX)] = b"xmlns:"
+    return bytes(out)
+
+
+def _parse_de_xml(raw_de: bytes) -> ET.Element:
+    """Parse deactivated (xmlnsoff) XML; prefixed namespaces made parseable for lxml."""
+    raw = _reactivate_prefixed_namespaces(raw_de)
+    if HAS_LXML:
+        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
+        return ET.fromstring(raw, parser)
+    return ET.fromstring(raw)
+
+
 def _parse_folded_xml(
     folded_bytes: bytes, document: Document, *, align_debug: bool
 ) -> ET.Element:
     try:
-        if HAS_LXML:
-            parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
-            return ET.fromstring(folded_bytes, parser)
-        return ET.fromstring(folded_bytes)
+        return _parse_de_xml(folded_bytes)
     except Exception as exc:
         dumped = _dump_folded_xml_for_debug(
             folded_bytes, document, align_debug=align_debug
@@ -700,20 +769,98 @@ def _flatten_surface_tokens(document: Document) -> list:
     return flat
 
 
+def _conllu_for_xt(document: Document, *, create_implicit_mwt: bool) -> str:
+    """flexipipe's CoNLL-U for xmltokenizer, with a literal ``_`` FORM unescaped.
+
+    flexipipe writes a one-character ``_`` FORM as ``\\_`` (distinct from the empty
+    placeholder; ``conllu._escape_form_column``). xmltokenizer compares FORM with
+    the text as is, so it gets the plain ``_`` that is in the text.
+    """
+    from .conllu import _unescape_form_column
+
+    lines = document_to_conllu(
+        document, model_info=None, create_implicit_mwt=create_implicit_mwt
+    ).split("\n")
+    for i, line in enumerate(lines):
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) >= 10 and fields[1] != _unescape_form_column(fields[1]):
+            fields[1] = _unescape_form_column(fields[1])
+            lines[i] = "\t".join(fields)
+    return "\n".join(lines)
+
+
+def _match_form_at(text: str, pos: int, form: str) -> Optional[int]:
+    """End of ``form`` at ``text[pos:]``: literally, else the shortest stretch equal under NFC."""
+    import unicodedata
+
+    if text.startswith(form, pos):
+        return pos + len(form)
+    target = unicodedata.normalize("NFC", form)
+    for q in range(pos + 1, min(len(text), pos + 2 * len(form) + 2) + 1):
+        if unicodedata.normalize("NFC", text[pos:q]) == target:
+            return q
+    return None
+
+
+def restore_surface_forms_from_nlp_plaintext(document: Document, nlp_plaintext: str) -> int:
+    """Give tokens the text's own spelling where a backend normalised it.
+
+    UDPipe REST returns NFC (polytonic Greek U+1F71 oxia comes back as U+03AC
+    tonos), so the forms no longer match the text exactly and xmltokenizer's
+    strict aligner fails. Walking the surface tokens over the text, a form that is
+    not literally next but equals the next stretch under NFC gets that stretch;
+    the subtokens of a multiword token likewise, when they spell out the parent.
+    Stops at the first other mismatch (left for the aligner to report). Returns
+    the number of forms replaced.
+    """
+    text = nlp_plaintext
+    n = len(text)
+    pos = 0
+    changed = 0
+    for tok in _flatten_surface_tokens(document):
+        form = tok.form or ""
+        if not form:
+            continue
+        while pos < n and text[pos].isspace():
+            pos += 1
+        end = _match_form_at(text, pos, form)
+        if end is None:
+            break
+        surface = text[pos:end]
+        if surface != form:
+            tok.form = surface
+            changed += 1
+        if tok.is_mwt and tok.subtokens:
+            sub_pos, sub_forms = 0, []
+            for sub in tok.subtokens:
+                sub_end = _match_form_at(surface, sub_pos, sub.form or "") if sub.form else None
+                if sub_end is None:
+                    sub_forms = []
+                    break
+                sub_forms.append(surface[sub_pos:sub_end])
+                sub_pos = sub_end
+            if sub_forms and sub_pos == len(surface):
+                for sub, sub_form in zip(tok.subtokens, sub_forms):
+                    if sub.form != sub_form:
+                        sub.form = sub_form
+                        changed += 1
+        pos = end
+    return changed
+
+
 def sync_document_spacing_to_nlp_plaintext(document: Document, nlp_plaintext: str) -> None:
     """Set ``space_after`` on tokens so CoNLL-U aligns with xmltokenizer ``nlp_plaintext``."""
     import xmltokenizer as xt
-
-    from .conllu import document_to_conllu
 
     flat = _flatten_surface_tokens(document)
     if not flat:
         return
 
+    restore_surface_forms_from_nlp_plaintext(document, nlp_plaintext)
     aligned = xt.align_to_plaintext(
-        xt.parse_conllu(
-            document_to_conllu(document, model_info=None, create_implicit_mwt=False)
-        ),
+        xt.parse_conllu(_conllu_for_xt(document, create_implicit_mwt=False)),
         nlp_plaintext,
     )
     surface_aligned = [at for at in aligned if at.nlp_start < at.nlp_end]
@@ -760,14 +907,12 @@ def _conllu_for_scope_nlp(
 ) -> str:
     """Build CoNLL-U for tokens whose spans fall in ``[scope_start, scope_end)``."""
     if scope_start == 0 and scope_end >= len(full_nlp):
-        return document_to_conllu(
-            document, model_info=None, create_implicit_mwt=create_implicit_mwt
-        )
+        return _conllu_for_xt(document, create_implicit_mwt=create_implicit_mwt)
 
     import xmltokenizer as xt
 
     sentences = xt.parse_conllu(
-        document_to_conllu(document, model_info=None, create_implicit_mwt=create_implicit_mwt)
+        _conllu_for_xt(document, create_implicit_mwt=create_implicit_mwt)
     )
     aligned = xt.align_to_plaintext(sentences, full_nlp)
     in_scope = [
@@ -817,7 +962,7 @@ def _conllu_for_scope_nlp(
             )
         sub.sentences.append(sent)
 
-    return document_to_conllu(sub, model_info=None, create_implicit_mwt=create_implicit_mwt)
+    return _conllu_for_xt(sub, create_implicit_mwt=create_implicit_mwt)
 
 
 def writeback_teitok_with_xmltokenizer(
@@ -868,16 +1013,10 @@ def writeback_teitok_with_xmltokenizer(
 
     import xmltokenizer as xt
 
-    raw_de_snap = session.input_bytes_de
-    if HAS_LXML:
-        parser = ET.XMLParser(strip_cdata=False, remove_blank_text=False)
-        original_root_snapshot = copy.deepcopy(
-            ET.fromstring(raw_de_snap, parser)
-        )
-    else:
-        original_root_snapshot = copy.deepcopy(ET.fromstring(raw_de_snap))
+    original_root_snapshot = copy.deepcopy(_parse_de_xml(session.input_bytes_de))
 
     full_nlp = session.nlp_plaintext
+    restore_surface_forms_from_nlp_plaintext(work_doc, full_nlp)
     if work_doc.meta.get("_teitok_extracted_nlp") != full_nlp:
         print(
             "[flexipipe] xmltokenizer writeback: document NLP plaintext differs from "
@@ -937,8 +1076,9 @@ def writeback_teitok_with_xmltokenizer(
     _postprocess_output_tree(new_root, work_doc)
 
     if HAS_LXML:
+        # the document, not just the root: keeps <?xml-model?> PIs and comments before it
         folded_after = ET.tostring(
-            new_root,
+            new_root.getroottree(),
             encoding="utf-8",
             xml_declaration=True,
             pretty_print=False,
