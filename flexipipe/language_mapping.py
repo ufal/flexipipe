@@ -448,6 +448,167 @@ def _build_language_mappings(
 def reload_language_mappings(*, refresh_cache: bool = False, verbose: bool = False) -> None:
     """Force reload of language mappings from remote/cache."""
     _build_language_mappings(force_reload=True, refresh_cache=refresh_cache, verbose=verbose)
+    _reset_language_base()
+
+
+# ---------------------------------------------------------------------------
+# Generated base: all of Glottolog and ISO 639-3 (flexipipe-models
+# resources/languages-base.json, made by tools/build_languages_base.py).
+# It is consulted only when the hand table above has no exact match, and it
+# is loaded lazily: languages the hand table knows never trigger it. Hand
+# entries always win.
+# ---------------------------------------------------------------------------
+
+DEFAULT_LANGUAGE_BASE_URL = "https://raw.githubusercontent.com/ufal/flexipipe-models/main/resources/languages-base.json"
+LANGUAGE_BASE_ENV = "FLEXIPIPE_LANGUAGE_BASE"  # a local path or URL overriding the default
+
+_BASE_LOADED = False
+_BASE_BY_CODE: Dict[str, Dict[str, Any]] = {}   # iso 639-1/2b/2t/3 and glottocode, lowercased
+_BASE_BY_NAME: Dict[str, Dict[str, Any]] = {}   # unique names of languages, lowercased
+_BASE_BY_GLOTTOCODE: Dict[str, Dict[str, Any]] = {}
+_BASE_RETIRED: Dict[str, Dict[str, Any]] = {}
+
+
+def _reset_language_base() -> None:
+    global _BASE_LOADED
+    _BASE_LOADED = False
+    _BASE_BY_CODE.clear()
+    _BASE_BY_NAME.clear()
+    _BASE_BY_GLOTTOCODE.clear()
+    _BASE_RETIRED.clear()
+
+
+def _read_language_base(source: str, *, verbose: bool = False) -> Optional[Dict[str, Any]]:
+    """Read the base from a path or URL, using the model cache for URLs (7 days)."""
+    if not source.startswith(("http://", "https://")):
+        path = Path(source[7:] if source.startswith("file://") else source)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            if verbose:
+                print(f"[flexipipe] Warning: cannot read language base {path}: {exc}", file=sys.stderr)
+            return None
+    from .model_storage import read_model_cache_entry, write_model_cache_entry
+    cached = read_model_cache_entry("language_base", max_age_seconds=7 * 86400)
+    if isinstance(cached, dict) and "languages" in cached:
+        return cached
+    if not requests:
+        return None
+    try:
+        response = requests.get(source, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        if verbose:
+            print(f"[flexipipe] Warning: cannot load language base from {source}: {exc}", file=sys.stderr)
+        return None
+    if isinstance(data, dict) and "languages" in data:
+        try:
+            write_model_cache_entry("language_base", data)
+        except (OSError, PermissionError):
+            pass
+        return data
+    return None
+
+
+def _load_language_base(*, verbose: bool = False) -> None:
+    """Build the base indexes once per process (an empty base if it cannot be read)."""
+    global _BASE_LOADED
+    if _BASE_LOADED:
+        return
+    _BASE_LOADED = True  # also on failure: do not retry on every lookup
+    import os
+    data = _read_language_base(os.environ.get(LANGUAGE_BASE_ENV) or DEFAULT_LANGUAGE_BASE_URL, verbose=verbose)
+    if not data:
+        return
+    names: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in data.get("languages") or []:
+        if not isinstance(entry, dict):
+            continue
+        glotto = entry.get("glottocode")
+        if glotto:
+            _BASE_BY_GLOTTOCODE[glotto] = entry
+            _BASE_BY_CODE.setdefault(glotto.lower(), entry)
+        for key in ("iso_639_3", "iso_639_1", "iso_639_2t", "iso_639_2b"):
+            code = entry.get(key)
+            if code:
+                _BASE_BY_CODE.setdefault(code.lower(), entry)
+        # Names only for languages (and ISO-only codes): dialect and family names
+        # are too often shared with languages to be safe as lookup keys.
+        if entry.get("level") in ("language", "iso-only") or entry.get("iso_639_3"):
+            for name in {entry.get("name"), entry.get("iso_name")}:
+                if name:
+                    names.setdefault(name.lower(), []).append(entry)
+    for name, found in names.items():
+        if len({id(e) for e in found}) == 1:  # ambiguous names are left out
+            _BASE_BY_NAME[name] = found[0]
+    retired = data.get("retired_iso_639_3")
+    if isinstance(retired, dict):
+        _BASE_RETIRED.update(retired)
+
+
+def _base_entry(language: str) -> Optional[Dict[str, Any]]:
+    """Exact code (ISO, Glottocode, retired ISO with one successor) or unique name in the base."""
+    _load_language_base()
+    key = language.lower().strip()
+    # "Ho" is the Ho language, "ho" the ISO 639-1 code of Hiri Motu: input with
+    # capitals is read as a name first.
+    if language.strip() != key and key in _BASE_BY_NAME:
+        return _BASE_BY_NAME[key]
+    if key in _BASE_BY_CODE:
+        return _BASE_BY_CODE[key]
+    ret = _BASE_RETIRED.get(key)
+    if ret and ret.get("change_to") and ret["change_to"].lower() in _BASE_BY_CODE:
+        return _BASE_BY_CODE[ret["change_to"].lower()]
+    return _BASE_BY_NAME.get(key)
+
+
+def _base_iso_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The entry that carries the ISO codes: a dialect without ISO falls back to its language."""
+    if not entry.get("iso_639_3") and entry.get("language") in _BASE_BY_GLOTTOCODE:
+        return _BASE_BY_GLOTTOCODE[entry["language"]]
+    return entry
+
+
+def _base_lang_data(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The base entry in the shape of the hand table's lookup records."""
+    iso = _base_iso_entry(entry)
+    iso3 = iso.get("iso_639_3")
+    if iso3 and iso3.lower() in _LANGUAGE_BY_CODE:  # the hand entry wins
+        return _LANGUAGE_BY_CODE[iso3.lower()]
+    return {
+        "iso_639_1": iso.get("iso_639_1"),
+        "iso_639_2": iso.get("iso_639_2t") or iso.get("iso_639_2b"),
+        "iso_639_3": iso3,
+        # ISO's reference name is the familiar one (Swiss German, not Central Alemannic)
+        "primary_name": iso.get("iso_name") or iso.get("name"),
+    }
+
+
+def get_language_info(language: str) -> Dict[str, Any]:
+    """
+    Everything known about a language: the hand table's codes and name, plus the
+    base's Glottocode, level, family, coordinates, macroarea, countries, ISO scope
+    and type, and macrolanguage membership. Accepts ISO codes, Glottocodes and
+    names. Returns {} when nothing matches.
+    """
+    _build_language_mappings()
+    key = language.lower().strip()
+    hand = _LANGUAGE_BY_CODE.get(key) or _LANGUAGE_BY_NAME.get(key)
+    base = _base_entry(language)
+    if hand and not base and hand.get("iso_639_3"):
+        base = _BASE_BY_CODE.get(hand["iso_639_3"].lower())
+    if not hand and not base:
+        return {}
+    info: Dict[str, Any] = {}
+    if base:
+        info.update({k: v for k, v in base.items() if k != "name"})
+        info["glottolog_name"] = base.get("name")
+        info.update({k: v for k, v in _base_lang_data(base).items() if v})
+    if hand:
+        info.update({k: v for k, v in hand.items() if v})
+    return info
 
 
 def normalize_language_code(language: str) -> Tuple[str, str, str]:
@@ -474,6 +635,13 @@ def normalize_language_code(language: str) -> Tuple[str, str, str]:
         lang_data = _LANGUAGE_BY_NAME[lang_lower]
         return (lang_data["iso_639_1"], lang_data["iso_639_2"], lang_data["iso_639_3"])
     
+    # Exact code (ISO, Glottocode) or unique name in the generated Glottolog/ISO base
+    base = _base_entry(language)
+    if base is not None:
+        lang_data = _base_lang_data(base)
+        if lang_data.get("iso_639_3"):
+            return (lang_data["iso_639_1"], lang_data["iso_639_2"], lang_data["iso_639_3"])
+
     # Try partial matches (e.g., "spanish" matches "Spanish")
     for key, lang_data in _LANGUAGE_BY_NAME.items():
         if lang_lower in key or key in lang_lower:
@@ -504,6 +672,13 @@ def get_language_metadata(language: str) -> Dict[str, str]:
     if lang_lower in _LANGUAGE_BY_NAME:
         return _LANGUAGE_BY_NAME[lang_lower].copy()
     
+    # Exact code (ISO, Glottocode) or unique name in the generated Glottolog/ISO base
+    base = _base_entry(language)
+    if base is not None:
+        lang_data = _base_lang_data(base)
+        if lang_data.get("iso_639_3"):
+            return dict(lang_data)
+
     # Try partial matches
     for key, lang_data in _LANGUAGE_BY_NAME.items():
         if lang_lower in key or key in lang_lower:
